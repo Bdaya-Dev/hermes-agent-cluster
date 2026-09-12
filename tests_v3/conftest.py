@@ -19,6 +19,30 @@ import os
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def _isolate_peer_auth_env():
+    """Neutralize ambient PEER_TOKEN/PEER_TOKENS for every test (#872 hygiene).
+
+    WHY: create_app() enables peer-auth whenever BOTH env vars are present
+    (app.py: `_peer_auth_enabled = bool(_local_token) and bool(_peer_tokens_map)`),
+    and a 401 then masks the response a test asserts on. The cluster main node
+    exports exactly these variables, so any lane running the suite ON A WORKER
+    (e.g. the #872 verifier) sees every API test fail 401 != 422 and reads
+    that as the guard being broken. Measured: with the vars set, 40 tests in
+    the API files fail; cleared, all pass. CI never set them, so this only
+    bites on the fleet — the place the suite matters most.
+
+    Test-level intent is preserved: fixtures that SET the vars (test_peer_auth)
+    run after this one, and their own pops run before our restore, so the
+    snapshot restore is a no-op for them.
+    """
+    saved = {k: os.environ.pop(k, None) for k in ("PEER_TOKEN", "PEER_TOKENS")}
+    yield
+    for k, v in saved.items():
+        if v is not None:
+            os.environ[k] = v
+
+
 def _pg_available(dsn: str) -> bool:
     try:
         import asyncio
