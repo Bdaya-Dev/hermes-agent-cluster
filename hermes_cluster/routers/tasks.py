@@ -59,6 +59,75 @@ def _brief_names_target(title: str, target: str) -> bool:
     return re.search(r"(?<!\d)" + re.escape(target) + r"(?!\d)", title or "") is not None
 
 
+# Instance 2 of #872: lane `infra-github!275-rev-c` got a brief that MENTIONED
+# pr#275 (so the presence check above passed) while instructing the lane to
+# `gh pr comment 273`. The lane silently overrode its own brief and guessed
+# right -- a lane correcting its brief is luck, not a control.
+#
+# Two competing drafts each closed half the gap (shared/claude-plugins#872,
+# notes 135712/135713): one was strict but CLI-only (missed prose actions like
+# `then comment on 273`); the other was verb-broad but rejected only when the
+# lane's number was absent from the whole action set (`review 275 and gh pr
+# comment 273` slipped through) while false-rejecting dates and SHAs. This is
+# the combination both independent reviews recommended: #32's broad verbs with
+# #31's strict-per-number rule -- EVERY verb-bound number must equal the lane
+# target.
+#
+# Three adjacency guards keep the broad verbs off ordinary prose (each one a
+# measured false-rejection row from the 82-brief corpus):
+#   1. `(?!\w)` after the number -- `merge 995d5600` is an SHA fragment, not a
+#      ref to PR 995.
+#   2. `merge`/`close` require `the` or an explicit pr/mr/issue referrer --
+#      standing rules like `NEVER approve or merge` and `please merge when
+#      green` carry no bound number and match nothing.
+#   3. A digit-followed token after the number is a date -- `merged
+#      2026-09-11` is not PR 2026.
+# Bare cross-references that name no action (`Refs #872.`) stay legal: a
+# mention is context, not the job instruction.
+_ACTION_REF_RE = re.compile(
+    r"""(?ix)
+    \b(?:
+      # CLI form -- the measured incident: `gh pr comment 273`
+        (?: gh | glab ) \s+ (?: pr | mr | issue ) \s+
+            (?: comment | review | close | merge | edit | approve | ready )
+      # prose posting/reviewing actions
+      | comment (?: s | ed )? \s+ on
+      | post (?: s | ed )? (?: \s+ the \s+ \w+ )? \s+ (?: to | on | in )
+      | verdict \s+ (?: on | for )
+      | review (?: s | ed )? (?: \s+ the )? \s+ (?: pr | mr | issue ) \s* [!#]?
+      # merge/close are action-ish ONLY with a referrer or `the`; the
+      # past-tense forms additionally require `the` so `Closed issue #831
+      # last week` stays narrative, and `NEVER approve or merge` /
+      # `merge when green` carry no number to bind.
+      | (?: merge | close ) \s+ (?: the \s+ )? (?: pr | mr | issue ) \s* [!#]?
+      | (?: merged | closed ) \s+ the \s+ (?: pr | mr | issue )?
+    )
+    \s* [!#]? \s*
+    ( \d+ ) (?! \w )      # guard: `995d5600` is an SHA fragment, not a ref
+    """,
+)
+
+
+def _brief_action_numbers(brief: str) -> list:
+    """Numbers the brief binds a posting/reviewing ACTION to.
+
+    `gh pr comment 273`, `then comment on 273`, `merge the MR 273`, `review
+    PR#275`, `post the verdict to 273` -- each yields its number. Verb-only
+    phrases with no attached number (issue's own "NEVER approve or merge")
+    yield nothing.
+    """
+    return _ACTION_REF_RE.findall(brief or "")
+
+
+def _action_ref_mismatches(brief: str, target: str) -> list:
+    """Action-bound numbers that disagree with the lane's target.
+
+    Bounded comparison (same rule as _brief_names_target): an action on "27"
+    does not satisfy a target of "274" and IS a mismatch.
+    """
+    return [n for n in _brief_action_numbers(brief) if not _brief_names_target(n, target)]
+
+
 @router.post("")
 async def submit_task(req: SubmitTaskRequest):
     # #872: a task's `title` IS its brief -- the schema has no description
@@ -79,6 +148,26 @@ async def submit_task(req: SubmitTaskRequest):
                 f"completed. Fix the brief, or the lane_key."
             ),
         )
+    # Instance 2 of #872: the brief MENTIONED its target (275) while
+    # instructing `gh pr comment 273`. The presence check above accepted it;
+    # only the lane overriding its own brief saved that verdict. Every number
+    # the brief binds a posting/reviewing action to must equal the lane's
+    # target -- broad verbs (CLI + prose), strict per number.
+    if target:
+        mismatches = _action_ref_mismatches(req.title, target)
+        if mismatches:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"brief/action disagreement (#872): lane_key "
+                    f"{req.lane_key!r} names target {target}, but the title -- "
+                    f"which IS the brief -- binds a posting/reviewing action "
+                    f"to {', '.join(sorted(set(mismatches)))}. The lane would "
+                    f"act on the wrong target -- or silently override its own "
+                    f"brief and get lucky. Fix the number in the brief, or "
+                    f"the lane_key."
+                ),
+            )
 
     task_id = _generate_task_id()
     # Default only when the caller said nothing (None). 0 is a legal band —
