@@ -68,6 +68,7 @@ from urllib.request import Request, urlopen
 from urllib.error import URLError
 
 from .deliverable_guard import classify_non_deliverable, has_no_turn_stderr
+from . import lane_cost as _lane_cost
 
 
 def _npx_bin() -> str:
@@ -161,6 +162,13 @@ class ActiveSpawn:
     # (from the persisted record; main's task.attempts is the authority).
     # Rides through persistence so an executor restart cannot reset it.
     attempt: int = 0
+    # #929: cumulative per-model token buckets for this lane's session read AT
+    # SPAWN. The reap-time footnote prices the delta (now - baseline), so a
+    # resumed long-lived lane's earlier tasks are not double-counted and this
+    # delivery's figure is exactly its own spend. Empty dict = no baseline
+    # (fresh session — everything it records belongs to this task — or the
+    # store was unreadable at spawn; the footnote discloses either case).
+    cost_baseline: Dict[str, Dict[str, int]] = field(default_factory=dict)
 
 
 class _ResumedProcess:
@@ -966,6 +974,13 @@ class AgentExecutor:
             session_id=resume_session_id,
             resumed=bool(resume_session_id),
             attempt=self._prior_attempt(task_id, task),
+            # #929: snapshot the session's cumulative usage NOW (a resumed
+            # lane's earlier rows belong to earlier deliveries and must not be
+            # priced against this one). A fresh lane has no rows yet — empty
+            # baseline, and the full session total is this task's spend.
+            cost_baseline=_lane_cost.spawn_baseline(
+                self._config.hermes_profile, resume_session_id
+            ) if resume_session_id else {},
         )
 
         with self._lock:
@@ -1250,6 +1265,16 @@ class AgentExecutor:
             if (outcome in ("done", "transcript_promoted")
                     and spawn.mode == "hermes"):
                 self._touch_lane_from_spawn(spawn, task_id)
+                # #929: the executor-side cost footnote. The #860 enforcement
+                # hook appends the footnote to the lane's PRINTED final text —
+                # which since #868 is NOT the deliverable unless it was
+                # promoted — and it is dead on any node whose pinned
+                # bdaya-enforcement predates #860. Reap-time, the child has
+                # exited and its session's usage rows are on disk: price the
+                # delta against the spawn-time baseline and append to the
+                # DELIVERABLE itself, so every cluster lane result carries its
+                # own credit figure regardless of hook state. Fail-open.
+                self._append_cost_footnote(spawn)
             # A terminal lane's persisted record is dropped so a future run of
             # the same task may spawn again; an active lane's record survives
             # restarts and blocks a duplicate spawn.
@@ -1661,6 +1686,38 @@ class AgentExecutor:
                 if val:
                     return val
         return ""
+
+    def _append_cost_footnote(self, spawn: ActiveSpawn) -> None:
+        """#929 — append this delivery's credit footnote to its result file.
+
+        Runs at reap, after the child exited (its usage rows are on disk) and
+        after _touch_lane_from_spawn bound spawn.session_id. Every failure
+        mode is silent-by-design (fail-open): a meter that breaks lane
+        delivery is worse than no meter. Idempotent via the shared marker —
+        when the #860 enforcement hook already footnoted the print (and it
+        became the deliverable), this pass is a no-op.
+        """
+        try:
+            path = Path(spawn.result_path) if spawn.result_path else None
+            if path is None or not path.is_file():
+                return
+            if not spawn.session_id:
+                return
+            footnote = _lane_cost.footnote_for_delivery(
+                profile=self._config.hermes_profile,
+                session_id=spawn.session_id,
+                baseline=spawn.cost_baseline or {},
+                lane_key=spawn.lane_key,
+            )
+            if footnote is None:
+                return
+            if _lane_cost.append_footnote(path, footnote):
+                logger.info(
+                    "#929: cost footnote appended to lane result %s (lane %s)",
+                    path, spawn.lane_key or "?",
+                )
+        except Exception:
+            logger.exception("#929: cost footnote pass failed (delivery unaffected)")
 
     def _touch_lane_from_spawn(self, spawn: ActiveSpawn, task_id: str) -> None:
         """Record a lane's session id + last task into the lanes table.
