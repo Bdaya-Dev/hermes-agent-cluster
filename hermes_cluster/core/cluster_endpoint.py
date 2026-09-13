@@ -87,15 +87,22 @@ def candidate_config_paths(node_id: str = "",
                            explicit_path: str = "") -> list[Path]:
     """The fixed, documented search order for cluster config files.
 
-    Worker files are matched by their ``node.id`` (fleet convention:
-    cluster-worker-desktop.yaml declares windows_desktop_worker,
-    cluster-worker-pc.yaml declares windows_pc_worker, ...): the file NAME is
-    not the node id, so names alone cannot be trusted — every worker file is
-    parsed and only the one whose node.id equals *node_id* is considered.
+      1. an explicit path from the plugin settings (config_path),
+      2. the fleet-convention per-machine file
+         ``~/.config/bdaya/hermes-cluster.yaml`` (next to hermes-peer-token;
+         install-worker-profile.sh renders it on every member),
+      3. worker files in the deploy checkout, matched by their ``node.id``
+         (fleet convention: cluster-worker-desktop.yaml declares
+         windows_desktop_worker, cluster-worker-pc.yaml declares
+         windows_pc_worker, ...): the file NAME is not the node id, so names
+         alone cannot be trusted — every worker file is parsed and only the
+         one whose node.id equals *node_id* is considered,
+      4. the single-node ``cluster.yaml`` default in the deploy checkout.
     """
     out: list[Path] = []
     if explicit_path:
         out.append(Path(explicit_path).expanduser())
+    out.append(Path.home() / ".config" / "bdaya" / "hermes-cluster.yaml")
     if node_id:
         for worker_file in sorted(_REPO_ROOT.glob("cluster-worker-*.yaml")):
             cfg = _load_yaml(worker_file)

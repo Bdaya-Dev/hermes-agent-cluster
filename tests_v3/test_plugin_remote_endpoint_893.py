@@ -23,6 +23,19 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
+@pytest.fixture(autouse=True)
+def _no_ambient_fleet_home(tmp_path, monkeypatch):
+    """Keep the resolver's fleet-convention home file out of tests that do
+    not model it: on a fleet member ~/.config/bdaya/hermes-cluster.yaml is
+    REAL (install-worker-profile.sh renders it) and would win the search
+    order, turning 'loopback default' tests into false reds — the #872
+    ambient-state class, same lesson."""
+    from hermes_cluster.core import cluster_endpoint as ce
+    empty_home = tmp_path / "no-home"
+    empty_home.mkdir()
+    monkeypatch.setattr(ce.Path, "home", classmethod(lambda cls: empty_home))
+
+
 # ---------------------------------------------------------------------------
 # core/cluster_endpoint.py — the config resolver
 # ---------------------------------------------------------------------------
@@ -71,6 +84,22 @@ def test_explicit_path_wins(tmp_path, monkeypatch):
     conf.write_text('cluster:\n  endpoint: "http://main.local:8787/"\n', encoding="utf-8")
     r = ce.resolve_cluster_endpoint(explicit_path=str(conf))
     assert r["endpoint"] == "http://main.local:8787"  # trailing slash stripped
+
+
+def test_fleet_home_file_is_in_the_search_order(tmp_path, monkeypatch):
+    """~/.config/bdaya/hermes-cluster.yaml — rendered per machine by
+    install-worker-profile.sh — answers even when no node_id is known."""
+    ce = _fresh_resolver(tmp_path, monkeypatch)
+    home = tmp_path / "home"
+    (home / ".config" / "bdaya").mkdir(parents=True)
+    (home / ".config" / "bdaya" / "hermes-cluster.yaml").write_text(
+        "cluster:\n  id: bdaya_hermes_cluster\n  role: worker\n"
+        '  endpoint: "https://hermes.bdaya-dev.com"\n'
+        "node:\n  id: macbook_worker\n", encoding="utf-8")
+    monkeypatch.setattr(ce.Path, "home", classmethod(lambda cls: home))
+    r = ce.resolve_cluster_endpoint()
+    assert r["endpoint"] == "https://hermes.bdaya-dev.com"
+    assert r["node_id"] == "macbook_worker"
 
 
 def test_non_http_endpoint_is_incomplete_not_guessed(tmp_path, monkeypatch):
