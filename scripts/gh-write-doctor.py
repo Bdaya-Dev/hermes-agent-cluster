@@ -141,11 +141,11 @@ def main() -> int:
     if args.url:
         res = verify_posted(args.url, cfg)
     elif args.no_post:
-        res = local_check(dict(cfg, _no_post=True))
+        res = local_check(dict(cfg, _no_post=True), args.node)
     elif args.proof:
-        res = local_check(dict(cfg, _proof=True))
+        res = local_check(dict(cfg, _proof=True), args.node)
     else:
-        res = local_check(cfg)
+        res = local_check(cfg, args.node)
     if args.json:
         print(json.dumps(res))
     else:
