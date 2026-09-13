@@ -242,11 +242,15 @@ def _make_transport(routes):
 
 
 @pytest.mark.asyncio
-async def test_poller_group_fanout_and_full_dedup(clean_env):
+async def test_poller_group_fanout_and_full_dedup(clean_env, monkeypatch):
     """The core new capability: one cycle walks project AND group scopes
     (group paths 404 on /projects/:id — measured live, 2026-09-13), assigns
     per-issue bands (business author -> 0), and dedups by project+iid so two
     projects sharing iid 420 produce two tasks."""
+    # The endpoint-allowlist fix (PR#36 #2) validates against the boot/env
+    # endpoint — declare gitlab.test as this node's boot endpoint so the
+    # test's own endpoint passes the same gate production uses.
+    monkeypatch.setenv("GITLAB_INTAKE_ENDPOINT", "https://gitlab.test")
     routes = {
         "/projects/shared%2Fclaude-plugins/issues": [
             _issue_json(900, "legacy still works", "shared/claude-plugins", 1,
@@ -302,8 +306,9 @@ async def test_poller_group_fanout_and_full_dedup(clean_env):
 
 
 @pytest.mark.asyncio
-async def test_poller_group_path_404_on_project_endpoint_is_fatal_for_scope_only(clean_env):
+async def test_poller_group_path_404_on_project_endpoint_is_fatal_for_scope_only(clean_env, monkeypatch):
     """A broken scope logs per-scope error and the others still ingest."""
+    monkeypatch.setenv("GITLAB_INTAKE_ENDPOINT", "https://gitlab.test")
     routes = {
         "/groups/invora/issues": [
             _issue_json(7, "ok from group", "invora/invora-backend", 461),
@@ -364,18 +369,27 @@ async def test_poller_legacy_cycle_unchanged(clean_env):
 @pytest.mark.asyncio
 async def test_policy_put_requires_token_when_secret_configured(clean_env, monkeypatch):
     """The policy surface sits on the peer-auth public list (operators cannot
-    HMAC-sign), so it carries its own gate: X-Gitlab-Token must match
-    GITLAB_INTAKE_WEBHOOK_SECRET once that secret is configured. This pins the
-    auth contract its middleware comment promises."""
-    monkeypatch.setenv("GITLAB_INTAKE_WEBHOOK_SECRET", "op-secret")
+    HMAC-sign a plain GET), so WRITES carry their own gate: X-Gitlab-Token
+    must match the DEDICATED GITLAB_INTAKE_POLICY_SECRET (PR#36 review #1 —
+    no more reuse of the webhook secret). Once ANY intake credential is
+    configured the write path is fail-closed; with none configured the boot
+    warning applies (dev mode, same contract as the webhook)."""
+    monkeypatch.setenv("GITLAB_INTAKE_WEBHOOK_SECRET", "webhook-s3cret")
+    monkeypatch.setenv("GITLAB_INTAKE_POLICY_SECRET", "op-secret")
     app = create_app(cluster_id="t", node_id="n", node_role="main")
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://t") as c:
+        # the webhook secret no longer opens writes (credential separation)
+        r = await c.put("/api/v1/intake/gitlab/policy", json=POLICY_BODY,
+                        headers={"X-Gitlab-Token": "webhook-s3cret"})
+        assert r.status_code == 401
         r = await c.put("/api/v1/intake/gitlab/policy", json=POLICY_BODY)
         assert r.status_code == 401
-        r = await c.get("/api/v1/intake/gitlab/policy")
-        assert r.status_code == 401
+        # the dedicated operator secret does
         r = await c.put("/api/v1/intake/gitlab/policy", json=POLICY_BODY,
                         headers={"X-Gitlab-Token": "op-secret"})
+        assert r.status_code == 200
+        # READS stay open (no secret in the body; operator read->edit->write loop)
+        r = await c.get("/api/v1/intake/gitlab/policy")
         assert r.status_code == 200
 
 
