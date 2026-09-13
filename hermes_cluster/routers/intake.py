@@ -36,6 +36,26 @@ POLICY ENDPOINT SECURITY (PR#36 review, findings 1 & 2):
     a third-party host, so the GitLab PAT can never be sent to one — even
     if the policy credential leaks.
 
+DEPLOYMENT REQUIREMENTS (PR#36 round-2 review — operator-facing; the full
+section lives in README.md "Deployment Requirements: GitLab intake policy
+surface" and MUST be kept in sync with the notes here):
+  * The per-IP rate limiter keys on ``X-Forwarded-For``'s FIRST entry (see
+    ``_client_ip``), which is only meaningful behind a trusted L7 proxy that
+    REWRITES the header — GCLB in the hosted deployment. Exposing the pod
+    directly lets any caller spoof XFF per request and bypass per-IP
+    limiting (and poison the audit's source_ip). This is defense-in-depth,
+    NOT primary auth: peer-HMAC / GITLAB_INTAKE_POLICY_SECRET remain the
+    real gate. The dependency is documented, deliberately NOT enforced in
+    code (enforcement = behaviour change needing its own review).
+  * Credential posture: with NO intake credential configured at all (fresh
+    dev node: no policy secret, no webhook secret, peer-auth off), the
+    policy-write surface is open BY DESIGN — the exact contract the webhook
+    has always had — and every such write is audited as ``credential=none``.
+    Acceptable on a trusted dev network; NOT acceptable in production,
+    where GITLAB_INTAKE_POLICY_SECRET (dedicated — never the webhook
+    secret) + peer-auth MUST be set so writes fail closed. ``init()`` logs
+    this posture in every deployment's boot output.
+
 Legacy env wiring (kept working when no policy is configured):
   GITLAB_INTAKE_TOKEN     enables the background poller
   GITLAB_INTAKE_ENDPOINT  default https://gitlab.bdaya-dev.com
@@ -180,6 +200,18 @@ def init(state: ClusterState):
             "runtime control surface usable unaided. NEVER reuse the webhook "
             "secret here (PR#36 finding 1)."
         )
+    if not _policy_write_auth_configured():
+        # Deployment-posture log (PR#36 round-2 review): spell out the
+        # fail-open contract in the boot output every operator sees.
+        logger.warning(
+            "NO intake credential configured (GITLAB_INTAKE_POLICY_SECRET / "
+            "GITLAB_INTAKE_WEBHOOK_SECRET unset, peer-auth off) — the intake "
+            "POLICY-WRITE surface is OPEN by design, matching the webhook's "
+            "long-standing contract; every such write is audited as "
+            "credential=none. Acceptable on a trusted dev node; NOT for "
+            "production (see README 'Deployment Requirements: GitLab intake "
+            "policy surface')."
+        )
 
     # The poller starts when EITHER the legacy token wiring says so OR the
     # runtime policy enables it (a policy may enable polling even with the
@@ -260,7 +292,20 @@ def _client_ip(request: Request) -> str:
     behind GCLB in production, so request.client is the proxy). XFF is
     spoofable by the direct caller; behind GCLB it is rewritten per-hop, so
     for an off-network attacker this is the right key. Worst case it is the
-    LB's own IP: a coarse shared bucket, still bounded DoS amplification."""
+    LB's own IP: a coarse shared bucket, still bounded DoS amplification.
+
+    DEPLOYMENT REQUIREMENT (PR#36 round-2 review): this means per-IP
+    limiting is only meaningful behind a trusted proxy that REWRITES
+    X-Forwarded-For (GCLB). If the pod is ever exposed directly — e.g. a
+    dev node behind no LB — an attacker can spoof XFF per request and
+    bypass the rate limit entirely (and the audit's source_ip is
+    attacker-chosen). That is defense-in-depth erosion, not an auth
+    bypass: peer-HMAC / GITLAB_INTAKE_POLICY_SECRET remain the real gate.
+    Enforcement via a trusted-proxy config check is deliberately NOT done
+    here (behaviour change, own review); it is documented — see the module
+    docstring and README "Deployment Requirements: GitLab intake policy
+    surface".
+    """
     xff = request.headers.get("X-Forwarded-For", "")
     if xff:
         return xff.split(",")[0].strip()
