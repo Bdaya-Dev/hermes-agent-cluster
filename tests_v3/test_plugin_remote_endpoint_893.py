@@ -248,3 +248,20 @@ def test_register_survives_ctx_without_get_config(plugin_fresh, monkeypatch):
 
     plugin_fresh.register(LegacyCtx())
     assert any(t.startswith("kanban_cluster_") for t in LegacyCtx.tools)
+
+
+def test_package_init_does_not_eagerly_import_fastapi():
+    """#893: `import hermes_cluster.core.peer_auth` (stdlib-only, used by the
+    plugin signer) must not drag fastapi/pydantic in through the package
+    __init__ — that made every lane boot pay >10 s (or ImportError where the
+    server deps are absent). create_app stays reachable (lazy)."""
+    import subprocess
+    import sys
+    code = (
+        "import sys; import hermes_cluster.core.peer_auth;"
+        "assert 'fastapi' not in sys.modules, 'fastapi leaked via package __init__';"
+        "import hermes_cluster; assert callable(hermes_cluster.create_app)"
+    )
+    r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True,
+                       timeout=120)
+    assert r.returncode == 0, r.stderr[-400:]

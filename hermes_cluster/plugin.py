@@ -548,7 +548,11 @@ HANDLERS = {
 
 def _on_session_start(**kwargs) -> None:
     """Auto-start cluster server when session begins."""
-    config = _get_plugin_config()
+    # #893: reuse the config resolved at register() (Hermes settings + file
+    # defaults) — _get_plugin_config() alone would drop config_path/endpoint
+    # and could wrongly auto-start a local server on a worker attached to a
+    # remote main.
+    config = dict(_cluster_config) if _cluster_config else _get_plugin_config()
     if not config.get("auto_start", True):
         return
     # #893: when cluster config points at a REMOTE main, attaching is the
