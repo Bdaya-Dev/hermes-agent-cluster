@@ -174,6 +174,16 @@ a new main node MUST read both before exposing the surface:
    webhook secret — PR#36 finding 1) and peer-auth, at which point writes
    fail closed (401 without a signature or the operator token).
 
+**Grouped intake (`intake.gitlab.grouping`, #762 LFP-1).** With
+`grouping.enabled: true` a poll cycle emits ONE stateful-lane bundle task
+per client×repo batch — lane key `<repo>#<branch>`, membership persisted on
+the task row (restart-safe DEDUP FIRST) — instead of one task per issue. Set
+`lane_branch` (default `env/dev`) and `lane_branches` (repo → branch, e.g.
+the fork itself on `main`) to match each client repo's integration branch;
+`max_bundle_size` (default 40) caps a sitting. The band-0 author rule
+survives: business-team issues get their own queued bundle instantly.
+Disabling grouping restores the per-issue wiring byte-for-byte.
+
 ### 📡 API Reference
 
 All endpoints prefixed: `/api/v1`

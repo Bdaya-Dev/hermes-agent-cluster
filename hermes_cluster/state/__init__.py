@@ -36,6 +36,7 @@ from ..core.scheduler import (
     ACTIVE_TASK_STATUSES,
     TERMINAL_TASK_STATUSES,
     FairScheduler,
+    lane_blocked_ready_ids,
 )
 
 
@@ -195,6 +196,8 @@ class ClusterState:
         priority: int = 3,
         lane_key: str = "",
         role: str = "author",
+        description: str = "",
+        issues: Optional[List[str]] = None,
     ) -> Task:
         now = datetime.utcnow()
         task = Task(
@@ -208,6 +211,8 @@ class ClusterState:
             version=1,
             lane_key=lane_key,
             role=role,
+            description=description,
+            issues=list(issues or []),
         )
         with self._tasks_lock:
             self._tasks[task_id] = task
@@ -698,6 +703,9 @@ class ClusterState:
         leased_task_ids = self._active_leased_task_ids()
 
         with self._tasks_lock:
+            # LFP-1 cardinality guard (#762): ready tasks whose lane already
+            # has an active/earlier sibling are held back for a later tick.
+            lane_blocked = lane_blocked_ready_ids(self._tasks.values())
             # Per-node active load from tasks currently assigned to each node.
             active_counts: Dict[str, int] = {}
             for t in self._tasks.values():
@@ -711,6 +719,7 @@ class ClusterState:
                 [
                     t for t in self._tasks.values()
                     if t.status == TaskStatus.ready and t.id not in leased_task_ids
+                    and t.id not in lane_blocked
                 ],
                 key=lambda t: (t.priority, t.created_at),
             )

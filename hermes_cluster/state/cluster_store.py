@@ -42,6 +42,7 @@ from ..core.scheduler import (
     ACTIVE_TASK_STATUSES,
     TERMINAL_TASK_STATUSES,
     FairScheduler,
+    lane_blocked_ready_ids,
 )
 
 logger = logging.getLogger(__name__)
@@ -118,7 +119,10 @@ CREATE TABLE IF NOT EXISTS tasks (
     version INTEGER DEFAULT 0,
     fail_reason TEXT,
     attempts INTEGER DEFAULT 0,
-    result TEXT
+    result TEXT,
+    -- #762 grouped intake: bundle brief + restart-safe membership.
+    description TEXT DEFAULT '',
+    issues TEXT DEFAULT '[]'
 );
 
 -- Stateful lanes: one row per lane_key, keyed to the hermes session it owns.
@@ -327,6 +331,9 @@ class ClusterStore:
             # count carried on the spawn record.
             ("tasks", "attempts", "ALTER TABLE tasks ADD COLUMN attempts INTEGER DEFAULT 0"),
             ("task_spawns", "attempt", "ALTER TABLE task_spawns ADD COLUMN attempt INTEGER DEFAULT 0"),
+            # #762 grouped intake: bundle brief + membership columns.
+            ("tasks", "description", "ALTER TABLE tasks ADD COLUMN description TEXT DEFAULT ''"),
+            ("tasks", "issues", "ALTER TABLE tasks ADD COLUMN issues TEXT DEFAULT '[]'"),
         ):
             try:
                 cols = [r[1] for r in self._conn.execute(f"PRAGMA table_info({table})")]
@@ -516,16 +523,18 @@ class ClusterStore:
         priority: int = 3,
         lane_key: str = "",
         role: str = "author",
+        description: str = "",
+        issues: Optional[List[str]] = None,
     ) -> Task:
         now = datetime.utcnow()
         with self._tx() as conn:
             conn.execute(
                 """INSERT OR IGNORE INTO tasks
-                   (id, title, requires, depends_on, priority, status, created_at, updated_at, version, lane_key, role)
-                   VALUES (?, ?, ?, '[]', ?, ?, ?, ?, 1, ?, ?)""",
+                   (id, title, requires, depends_on, priority, status, created_at, updated_at, version, lane_key, role, description, issues)
+                   VALUES (?, ?, ?, '[]', ?, ?, ?, ?, 1, ?, ?, ?, ?)""",
                 (task_id, title, _json_dumps(requires), priority,
                  TaskStatus.pending.value, _dt_to_str(now), _dt_to_str(now),
-                 lane_key, role),
+                 lane_key, role, description, _json_dumps(list(issues or []))),
             )
         # Promote to ready immediately if no dependencies (matching ClusterState behavior)
         # The original in-memory store returns by reference so the caller
@@ -543,6 +552,7 @@ class ClusterStore:
             id=task_id, title=title, requires=requires, priority=priority,
             status=TaskStatus.pending, created_at=now, updated_at=now, version=1,
             lane_key=lane_key, role=role,
+            description=description, issues=list(issues or []),
         )
 
     def get_task(self, task_id: str) -> Optional[Task]:
@@ -761,6 +771,7 @@ class ClusterStore:
             attempts = int(row["attempts"] or 0)
         except (KeyError, IndexError, TypeError, ValueError):
             attempts = 0
+        keys = row.keys()
         return Task(
             id=row["id"],
             title=row["title"],
@@ -773,10 +784,13 @@ class ClusterStore:
             updated_at=_str_to_dt(row["updated_at"]),
             version=row["version"],
             fail_reason=row["fail_reason"],
-            result=(row["result"] if "result" in row.keys() else None),
+            result=(row["result"] if "result" in keys else None),
             attempts=attempts,
             lane_key=lane_key,
             role=role,
+            description=(row["description"] or "") if "description" in keys else "",
+            issues=(_json_loads(row["issues"])
+                    if "issues" in keys and row["issues"] else []),
         )
 
     # -------------------------------------------------------------------
@@ -1143,6 +1157,14 @@ class ClusterStore:
                 ).fetchall()
             }
 
+            # LFP-1 cardinality guard (#762): a ready task whose lane key has
+            # an ACTIVE sibling (or an earlier queued sibling) must wait —
+            # exactly one live sitting per lane, same invariant the
+            # bdaya-enforcement lane_key_guard DENIES at spawn time.
+            all_rows = conn.execute("SELECT * FROM tasks").fetchall()
+            lane_blocked = lane_blocked_ready_ids(
+                [self._row_to_task(r) for r in all_rows])
+
             ready_tasks = [
                 self._row_to_task(r)
                 for r in conn.execute(
@@ -1150,7 +1172,7 @@ class ClusterStore:
                        ORDER BY priority, created_at""",
                     (TaskStatus.ready.value,),
                 ).fetchall()
-                if r["id"] not in leased
+                if r["id"] not in leased and r["id"] not in lane_blocked
             ]
 
             for task in ready_tasks:

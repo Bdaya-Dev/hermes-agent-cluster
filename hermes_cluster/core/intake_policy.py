@@ -36,6 +36,11 @@ env-var wiring, so an unconfigured main node does not change behavior)::
           labels: {"priority::p0": 1}   # issue label -> band
           label_prefixes: ["business-now"]  # -> band 0
         dedup_scope: iid|full      # iid (default) = legacy behaviour
+        grouping:                  # LFP-1 lane bundling (#762) — default OFF
+          enabled: true
+          lane_branch: "env/dev"   # default target branch of the lane key
+          lane_branches: {"hermes-agent-cluster": "main"}  # repo -> branch
+          max_bundle_size: 40      # owner intent 30-40 issues/sitting
         allowed_endpoints: []      # FILE-SEED ONLY (see below) — extra hosts
 
 Label semantics: a scope with an empty/absent ``label`` ingests EVERY open
@@ -71,6 +76,8 @@ import urllib.parse
 from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, Field, field_validator
+
+from .intake_grouping import GroupingConfig
 
 VALID_PRIORITY_BANDS = frozenset(range(0, 6))
 
@@ -211,6 +218,10 @@ class GitLabIntakePolicy(BaseModel):
     scopes: List[IntakeScope] = Field(default_factory=list)
     priority: IntakePriority = Field(default_factory=IntakePriority)
     dedup_scope: str = "iid"  # "iid" (legacy) or "full" (project path + iid)
+    # LFP-1 grouped intake (#762): one lane bundle task per client×repo batch
+    # instead of one task per issue. Default OFF — an unconfigured policy
+    # keeps the legacy per-issue wiring byte-for-byte.
+    grouping: GroupingConfig = Field(default_factory=GroupingConfig)
 
     # File-seed-only: extra hosts allowed for `endpoint` (see module
     # docstring). Loaded into the env at boot by the file-seed path; never
