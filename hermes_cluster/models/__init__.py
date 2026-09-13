@@ -652,7 +652,15 @@ class TelemetryConfigJSON(BaseModel):
 
 
 class ConfigJSON(BaseModel):
-    """Go struct: api.configJSON — JSON API config representation."""
+    """Go struct: api.configJSON — JSON API config representation.
+
+    extra="allow" (hermes-factory-intake): unknown top-level sections — e.g.
+    the runtime ``intake.gitlab`` policy — must SURVIVE a PUT /api/v1/config
+    round-trip. With the default (drop-unknown), the dashboard's "save config"
+    would silently wipe any runtime section the Go-shaped model doesn't know.
+    """
+    model_config = {"extra": "allow"}
+
     cluster: ClusterConfigJSON = ClusterConfigJSON()
     node: NodeConfigJSON = NodeConfigJSON()
     server: ServerConfigJSON = ServerConfigJSON()

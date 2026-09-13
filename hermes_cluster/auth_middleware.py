@@ -36,6 +36,14 @@ PUBLIC_PATHS: FrozenSet[str] = frozenset({
     # GitLab webhook — has its own X-Gitlab-Token auth (PR#2).
     # GitLab (external) can never sign peer-HMAC, so this MUST be public.
     "/api/v1/intake/gitlab/webhook",
+    # Runtime intake POLICY read/write (hermes-factory-intake): the business
+    # team's 2am control surface. Peer-HMAC signing is impossible from a
+    # browser/plain curl, which would force the config through env-var/
+    # ConfigMap redeploys — exactly what the requirement forbids. Same auth
+    # contract as the webhook: the handlers enforce X-Gitlab-Token when
+    # GITLAB_INTAKE_WEBHOOK_SECRET is set (and log a warning at boot when it
+    # is not). Method-restricted to GET/PUT by the route itself.
+    "/api/v1/intake/gitlab/policy",
 })
 
 PUBLIC_PREFIXES: tuple = (
