@@ -528,6 +528,43 @@ class AgentExecutor:
             "- When done, state exactly what you produced (files, MR links, proof) in your final message.",
             "",
         ]
+        if role == "author":
+            # #893: the author lane hands off to an INDEPENDENT reviewer
+            # itself — no lead session in the loop. Written into the SHARED
+            # template (the one place every lane reads), not copy-pasted per
+            # brief. RV-1: the reviewer runs in a fresh context on a
+            # different lane; the author lane MUST NOT approve or merge; a
+            # needs-human label stays a live hard gate.
+            lines += [
+                "### Author hand-off (shared/claude-plugins#893 — no lead in the loop)",
+                "- When your work is done and the Draft MR/PR is open, DO NOT stop and wait for a "
+                "lead to notice. Submit your own reviewer task with `kanban_cluster_submit`: "
+                "`role='reviewer'`, `requires=['review']`, `lane_key='<repo>!<mr_iid>'` (the reviewer "
+                "lane key), and a title that carries the MR/PR URL and the exact head sha.",
+                "- Exception: a LANDING task (its brief names an existing reviewer PASS at the "
+                "current head sha) merges — it does NOT dispatch another reviewer. A reviewer "
+                "task only ever comes from an author lane that produced the diff.",
+                "- You are the AUTHOR lane. You MUST NOT approve or merge your own MR — RV-1 is not "
+                "negotiable. On a reviewer PASS at head the merge is actuated by a dedicated "
+                "LANDING task: submit it with role='author' on a landing lane key "
+                "(e.g. '<repo>#land-<mr_iid>', never the authoring lane key) carrying the "
+                "MR URL, the head sha AND the reviewer's PASS verdict reference. Never by you, "
+                "and never by the reviewer lane itself (#882's read-only gate mechanically "
+                "denies a reviewer merge).",
+                "",
+            ]
+        if role == "reviewer":
+            # #893 close of the loop, same shared template (not per-brief).
+            lines += [
+                "### Reviewer landing hand-off (shared/claude-plugins#893)",
+                "- Post your sha-pinned verdict as an MR note first (the durable oracle).",
+                "- On PASS at head: you MUST NOT merge (#882 denies it). Submit the LANDING task "
+                "yourself with `kanban_cluster_submit`: `role='author'`, "
+                "`lane_key='<repo>#land-<mr_iid>'`, title naming the MR URL, the verified head "
+                "sha, and your PASS. On NEEDS-CHANGES: do not submit landing; the verdict note "
+                "is the hand-back.",
+                "",
+            ]
         if deliverable_path:
             lines += [
                 "### Delivery contract (cluster executor)",

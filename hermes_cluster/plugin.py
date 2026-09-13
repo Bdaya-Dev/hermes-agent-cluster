@@ -38,6 +38,10 @@ _cluster_config: Dict[str, Any] = {}
 _server_thread: Optional[threading.Thread] = None
 _server_stop = threading.Event()
 _base_url: str = ""
+# #893: set when a cluster config NAMES an endpoint but it is unusable
+# (e.g. no http(s) scheme). The tools then answer LOUDLY with this reason
+# instead of silently addressing the wrong (loopback) cluster.
+_endpoint_error: str = ""
 
 DEFAULT_PORT = 8787
 DEFAULT_CLUSTER_ID = "hermes-cluster"
@@ -102,14 +106,35 @@ def _parse_peer_tokens(raw: str) -> Dict[str, str]:
     return out
 
 
+def _peer_token_from_file() -> str:
+    """Read the fleet-convention peer token file, or "" (never raises).
+
+    Same path worker_connector._resolve_peer_token falls back to
+    (~/.config/bdaya/hermes-peer-token) — one fleet convention, no env var.
+    """
+    try:
+        p = Path.home() / ".config" / "bdaya" / "hermes-peer-token"
+        if p.is_file():
+            return p.read_text(encoding="utf-8").strip()
+    except OSError:
+        pass
+    return ""
+
+
 def _configure_peer_auth(config: Dict[str, Any]) -> bool:
     """Configure module-level peer-auth signing for THIS process (plugin-only mode).
 
     In auto_start=false mode no server is created in-process, so nothing else
     ever calls peer_auth.configure(); without this every _api_call is unsigned
     and an auth-ON main answers 401. Returns True when signing was configured.
+
+    Token resolution mirrors worker_connector._resolve_peer_token — the fleet
+    convention file ``~/.config/bdaya/hermes-peer-token`` is the fallback when
+    no token is set in cluster config — so a worker needs ZERO env vars.
     """
     token = config.get("token") or ""
+    if not token:
+        token = _peer_token_from_file()
     if not token:
         return False
     try:
@@ -123,15 +148,71 @@ def _configure_peer_auth(config: Dict[str, Any]) -> bool:
 
 
 def _ensure_base_url(config: Dict[str, Any]) -> str:
-    """Set the module base URL from config when no in-process server is started.
+    """Resolve the module base URL from cluster CONFIG (#893), loopback default.
 
-    _start_server() used to be the only place that set _base_url, so in
-    auto_start=false (attach-to-existing-main) mode every _api_call was built
-    from an empty base and urlopen raised "unknown url type: '/api/v1/...'".
+    History: _start_server() used to be the only place that set _base_url, so
+    in auto_start=false (attach-to-existing-main) mode every _api_call was
+    built from an empty base and urlopen raised "unknown url type". Then the
+    base was hardcoded to 127.0.0.1, which made every tool on a WORKER node
+    address that worker's own local process — never the hosted main — so a
+    lane's kanban_cluster_submit silently submitted into a local void (#893).
+
+    Resolution order, all from cluster config files (owner ruling 2026-09-13:
+    NOTHING is configured from env vars):
+      1. an explicit ``endpoint`` key in the plugin config,
+      2. the node's cluster config file via core.cluster_endpoint
+         (``cluster: endpoint:`` — the SAME key the worker connector reads),
+      3. loopback on the configured port — single-node behaviour, unchanged.
+
+    When a config file NAMES an endpoint but it is unusable, _endpoint_error
+    is set and returned as "" so callers surface the reason instead of
+    guessing a cluster the operator did not configure.
     """
-    global _base_url
-    if not _base_url:
-        _base_url = f"http://127.0.0.1:{config.get('port', DEFAULT_PORT)}"
+    global _base_url, _endpoint_error
+    if _base_url:
+        return _base_url
+
+    explicit = str(config.get("endpoint") or "").strip().rstrip("/")
+    if explicit:
+        if explicit.startswith("http://") or explicit.startswith("https://"):
+            _base_url = explicit
+            logger.info("cluster plugin base URL from config endpoint: %s", _base_url)
+            return _base_url
+        _endpoint_error = (f"cluster endpoint config {explicit!r} is not an "
+                           "http(s) URL — refusing to guess a base URL")
+        return ""
+
+    try:
+        from .core.cluster_endpoint import resolve_cluster_endpoint
+        resolved = resolve_cluster_endpoint(
+            node_id=str(config.get("node_id") or ""),
+            explicit_path=str(config.get("config_path") or ""),
+        )
+    except Exception as e:  # pragma: no cover - defensive
+        resolved = {"endpoint": "", "incomplete": False, "why": str(e),
+                    "source": "", "node_id": "", "token": ""}
+
+    if resolved.get("endpoint"):
+        _base_url = resolved["endpoint"]
+        # The config file that NAMED the endpoint is also the authority for
+        # WHO this node is and what it signs with — take node_id/token from
+        # it (the same fields serve.py feeds the worker connector). This only
+        # runs when the file actually resolved an endpoint, so a repo with no
+        # cluster config cannot rewrite an env-configured plugin identity.
+        if resolved.get("node_id"):
+            config["node_id"] = resolved["node_id"]
+        if not config.get("token") and resolved.get("token"):
+            config["token"] = resolved["token"]
+        logger.info("cluster plugin base URL from %s: %s",
+                    resolved.get("source"), _base_url)
+        return _base_url
+
+    if resolved.get("incomplete"):
+        _endpoint_error = resolved.get("why") or "cluster endpoint config invalid"
+        return ""
+
+    # Nothing names an endpoint: single-node default, loopback (pre-#893).
+    _base_url = f"http://127.0.0.1:{config.get('port', DEFAULT_PORT)}"
     return _base_url
 
 
@@ -216,6 +297,11 @@ def _api_call(method: str, path: str, data: dict = None) -> dict:
     so the product works with auth ON.
     """
     url = f"{_base_url}{path}"
+    if not _base_url:
+        # #893 loud-by-default: config named an unusable endpoint
+        # (_endpoint_error) or nothing resolved. Never address the wrong
+        # cluster silently — an author lane must see WHY its submit failed.
+        return {"error": _endpoint_error or "cluster endpoint not configured"}
     body = json.dumps(data).encode() if data else None
     req = Request(url, data=body, method=method)
     req.add_header("Content-Type", "application/json")
@@ -275,12 +361,33 @@ def handle_cluster_join(args: dict, **kwargs) -> str:
 
 
 def handle_cluster_submit(args: dict, **kwargs) -> str:
-    """Submit a task to the cluster."""
-    result = _api_call("POST", "/api/v1/tasks", {
+    """Submit a task to the cluster.
+
+    #893: POST /api/v1/tasks creates the row but does NOT schedule it — on the
+    deployed main assignment happens at node joins, capability changes and
+    completions, or on an explicit POST /api/v1/schedule/trigger. A lane that
+    submits a reviewer task and stops must not leave it inert in `ready`
+    waiting for the next event (measured 2026-09-12 in #878's notes: an
+    unscheduled ready task sat 3+ minutes with idle workers; one trigger call
+    dispatched it in <15s). Trigger after a successful create so self-dispatch
+    actually dispatches. The call is best-effort: a main that already schedules
+    on create is unaffected, and a trigger failure never masks the submit.
+    """
+    payload = {
         "title": args.get("title", "Untitled task"),
         "requires": args.get("requires", []),
         "priority": args.get("priority", 3),
-    })
+    }
+    # Fork PR#16 lane contract: role + lane_key ride the same submit so an
+    # author lane can hand off a reviewer task bound to the reviewer lane key.
+    for opt in ("role", "lane_key"):
+        if args.get(opt):
+            payload[opt] = args[opt]
+    result = _api_call("POST", "/api/v1/tasks", payload)
+    if isinstance(result, dict) and not result.get("error"):
+        trigger = _api_call("POST", "/api/v1/schedule/trigger", {})
+        if isinstance(trigger, dict) and trigger.get("error"):
+            logger.warning("schedule trigger after submit failed: %s", trigger["error"])
     return json.dumps(result)
 
 
@@ -360,13 +467,21 @@ SCHEMAS = {
     },
     "kanban_cluster_submit": {
         "name": "kanban_cluster_submit",
-        "description": "Submit a task to the cluster for distributed execution.",
+        "description": (
+            "Submit a task to the cluster for distributed execution. Used by an "
+            "author lane for its hand-off: pass role='reviewer', requires=['review'] "
+            "and lane_key='<repo>!<mr_iid>' to dispatch the independent reviewer "
+            "yourself (RV-1: a fresh context on a different lane — never approve or "
+            "merge your own work)."
+        ),
         "parameters": {
             "type": "object",
             "properties": {
-                "title": {"type": "string", "description": "Task title/description"},
+                "title": {"type": "string", "description": "Task title/description (the lane's brief)"},
                 "requires": {"type": "array", "items": {"type": "string"}, "description": "Required capabilities"},
-                "priority": {"type": "integer", "description": "Priority (1=highest, 5=lowest)", "default": 3},
+                "priority": {"type": "integer", "description": "Priority band, ascending sort: 0=most urgent, 1..5 documented bands (default 3)", "default": 3},
+                "role": {"type": "string", "enum": ["author", "reviewer"], "description": "Lane role: reviewer lanes spawn fresh-context on the reviewer tier"},
+                "lane_key": {"type": "string", "description": "Stateful lane identity, e.g. '<repo>!<mr_iid>' for a reviewer lane"},
             },
             "required": ["title"],
         },
@@ -436,6 +551,14 @@ def _on_session_start(**kwargs) -> None:
     config = _get_plugin_config()
     if not config.get("auto_start", True):
         return
+    # #893: when cluster config points at a REMOTE main, attaching is the
+    # whole point — auto-starting a local FastAPI here would spawn a second,
+    # empty cluster (the #890 gateway-pod failure mode). Resolve first, then
+    # decide.
+    base = _ensure_base_url(config)
+    if base and "127.0.0.1" not in base and "localhost" not in base:
+        logger.info("cluster plugin attached to remote main %s — local auto-start skipped", base)
+        return
 
     def _start_in_background():
         try:
@@ -461,9 +584,36 @@ def _on_session_end(**kwargs) -> None:
 # Plugin registration
 # ---------------------------------------------------------------------------
 
+def _config_from_hermes_settings(ctx) -> Dict[str, Any]:
+    """Layer Hermes plugin settings (plugins.entries.<id>.settings.*) on the
+    file defaults. This is the config home per the owner ruling — the Hermes
+    config FILE, read through ctx.get_config — not env vars. get_config is
+    probed with getattr: the fork's unit-test Ctx stubs predate it.
+
+    Settings honoured (all optional):
+      endpoint    — direct cluster-main base URL (beats cluster config files)
+      node_id     — which worker cluster config file names this node
+      config_path — explicit cluster config YAML (search anchor)
+      auto_start  — local server auto-start (default true, single-node mode)
+    """
+    cfg = _get_plugin_config()
+    get = getattr(ctx, "get_config", None)
+    if callable(get):
+        for key in ("endpoint", "node_id", "config_path", "auto_start"):
+            try:
+                value = get(key)
+            except Exception:
+                value = None
+            if value not in (None, ""):
+                cfg[key] = value
+    return cfg
+
+
 def register(ctx) -> None:
     """Register cluster tools with Hermes Agent."""
-    _cfg = _get_plugin_config()
+    _cfg = _config_from_hermes_settings(ctx)
+    global _cluster_config
+    _cluster_config = _cfg
     _ensure_base_url(_cfg)
     _configure_peer_auth(_cfg)
     for name, schema in SCHEMAS.items():

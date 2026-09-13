@@ -24,9 +24,30 @@ def test_configure_peer_auth_from_env(monkeypatch):
 
 def test_configure_peer_auth_noop_without_token(monkeypatch):
     monkeypatch.delenv("HERMES_CLUSTER_TOKEN", raising=False)
+    # #893: _configure_peer_auth falls back to the fleet convention file
+    # (~/.config/bdaya/hermes-peer-token, same as worker_connector). This test
+    # asserts "no token ANYWHERE -> noop", so neutralize the file leg — on a
+    # fleet member the file exists and would flip the answer for reasons the
+    # test does not model (#872 ambient-state class).
+    monkeypatch.setattr(plugin, "_peer_token_from_file", lambda: "")
     cfg = plugin._get_plugin_config()
     cfg["token"] = ""
     assert plugin._configure_peer_auth(cfg) is False
+
+
+def test_configure_peer_auth_falls_back_to_fleet_token_file(monkeypatch):
+    """#893: a worker with no explicit token signs with the fleet-convention
+    file — zero env vars required (owner ruling 2026-09-13)."""
+    monkeypatch.delenv("HERMES_CLUSTER_TOKEN", raising=False)
+    monkeypatch.setattr(plugin, "_peer_token_from_file", lambda: "tok-from-file")
+    cfg = plugin._get_plugin_config()
+    cfg["token"] = ""
+    cfg["node_id"] = "node_file"
+    assert plugin._configure_peer_auth(cfg) is True
+    from hermes_cluster.core import peer_auth
+    st = peer_auth.get_default_state()
+    assert st.local_node_id == "node_file"
+    assert peer_auth.sign_request("GET", "/api/v1/tasks", b"").get("X-Peer-Node") == "node_file"
 
 
 def test_register_configures_signing(monkeypatch):
