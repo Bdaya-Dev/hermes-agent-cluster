@@ -143,6 +143,37 @@ telemetry:
 ./kanban-cluster
 ```
 
+#### Deployment Requirements: GitLab intake policy surface
+
+The GitLab intake feature (`/api/v1/intake/gitlab/*`, runtime policy store —
+see `hermes_cluster/routers/intake.py`) carries two deployment-side
+requirements that the code documents but does NOT enforce. An operator wiring
+a new main node MUST read both before exposing the surface:
+
+1. **Per-IP rate limiting is only meaningful behind a trusted proxy that
+   rewrites `X-Forwarded-For` — GCLB in the hosted deployment.** The policy
+   write limiter keys on the FIRST `X-Forwarded-For` entry (the pod sits
+   behind GCLB, so the header's first hop is the real client and the LB
+   rewrites it per-hop). If the pod is ever reachable directly — a dev node
+   with no load balancer, a `kubectl port-forward`, a NodePort — a caller
+   can send a fresh spoofed `X-Forwarded-For` per request and bypass the
+   per-IP limit entirely (and choose what the audit log records as
+   `source_ip`). This is defense-in-depth, not primary authentication:
+   peer-HMAC / `GITLAB_INTAKE_POLICY_SECRET` remain the real gate. Keep the
+   pod behind GCLB (or a proxy with equivalent XFF-rewrite semantics); do
+   not expose it directly outside a trusted network.
+
+2. **With NO intake credential configured, the policy-write surface is open
+   by design — dev posture only.** A fresh dev node with
+   `GITLAB_INTAKE_POLICY_SECRET`, `GITLAB_INTAKE_WEBHOOK_SECRET` unset and
+   peer-auth off accepts unsigned policy writes, exactly matching the
+   webhook's long-standing open-with-boot-warning contract; every such write
+   is audited (`credential=none`) and the boot log warns. This is acceptable
+   on a trusted dev network and **NOT acceptable in production**: production
+   MUST set a dedicated `GITLAB_INTAKE_POLICY_SECRET` (never reuse the
+   webhook secret — PR#36 finding 1) and peer-auth, at which point writes
+   fail closed (401 without a signature or the operator token).
+
 ### 📡 API Reference
 
 All endpoints prefixed: `/api/v1`
