@@ -52,7 +52,10 @@ def local_check(cfg: dict, node_label: str = "") -> dict:
         return out
     probe_repo = cfg.get("write_probe_repo", "Bdaya-Dev/bdaya-website-infra")
     probe_pr = str(cfg.get("write_probe_pr", "288"))
-    resolver = cfg.get("resolver_file") or os.path.join(_resolver_dir(), "lane_gh_token.py")
+    # Resolver single source of truth: claude-plugins/hermes/scripts/lane_gh_token.py,
+    # installed per-node by install-worker-profile.sh to the stable path below.
+    resolver = cfg.get("resolver_file") or os.path.expanduser(
+        "~/.config/bdaya/lane-gh-token/lane_gh_token.py")
     try:
         token = subprocess.run(
             [sys.executable, resolver, "get"], capture_output=True, text=True, timeout=90
