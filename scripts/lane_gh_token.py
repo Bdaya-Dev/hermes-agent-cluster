@@ -193,8 +193,7 @@ def cmd_get(as_json: bool, force: bool) -> int:
     # (same ADC->SM chain as the alibaba key and run-worker-macbook.sh) —
     # so a new member needs ZERO hand-placed files, and a node without SM
     # access fails LOUDLY here (the probe maps it to MISSING at dispatch).
-    kf = cfg["private_key_file"]
-    if not (os.path.exists(kf) and cfg.get("app_id") and cfg.get("installation_id")):
+    if not (os.path.exists(cfg["private_key_file"]) and cfg.get("app_id") and cfg.get("installation_id")):
         try:
             cmd_hydrate_key(force=False)
         except SystemExit:
