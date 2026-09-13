@@ -129,7 +129,10 @@ async def webhook(request: Request):
         raise HTTPException(status_code=400, detail=f"Invalid or missing iid: {issue_iid!r}")
 
     title = attrs.get("title", "")
-    task, is_new = _create_task_from_issue(issue_iid=issue_iid, title=title, label=label)
+    task, is_new = _create_task_from_issue(
+        issue_iid=issue_iid, title=title, label=label,
+        description=attrs.get("description", "") or "",
+    )
     status = "created" if is_new else "deduped"
     return {"status": status, "task_id": task.id, "task": task.model_dump(mode="json")}
 
@@ -192,8 +195,14 @@ def _create_task_from_issue(
     issue_iid: int,
     title: str,
     label: str,
+    description: str = "",
 ) -> tuple[Task, bool]:
     """Create a cluster task from a GitLab issue, dedup by iid.
+
+    #872 (deeper half): the issue BODY is the brief and rides in the task's
+    own `description` column; the title stays the one-line `[#iid] Issue
+    title` goal. Before this the body had nowhere to go, which is exactly the
+    conflation that let one lane's brief land in another lane's title.
 
     Returns (task, is_new) where is_new=True if a new task was created,
     False if an existing task was returned (dedup hit).
@@ -210,6 +219,7 @@ def _create_task_from_issue(
         title=f"[#{issue_iid}] {title}",
         requires=_intake_requires(),
         priority=3,
+        description=description or "",
     )
     _issue_iid_to_task_id[issue_iid] = task_id
     _state.trigger_pending_tasks()
@@ -294,6 +304,9 @@ class _GitLabPoller:
                 issue_iid=iid,
                 title=issue["title"],
                 label=self.label,
+                # #872: the issue body IS the brief — give it the column it
+                # now has instead of leaving it nowhere.
+                description=issue.get("description", "") or "",
             )
             if is_new:
                 self.tasks_created += 1

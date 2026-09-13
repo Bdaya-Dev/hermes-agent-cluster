@@ -133,6 +133,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     attempts INTEGER DEFAULT 0,
     lane_key TEXT DEFAULT '',
     role TEXT DEFAULT 'author',
+    description TEXT DEFAULT '',
     result TEXT
 );
 
@@ -349,6 +350,10 @@ class PostgresClusterStore:
             # #874: the lane deliverable, so a result outlives the node that made it.
             await conn.execute(
                 "ALTER TABLE tasks ADD COLUMN IF NOT EXISTS result TEXT")
+            # #872 (deeper half): the brief's own column, same additive drift
+            # pattern (CREATE TABLE IF NOT EXISTS never touches an old table).
+            await conn.execute(
+                "ALTER TABLE tasks ADD COLUMN IF NOT EXISTS description TEXT DEFAULT ''")
             await conn.execute(
                 "ALTER TABLE task_spawns ADD COLUMN IF NOT EXISTS attempt INTEGER DEFAULT 0")
         logger.info("PostgresClusterStore: connected, schema ensured")
@@ -586,6 +591,7 @@ class PostgresClusterStore:
         priority: int = 3,
         lane_key: str = "",
         role: str = "author",
+        description: str = "",
     ) -> Task:
         now = _utcnow()
         # One transaction: insert-if-absent then promote pending->ready
@@ -597,11 +603,11 @@ class PostgresClusterStore:
             await conn.execute(
                 """INSERT INTO tasks
                    (id, title, requires, depends_on, priority, status,
-                    created_at, updated_at, version, lane_key, role)
-                   VALUES ($1, $2, $3, '[]', $4, $5, $6, $6, 1, $7, $8)
+                    created_at, updated_at, version, lane_key, role, description)
+                   VALUES ($1, $2, $3, '[]', $4, $5, $6, $6, 1, $7, $8, $9)
                    ON CONFLICT (id) DO NOTHING""",
                 task_id, title, _json_dumps(requires), priority,
-                TaskStatus.pending.value, now, lane_key, role,
+                TaskStatus.pending.value, now, lane_key, role, description,
             )
             await conn.execute(
                 """UPDATE tasks SET status = $1, updated_at = $2
@@ -801,6 +807,7 @@ class PostgresClusterStore:
             attempts=int(row["attempts"] or 0) if "attempts" in row.keys() else 0,
             lane_key=row["lane_key"] or "",
             role=row["role"] or "author",
+            description=(row["description"] or "") if "description" in row.keys() else "",
         )
 
     # -------------------------------------------------------------------

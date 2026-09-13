@@ -129,6 +129,14 @@ class Task(BaseModel):
     updated_at: datetime = Field(default_factory=datetime.utcnow)
     version: int = 0
     fail_reason: Optional[str] = None
+    # #872 (deeper half): the BRIEF gets its own column. Until now `title` IS
+    # the brief (the schema had nowhere else to put it), so the only dispatch
+    # shape was "paste the brief into the column named title": a 7.5 KB
+    # markdown blob rode in the field every other consumer reads as a one-line
+    # goal (dashboard, --goal, intake). With this column: title is the goal
+    # line, description is the job text. Absent => title-as-brief, exactly the
+    # legacy behavior (the #872 guards keep working either way).
+    description: str = ""
     # #870: deliveries re-queued back to this node after a non-deliverable
     # result (provider error / echoed brief). The retry cap lives HERE — on
     # main, the scheduler's source of truth — so an executor restart or a
@@ -706,6 +714,11 @@ class UpdateCapabilitiesRequest(BaseModel):
 
 class SubmitTaskRequest(BaseModel):
     title: str
+    # #872 (deeper half): the task's BRIEF, in its own column. When present it
+    # is what the lane is dispatched to do and what the #872 brief/target
+    # guards validate; `title` stays the one-line goal. When absent, title IS
+    # the brief (legacy shape, unchanged).
+    description: str = ""
     requires: List[str] = []
     # Bands for the ascending scheduler sort (ORDER BY priority, created_at):
     # 0=top band (most urgent), 1..5 documented bands, unset -> default 3.

@@ -275,12 +275,23 @@ def handle_cluster_join(args: dict, **kwargs) -> str:
 
 
 def handle_cluster_submit(args: dict, **kwargs) -> str:
-    """Submit a task to the cluster."""
-    result = _api_call("POST", "/api/v1/tasks", {
+    """Submit a task to the cluster.
+
+    #872 goal-vs-brief contract: `title` is the ONE-LINE goal (what --goal and
+    the dashboard show). `description` is the full brief the lane is
+    dispatched to execute. Never paste the brief into `title` -- that
+    conflation is what made one lane run another lane's job and report
+    completed.
+    """
+    body = {
         "title": args.get("title", "Untitled task"),
         "requires": args.get("requires", []),
         "priority": args.get("priority", 3),
-    })
+    }
+    for k in ("description", "lane_key", "role"):
+        if args.get(k):
+            body[k] = args[k]
+    result = _api_call("POST", "/api/v1/tasks", body)
     return json.dumps(result)
 
 
@@ -360,11 +371,14 @@ SCHEMAS = {
     },
     "kanban_cluster_submit": {
         "name": "kanban_cluster_submit",
-        "description": "Submit a task to the cluster for distributed execution.",
+        "description": "Submit a task to the cluster for distributed execution. #872: `title` is the ONE-LINE goal; the full brief goes in `description` -- never paste a multi-line brief into title.",
         "parameters": {
             "type": "object",
             "properties": {
-                "title": {"type": "string", "description": "Task title/description"},
+                "title": {"type": "string", "description": "One-line goal (what --goal and the dashboard show)"},
+                "description": {"type": "string", "description": "The task's full brief -- the job text the lane executes (#872: never paste this into title)"},
+                "lane_key": {"type": "string", "description": "Stateful lane identity, e.g. 'shared/claude-plugins#feat/x' or 'infra-github!275-rev-c'"},
+                "role": {"type": "string", "enum": ["author", "reviewer"], "description": "author = profile default model; reviewer = review tier"},
                 "requires": {"type": "array", "items": {"type": "string"}, "description": "Required capabilities"},
                 "priority": {"type": "integer", "description": "Priority (1=highest, 5=lowest)", "default": 3},
             },

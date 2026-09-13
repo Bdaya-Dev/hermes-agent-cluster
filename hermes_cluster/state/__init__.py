@@ -195,6 +195,7 @@ class ClusterState:
         priority: int = 3,
         lane_key: str = "",
         role: str = "author",
+        description: str = "",
     ) -> Task:
         now = datetime.utcnow()
         task = Task(
@@ -208,6 +209,7 @@ class ClusterState:
             version=1,
             lane_key=lane_key,
             role=role,
+            description=description,
         )
         with self._tasks_lock:
             self._tasks[task_id] = task

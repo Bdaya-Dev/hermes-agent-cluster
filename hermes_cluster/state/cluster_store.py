@@ -118,6 +118,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     version INTEGER DEFAULT 0,
     fail_reason TEXT,
     attempts INTEGER DEFAULT 0,
+    description TEXT DEFAULT '',
     result TEXT
 );
 
@@ -320,6 +321,9 @@ class ClusterStore:
             ("tasks", "lane_key", "ALTER TABLE tasks ADD COLUMN lane_key TEXT DEFAULT ''"),
             ("tasks", "role", "ALTER TABLE tasks ADD COLUMN role TEXT DEFAULT 'author'"),
             ("tasks", "result", "ALTER TABLE tasks ADD COLUMN result TEXT"),
+            # #872 (deeper half): the brief's own column, same additive-drift
+            # pattern as #874's result.
+            ("tasks", "description", "ALTER TABLE tasks ADD COLUMN description TEXT DEFAULT ''"),
             ("task_spawns", "lane_key", "ALTER TABLE task_spawns ADD COLUMN lane_key TEXT DEFAULT ''"),
             ("task_spawns", "role", "ALTER TABLE task_spawns ADD COLUMN role TEXT DEFAULT 'author'"),
             ("task_spawns", "session_id", "ALTER TABLE task_spawns ADD COLUMN session_id TEXT DEFAULT ''"),
@@ -516,16 +520,17 @@ class ClusterStore:
         priority: int = 3,
         lane_key: str = "",
         role: str = "author",
+        description: str = "",
     ) -> Task:
         now = datetime.utcnow()
         with self._tx() as conn:
             conn.execute(
                 """INSERT OR IGNORE INTO tasks
-                   (id, title, requires, depends_on, priority, status, created_at, updated_at, version, lane_key, role)
-                   VALUES (?, ?, ?, '[]', ?, ?, ?, ?, 1, ?, ?)""",
+                   (id, title, requires, depends_on, priority, status, created_at, updated_at, version, lane_key, role, description)
+                   VALUES (?, ?, ?, '[]', ?, ?, ?, ?, 1, ?, ?, ?)""",
                 (task_id, title, _json_dumps(requires), priority,
                  TaskStatus.pending.value, _dt_to_str(now), _dt_to_str(now),
-                 lane_key, role),
+                 lane_key, role, description),
             )
         # Promote to ready immediately if no dependencies (matching ClusterState behavior)
         # The original in-memory store returns by reference so the caller
@@ -542,7 +547,7 @@ class ClusterStore:
         return self.get_task(task_id) or Task(
             id=task_id, title=title, requires=requires, priority=priority,
             status=TaskStatus.pending, created_at=now, updated_at=now, version=1,
-            lane_key=lane_key, role=role,
+            lane_key=lane_key, role=role, description=description,
         )
 
     def get_task(self, task_id: str) -> Optional[Task]:
@@ -761,6 +766,10 @@ class ClusterStore:
             attempts = int(row["attempts"] or 0)
         except (KeyError, IndexError, TypeError, ValueError):
             attempts = 0
+        try:
+            description = row["description"] or ""
+        except (KeyError, IndexError):
+            description = ""
         return Task(
             id=row["id"],
             title=row["title"],
@@ -777,6 +786,7 @@ class ClusterStore:
             attempts=attempts,
             lane_key=lane_key,
             role=role,
+            description=description,
         )
 
     # -------------------------------------------------------------------
