@@ -36,14 +36,16 @@ def _resolver_dir() -> str:
     return os.path.dirname(os.path.abspath(__file__))
 
 
-def _node_id(cfg: dict) -> str:
+def _node_id(cfg: dict, override: str = "") -> str:
+    if override:
+        return override
     if cfg.get("node_id"):
         return cfg["node_id"]
     return os.uname().nodename if hasattr(os, "uname") else os.environ.get("COMPUTERNAME", "unknown")
 
 
-def local_check(cfg: dict) -> dict:
-    out = {"node": _node_id(cfg), "verdict": "ok", "detail": ""}
+def local_check(cfg: dict, node_label: str = "") -> dict:
+    out = {"node": _node_id(cfg, node_label), "verdict": "ok", "detail": ""}
     key_file = os.path.expanduser(cfg.get("private_key_file", "~/.config/bdaya/lane-agent-app.pem"))
     if not os.path.exists(key_file) or not os.path.exists(CONFIG_PATH):
         out.update(verdict="MISSING", detail="private key or config not provisioned on this node")
@@ -71,12 +73,12 @@ def local_check(cfg: dict) -> dict:
         out["detail"] = "key present, token minted; POST skipped (--no-post)"
         return out
     url = f"https://api.github.com/repos/{probe_repo}/issues/{probe_pr}/comments"
-    body = (f"[bdaya-lane-agent] #867 doctor WRITE probe from {_node_id(cfg)} — "
+    body = (f"[bdaya-lane-agent] #867 doctor WRITE probe from {out['node']} — "
             "no action needed.")
     req = urllib.request.Request(url, data=json.dumps({"body": body}).encode(), method="POST", headers={
         "Authorization": f"Bearer {tok}",
         "Accept": "application/vnd.github+json",
-        "User-Agent": f"gh-write-doctor-{_node_id(cfg)}",
+        "User-Agent": f"gh-write-doctor-{out['node']}",
     })
     try:
         with urllib.request.urlopen(req, timeout=30) as r:
@@ -86,15 +88,16 @@ def local_check(cfg: dict) -> dict:
             return out
         out["post_url"] = c["html_url"]
         out["author"] = c["user"]["login"]
-        # Clean the probe comment back up — the write-path proof is the POST
-        # verdict, not permanent noise on the PR.
-        try:
-            dele = urllib.request.Request(c["url"], method="DELETE", headers={
-                "Authorization": f"Bearer {tok}", "User-Agent": "gh-write-doctor"})
-            urllib.request.urlopen(dele, timeout=30)
-            out["cleanup"] = "deleted"
-        except Exception as e:
-            out["cleanup"] = f"FAILED ({e}) — delete manually"
+        if not cfg.get("_proof"):
+            # Clean the probe comment back up — the write-path proof is the POST
+            # verdict, not permanent noise on the PR. (--proof keeps it.)
+            try:
+                dele = urllib.request.Request(c["url"], method="DELETE", headers={
+                    "Authorization": f"Bearer {tok}", "User-Agent": "gh-write-doctor"})
+                urllib.request.urlopen(dele, timeout=30)
+                out["cleanup"] = "deleted"
+            except Exception as e:
+                out["cleanup"] = f"FAILED ({e}) — delete manually"
     except urllib.error.HTTPError as e:
         if e.code in (403, 404):
             out.update(verdict="NOPR", detail=f"write POST rejected HTTP {e.code} on {probe_repo}#{probe_pr}")
@@ -128,6 +131,9 @@ def main() -> int:
     ap.add_argument("--json", action="store_true")
     ap.add_argument("--url", help="verify a posted comment URL is authored by the App")
     ap.add_argument("--no-post", action="store_true", help="check key+mint only, do not POST")
+    ap.add_argument("--proof", action="store_true",
+                    help="post a PERSISTENT identity proof comment (not deleted) and verify the author")
+    ap.add_argument("--node", default="", help="fleet node label recorded in the proof (e.g. windows-desktop)")
     args = ap.parse_args()
     cfg = {}
     if os.path.exists(CONFIG_PATH):
@@ -136,6 +142,8 @@ def main() -> int:
         res = verify_posted(args.url, cfg)
     elif args.no_post:
         res = local_check(dict(cfg, _no_post=True))
+    elif args.proof:
+        res = local_check(dict(cfg, _proof=True))
     else:
         res = local_check(cfg)
     if args.json:
