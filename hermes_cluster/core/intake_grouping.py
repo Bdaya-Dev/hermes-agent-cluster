@@ -335,7 +335,15 @@ def reviewer_handoff_brief(bundle: BundlePlan, mr_url: str, head_sha: str,
     posting instruction, and CLOSE-THE-LOOP (reviewer lands on PASS —
     reviewer != author and fresh-context, so RV-1 holds — and hands back to
     the ORIGINAL author lane on NEEDS-CHANGES). The author NEVER appears on
-    the approve/merge side of this text."""
+    the approve/merge side of this text.
+
+    Under the 2026-09-14 owner ruling (shared/claude-plugins VP-1 fold) the
+    reviewer's duties widened: the separate live-verify lane is retired, so
+    THIS brief also carries the folded VP-1 close leg — re-run the TDDD-1
+    guard RED→GREEN, read the post-deploy e2e job at env/dev after landing,
+    then post the folded `VP-1: PASS — Surface: merged@<sha> +
+    ci-job@<project>/<job-id> — <mr-url> — verifier: @<you>` note on each
+    fixed issue and CLOSE it yourself (needs-human stays a hard stop)."""
     issues = ", ".join(f"#{i}" for i in bundle.iids)
     rev_key = reviewer_lane_key or f"{bundle.lane_key}-rev"
     return (
@@ -375,6 +383,23 @@ def reviewer_handoff_brief(bundle: BundlePlan, mr_url: str, head_sha: str,
         f"    (sha pinned; the tool refuses a stale head). Reviewer != author\n"
         f"    and this lane is fresh-context, so RV-1 holds — a `needs-human`\n"
         f"    label is a hard stop: NEVER land past it.\n"
+        f"  * FOLDED VP-1 (owner ruling 2026-09-14 — the separate live-verify\n"
+        f"    lane is RETIRED; you are the live verifier): for every listed\n"
+        f"    user-facing issue, before its close — (1) RE-RUN the issue's\n"
+        f"    TDDD-1 guard YOURSELF both ways: RED with the defect present\n"
+        f"    (mutation/revert of the fix line), GREEN with the fix; keep the\n"
+        f"    red and green output lines; (2) AFTER landing at the merge sha,\n"
+        f"    read the post-deploy e2e job on the deployed env/dev surface\n"
+        f"    (patrol/playwright frontend, black-box e2e/integration backend):\n"
+        f"    `finished_at` set + `status=success` + the trace shows the suite\n"
+        f"    ran and passed — CG-1: the job's TERMINAL TRACE, never pipeline\n"
+        f"    color. Then post on EACH fixed issue:\n"
+        f"    `VP-1: PASS — Surface: merged@<merge-sha> + ci-job@<project>/<job-id> — {mr_url} — verifier: @<your-username>`\n"
+        f"    (bdaya-glab note post; the close gate parses exactly this folded\n"
+        f"    shape) and CLOSE it yourself: `bdaya-glab issue close`. An issue\n"
+        f"    whose post-deploy job is not green STAYS OPEN with label\n"
+        f"    `fix-merged-awaiting-live-verify` — never close on the merge\n"
+        f"    alone, and never relabel to dodge the gate.\n"
         f"  * On NEEDS-CHANGES: do NOT land. Submit a follow-up AUTHOR task on\n"
         f"    the ORIGINAL lane_key `{bundle.lane_key}` (role='author') via\n"
         f"    `kanban_cluster_submit`, carrying your findings verbatim — the\n"
@@ -406,11 +431,17 @@ def bundle_brief(bundle: BundlePlan) -> str:
         f"    inside it is the LFP-1 carve-out and the diff MUST stay reviewable —\n"
         f"    if it exceeds one review pass, split the MR and say so on every\n"
         f"    dropped issue's disposition note.\n"
-        f"  * PROOF IS NOT DILUTED BY BUNDLING: each issue needs its own scoped\n"
-        f"    proof (per-issue VP-1 instance, TDDD-1 fence for bug-labeled ones)\n"
-        f"    and its own disposition note. The MR `Refs` every issue — NEVER\n"
-        f"    `Closes` (the VP-1 close gate fires them on merge before live\n"
-        f"    verification). Each issue closes individually AFTER its proof note.\n"
+        f"  * PROOF IS NOT DILUTED BY BUNDLING (per-issue, folded per the\n"
+        f"    2026-09-14 owner ruling): each bug-labeled issue needs its own\n"
+        f"    TDDD-1 fence AND the guard it names — extend the e2e/test layer\n"
+        f"    where the symptom is user-visible (patrol/playwright for frontend,\n"
+        f"    black-box e2e / integration / unit for backend), proven RED with\n"
+        f"    the defect and GREEN with the fix — plus its own disposition note.\n"
+        f"    There is NO separate live-verification pass anymore: the MR's\n"
+        f"    reviewer re-runs that guard RED→GREEN and reads the post-deploy\n"
+        f"    e2e job at env/dev, then posts the folded VP-1 note and closes\n"
+        f"    the issue itself. The MR `Refs` every issue — NEVER `Closes`\n"
+        f"    (the close gate fires them on merge before the reviewer's proof).\n"
         f"  * DAG: do not fix an issue above whose open blocker (is_blocked_by,\n"
         f"    outside this bundle) is unmerged — record the hold as its\n"
         f"    disposition instead.\n"
