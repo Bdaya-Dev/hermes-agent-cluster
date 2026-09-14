@@ -132,10 +132,34 @@ class TestServeWorkerLock:
         (lock_dir / f"{node_id}.lock").write_text(json.dumps(
             {"node_id": node_id, "pid": 999999, "token": "old",
              "port": si.derive_port(node_id)}), encoding="utf-8")
-        rc, printed = _run_worker_serve(tmp_path, node_id=node_id)
-        assert rc == 0, f"stale lock must allow takeover, got: {printed[:300]!r}"
-        data = json.loads((lock_dir / f"{node_id}.lock").read_text())
-        assert data["pid"] == os.getpid()  # file rewritten to the live holder
+
+        # Keep the restarted instance alive INSIDE the run so the lock file
+        # can be inspected before the graceful-shutdown release unlinks it.
+        seen = {}
+
+        def fake_run(app, **kwargs):
+            path = lock_dir / f"{node_id}.lock"
+            seen["exists"] = path.is_file()
+            if seen["exists"]:
+                seen["data"] = json.loads(path.read_text(encoding="utf-8"))
+
+        argv = ["serve", "--node-role", "worker", "--node-id", node_id,
+                "--db-path", str(tmp_path / "w.db"),
+                "--instance-token", "tkRestart"]
+        out, err = io.StringIO(), io.StringIO()
+        rc = 0
+        with patch.object(sys, "argv", argv), \
+             patch("uvicorn.run", side_effect=fake_run):
+            try:
+                with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                    serve_main()
+            except SystemExit as exc:
+                rc = exc.code if isinstance(exc.code, int) else 1
+        assert rc == 0, f"stale lock must allow takeover, got rc={rc}"
+        assert seen.get("exists") is True, "takeover did not write a lock file"
+        data = seen["data"]
+        assert data["pid"] == os.getpid()   # rewritten to the live holder
+        assert data["token"] == "tkRestart"  # the declared identity is kept
 
     def test_port_squatter_with_dead_holder_pid_fails_loud(self, tmp_path):
         """The unambiguous-collision case: the derived port is held by a

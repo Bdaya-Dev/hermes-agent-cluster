@@ -149,7 +149,14 @@ def main():
     print(f"Health:    http://{args.host}:{args.port}/health")
 
     import uvicorn
-    uvicorn.run(app, host=args.host, port=args.port)
+    try:
+        uvicorn.run(app, host=args.host, port=args.port)
+    finally:
+        # #899: release the node-id lock on graceful shutdown (the OS frees
+        # it on any exit anyway; this keeps the lock file tidy for the
+        # documented restart path).
+        if _worker_lock is not None:
+            _worker_lock.release()
 
 
 if __name__ == "__main__":
