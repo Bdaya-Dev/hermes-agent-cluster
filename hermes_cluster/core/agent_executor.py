@@ -68,6 +68,7 @@ import logging
 import errno
 import os
 import shutil
+import signal
 import subprocess
 import threading
 import time
@@ -90,6 +91,41 @@ def _npx_bin() -> str:
     Node is on PATH. shutil.which applies PATHEXT and returns the real file.
     """
     return shutil.which("npx") or "npx"
+
+
+def _persisted_ids_refresh_interval(default: float = 15.0) -> float:
+    """How often a running executor re-reads the persisted spawn table.
+
+    #899: the single-instance lock and the /join 409 are the primary
+    defences, but a duplicate executor can still slip in beside a live
+    one (an older build without the lock, or a takeover racing the
+    watchdog window). The spawn-suppression set used to be built ONCE at
+    reconcile, so a record persisted by a sibling after our start was
+    invisible and we re-spawned the task. A periodic refresh closes that
+    window to one poll cycle; cheap (one indexed SELECT) and env-tunable
+    for tests. A negative/zero value disables refreshes (pre-#899
+    behaviour).
+    """
+    raw = os.environ.get("HERMES_CLUSTER_PERSISTED_REFRESH_S", "")
+    if raw:
+        try:
+            return float(raw)
+        except ValueError:
+            pass
+    return default
+
+
+def _tree_kill_kwargs() -> dict:
+    """Popen kwargs that make the child killable as a TREE (#898).
+
+    POSIX: ``start_new_session=True`` puts the child in its own process group,
+    so the cancel sweep can ``killpg`` the whole tree — the incident saw the
+    cancelled lane's hermes.exe plus two python children outlive the cancel
+    because plain ``terminate()`` reaches only the direct child.
+    Windows: CREATE_NEW_PROCESS_GROUP is applied at the Popen call site
+    already; ``taskkill /T`` covers the tree in _kill_spawn_process.
+    """
+    return {} if os.name == "nt" else {"start_new_session": True}
 
 
 def _record_attempt(record: dict) -> int:
@@ -372,8 +408,17 @@ class AgentExecutor:
         self._reconciled = False
         # Persisted task-id cache (F4): reconciled once from the store, then
         # maintained in-memory by _persist_spawn/_drop_persisted_spawn so the
-        # poll loop never re-reads SQLite. Reseeded by reconcile on start.
+        # poll loop never re-reads SQLite. Reseeded by reconcile on start,
+        # and re-read periodically while running (#899 — see
+        # _refresh_persisted_ids).
         self._persisted_ids: set = set()
+        self._persisted_refresh_s = _persisted_ids_refresh_interval()
+        self._last_persisted_refresh = 0.0
+        # #897: terminal reports (complete/fail) that could not be delivered
+        # because main was unreachable — retried every poll cycle with
+        # exponential backoff. Keyed by (verb, task_id); each value holds
+        # path/payload/attempts/next_at.
+        self._pending_reports: Dict[tuple, dict] = {}
         # Per-lane FIFO of task dicts waiting for the lane's in-flight
         # delivery to reap (#858 defect 1). Guarded by self._lock.
         self._lane_queue: Dict[str, List[dict]] = {}
@@ -486,6 +531,9 @@ class AgentExecutor:
         # 1. Check completed/failed spawns
         self._reap_finished_spawns()
 
+        # 1a. #897: retry terminal reports queued during a main outage.
+        self._drain_pending_reports()
+
         # 1b. Reap idle stateful lanes (lead requirement, #833 2026-09-10):
         # a lane idle past lane_idle_timeout has its lanes row cleared so the
         # next task with that lane_key starts fresh (session left on disk).
@@ -579,6 +627,11 @@ class AgentExecutor:
                 t.get("id", "")
                 for q in self._lane_released.values() for t in q
             }
+        # #899: re-read the persisted spawn table periodically (not only at
+        # reconcile) so a record written AFTER our start — by a sibling
+        # executor that bypassed the lock, or by ourselves mid-cycle — still
+        # suppresses a second spawn of the same task.
+        self._refresh_persisted_ids()
         active_task_ids |= self._persisted_spawn_task_ids()
 
         candidates = []
@@ -721,6 +774,15 @@ class AgentExecutor:
                 "lead to notice. Submit your own reviewer task with `kanban_cluster_submit`: "
                 "`role='reviewer'`, `requires=['review']`, `lane_key='<repo>!<mr_iid>'` (the reviewer "
                 "lane key), and a title that carries the MR/PR URL and the exact head sha.",
+                "- SUBMIT EXACTLY ONE reviewer task, then FINISH your turn (#898). Never cancel "
+                "or resubmit it: a reviewer that has not started is QUEUED, not lost — capacity, "
+                "not your attention, decides when it runs. If your head moves before it starts, "
+                "leave the task as it is (the reviewer reads the LIVE head and pins its verdict "
+                "sha). Measured 2026-09-14: an author lane that cancel-and-resubmitted four times "
+                "while reviewers were queued burned 90 minutes of credits and landed nothing; a "
+                "resubmit on a lane_key with a live reviewer is also refused by the main "
+                "(returns the existing task). The reviewer hands back to you itself on "
+                "NEEDS-CHANGES — waiting for it is never the author's job.",
                 "- Exception: a LANDING task (its brief names an existing reviewer PASS at the "
                 "current head sha) merges — it does NOT dispatch another reviewer. A reviewer "
                 "task only ever comes from an author lane that produced the diff.",
@@ -891,6 +953,11 @@ class AgentExecutor:
                 creationflags=subprocess.CREATE_NEW_PROCESS_GROUP
                 if os.name == "nt"
                 else 0,
+                # #898: on POSIX, make the child its own session/group leader so
+                # a cancel can killpg the WHOLE tree — the cancelled-lane
+                # incident saw hermes.exe plus two python children outlive the
+                # cancel because terminate() reaches only the direct child.
+                **_tree_kill_kwargs(),
             )
         except FileNotFoundError:
             logger.error(
@@ -1333,6 +1400,9 @@ class AgentExecutor:
                 creationflags=subprocess.CREATE_NEW_PROCESS_GROUP
                 if os.name == "nt"
                 else 0,
+                # #898: POSIX tree-kill session (see _tree_kill_kwargs) — the
+                # cancelled-lane incident's orphan was THIS spawn mode.
+                **_tree_kill_kwargs(),
             )
         except FileNotFoundError:
             for f in (stdout_file, stderr_file):
@@ -1474,67 +1544,127 @@ class AgentExecutor:
                 task_id = record.get("task_id", "")
                 if not task_id or task_id in self._active_spawns:
                     continue
-                lane_key = record.get("lane_key") or ""
-                role = record.get("role") or "author"
-                session_id = record.get("session_id") or ""
-                # Worker-restart re-attach by lane_key: if the record does not
-                # carry a session id but the lanes table knows the lane's
-                # session, recover it so a resume (not a fresh spawn) follows.
-                if lane_key and not session_id and getattr(self, "_store", None) is not None:
-                    try:
-                        lane = self._store.get_lane(lane_key)
-                        if lane:
-                            session_id = lane.get("session_id") or ""
-                    except Exception:
-                        logger.exception("failed to read lane %s during reconcile", lane_key)
-                spawn = ActiveSpawn(
-                    task_id=task_id,
-                    task_title=record.get("job_id") or task_id,
-                    process=_ResumedProcess(int(record.get("pid") or 0)),
-                    lease_id=record.get("lease_id") or "",
-                    started_at=float(record.get("started_at") or time.time()),
-                    lane_name=record.get("lane_name") or f"hermes-{task_id}",
-                    mode=record.get("mode") or "bdaya-dispatch",
-                    result_path=record.get("result_path") or "",
-                    attempt=_record_attempt(record),
-                    stdout_path=(
-                        str(self._hermes_stdout_path(task_id))
-                        if record.get("mode") == "hermes"
-                        else ""
-                    ),
-                    stderr_path=(
-                        record.get("stderr_path")
-                        or str(self._hermes_stderr_path(task_id))
-                        if record.get("mode") == "hermes"
-                        else record.get("stderr_path") or ""
-                    ),
-                    # #894: deterministic from task_id, same as stdout/stderr —
-                    # a reconciled hermes spawn must still see its escalation.
-                    escalation_path=(
-                        str(self._hermes_escalation_path(task_id))
-                        if record.get("mode") == "hermes"
-                        else ""
-                    ),
-                    resumed=True,
-                    lane_key=lane_key,
-                    role=role,
-                    session_id=session_id,
-                )
-                self._active_spawns[task_id] = spawn
-                reconstituted += 1
-                if lane_key:
-                    # Block a duplicate worker for the lane's task (the spawn is
-                    # live-tracked again, not re-delivered to the same lane).
-                    logger.info(
-                        "reattached lane %s (session %s) to task %s after restart",
-                        lane_key, session_id or "?", task_id,
-                    )
+                if self._reattach_record_locked(record):
+                    reconstituted += 1
+        self._last_persisted_refresh = time.time()
         self._reconciled = True
         if reconstituted:
             logger.info(
                 "reconciled %d persisted spawn(s) from store — resuming tracking, "
                 "NOT re-spawning", reconstituted,
             )
+
+    def _reattach_record_locked(self, record: dict) -> bool:
+        """Rehydrate one persisted spawn record into the active-spawn table.
+
+        Caller holds self._lock. Returns True when a spawn was reattached.
+        #899: shared by reconcile-on-start and the periodic
+        _refresh_persisted_ids pass, so a record that appears WHILE the
+        executor runs (written by a sibling that bypassed the lock) is
+        tracked against its live pid exactly like a restart-time record —
+        the task never gets a second session and is reaped normally.
+        """
+        task_id = record.get("task_id", "")
+        if not task_id or task_id in self._active_spawns:
+            return False
+        lane_key = record.get("lane_key") or ""
+        role = record.get("role") or "author"
+        session_id = record.get("session_id") or ""
+        # Worker-restart re-attach by lane_key: if the record does not
+        # carry a session id but the lanes table knows the lane's
+        # session, recover it so a resume (not a fresh spawn) follows.
+        if lane_key and not session_id and getattr(self, "_store", None) is not None:
+            try:
+                lane = self._store.get_lane(lane_key)
+                if lane:
+                    session_id = lane.get("session_id") or ""
+            except Exception:
+                logger.exception("failed to read lane %s during reconcile", lane_key)
+        # #899: the record carries the child's pid — wrap it in the
+        # OS-level liveness stand-in so the reap keeps polling the REAL
+        # process (os.kill probe), not a guess.
+        spawn = ActiveSpawn(
+            task_id=task_id,
+            task_title=record.get("job_id") or task_id,
+            process=_ResumedProcess(int(record.get("pid") or 0)),
+            lease_id=record.get("lease_id") or "",
+            started_at=float(record.get("started_at") or time.time()),
+            lane_name=record.get("lane_name") or f"hermes-{task_id}",
+            mode=record.get("mode") or "bdaya-dispatch",
+            result_path=record.get("result_path") or "",
+            attempt=_record_attempt(record),
+            stdout_path=(
+                str(self._hermes_stdout_path(task_id))
+                if record.get("mode") == "hermes"
+                else ""
+            ),
+            stderr_path=(
+                record.get("stderr_path")
+                or str(self._hermes_stderr_path(task_id))
+                if record.get("mode") == "hermes"
+                else record.get("stderr_path") or ""
+            ),
+            # #894: deterministic from task_id, same as stdout/stderr —
+            # a reconciled hermes spawn must still see its escalation.
+            escalation_path=(
+                str(self._hermes_escalation_path(task_id))
+                if record.get("mode") == "hermes"
+                else ""
+            ),
+            resumed=True,
+            lane_key=lane_key,
+            role=role,
+            session_id=session_id,
+        )
+        self._active_spawns[task_id] = spawn
+        if lane_key:
+            # Block a duplicate worker for the lane's task (the spawn is
+            # live-tracked again, not re-delivered to the same lane).
+            logger.info(
+                "reattached lane %s (session %s) to task %s after restart",
+                lane_key, session_id or "?", task_id,
+            )
+        return True
+
+    def _refresh_persisted_ids(self) -> None:
+        """Re-read the persisted spawn table while running (#899).
+
+        Cheap guard behind the single-instance lock: any record that
+        appeared after reconcile — the fingerprint of a second executor
+        for this node id — is added to the suppression cache AND
+        re-attached live against its pid, so this executor spawns zero
+        sessions for it and the normal reap logic takes over. Throttled
+        to _persisted_refresh_s (env-tunable; <0 disables for pre-#899
+        behaviour).
+        """
+        if getattr(self, "_store", None) is None:
+            return
+        if self._persisted_refresh_s < 0:
+            return
+        now = time.time()
+        if now - self._last_persisted_refresh < self._persisted_refresh_s:
+            return
+        self._last_persisted_refresh = now
+        try:
+            records = self._store.get_all_task_spawns()
+        except Exception:
+            logger.warning("failed to refresh persisted spawn records", exc_info=True)
+            return
+        fresh = {r.get("task_id", "") for r in records} - {""}
+        added = fresh - self._persisted_ids
+        self._persisted_ids = fresh
+        if not added:
+            return
+        logger.warning(
+            "#899: %d spawn record(s) appeared after this executor started "
+            "(%s) — a second executor for node '%s' is writing them; "
+            "re-attaching instead of spawning",
+            len(added), sorted(added), self._node_id,
+        )
+        with self._lock:
+            for record in records:
+                if record.get("task_id", "") in added:
+                    self._reattach_record_locked(record)
 
     def _drop_persisted_spawn(self, task_id: str) -> None:
         """Remove a terminal spawn's record so a future run may spawn again."""
@@ -1561,6 +1691,57 @@ class AgentExecutor:
     _MISS_GRACE_COUNT = 4  # ~60s at default 15s poll_interval
     _MISS_GRACE_SECONDS = 90.0
 
+    def _sweep_cancelled_spawns(self) -> None:
+        """#898: kill the process tree of every spawn whose task main says is cancelled.
+
+        Called first in each reap cycle. For each active spawn, GET
+        ``/api/v1/tasks/<id>``; when the row reads ``cancelled`` or
+        ``cancel_requested`` (the lead or the dedupe path cancelled it while
+        our child still runs — the incident's shape), terminate the tree,
+        drop local state, and ack: a ``cancel_requested`` row needs the
+        worker's ``/fail`` ack to close the two-phase protocol (the existing
+        B2 ack path turns it into ``cancelled``). A read failure keeps the
+        spawn (poll-loop bounded by spawn_timeout); a 404 (task deleted) is
+        treated as gone-for-good and kills too, since no ack endpoint can
+        succeed on it anyway.
+        """
+        with self._lock:
+            items = list(self._active_spawns.items())
+        for task_id, spawn in items:
+            row = _signed_request(
+                self._cluster_endpoint, "GET", f"/api/v1/tasks/{task_id}",
+                None, self._token, self._node_id,
+            )
+            if row is None:
+                continue  # unreadable: leave it to the timeout bound (F1)
+            status = str(row.get("status", ""))
+            if status not in ("cancelled", "cancel_requested"):
+                continue
+            logger.warning(
+                "task %s is %s on main — killing spawn tree pid %s and acking "
+                "cancel (#898: cancel must terminate the lane, not just bookkeep)",
+                task_id, status, getattr(spawn.process, "pid", "?"),
+            )
+            self._kill_spawn_process(spawn)
+            with self._lock:
+                self._active_spawns.pop(task_id, None)
+            self._drop_persisted_spawn(task_id)
+            self._lane_queue_meta.pop(task_id, None)
+            for f in (spawn.stdout_file, spawn.stderr_file):
+                try:
+                    if f is not None:
+                        f.close()
+                except Exception:
+                    pass
+            if status == "cancel_requested":
+                # The two-phase protocol expects the worker ack to close it.
+                _signed_request(
+                    self._cluster_endpoint, "POST",
+                    f"/api/v1/tasks/{task_id}/fail",
+                    {"reason": "worker ack: lane terminated after cancel (task was kill-switched by main, #898)"},
+                    self._token, self._node_id,
+                )
+
     def _reap_finished_spawns(self) -> None:
         """Poll lane status for active spawns and report terminal states.
 
@@ -1576,6 +1757,18 @@ class AgentExecutor:
           - query failure (not just empty result) → keep waiting (bounded by timeout)
           - lane absent from status → grace window before failing
         """
+        if not self._active_spawns:
+            return
+
+        # 0. #898 cancel sweep FIRST: a task cancelled on main must not keep
+        # a live spawn. Measured 2026-09-14: POST /tasks/<id>/cancel flipped
+        # the row to cancelled while the spawned session ran 10+ minutes
+        # longer and submitted ANOTHER reviewer — cancel was bookkeeping
+        # only. Re-read each active spawn's task row; if it is
+        # cancelled/cancel_requested, kill the child process TREE, drop the
+        # local state, and ack the close (a cancel_requested row completes
+        # the two-phase protocol via the /fail ack path).
+        self._sweep_cancelled_spawns()
         if not self._active_spawns:
             return
 
@@ -2122,15 +2315,40 @@ class AgentExecutor:
             ))
 
     def _kill_spawn_process(self, spawn: ActiveSpawn) -> None:
-        """Best-effort terminate of a spawn's child process (tree on Windows)."""
+        """Best-effort terminate of a spawn's child PROCESS TREE (#898).
+
+        POSIX: the child leads its own group (``_tree_kill_kwargs``), so
+        ``killpg`` reaches every descendant — the cancelled lane left
+        hermes.exe plus two python children alive because terminate()
+        touches only the direct child. Group gone or not ours: fall back to
+        the direct terminate/kill pair.
+        Windows: ``taskkill /T /F`` kills the tree of the CREATE_NEW_PROCESS_GROUP
+        root; the direct kill stays as the last resort.
+        """
         proc = spawn.process
         if proc is None or isinstance(proc, _ResumedProcess):
             return  # nothing to kill (reconciled record holds no live handle)
         try:
             if os.name == "nt":
-                proc.kill()
+                pid = getattr(proc, "pid", None)
+                killed_tree = False
+                if pid:
+                    try:
+                        subprocess.Popen(
+                            ["taskkill", "/T", "/F", "/PID", str(pid)],
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL,
+                        ).wait(timeout=10)
+                        killed_tree = True
+                    except Exception:
+                        pass
+                if not killed_tree:
+                    proc.kill()
             else:
-                proc.terminate()
+                try:
+                    os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+                except OSError:
+                    proc.terminate()
         except Exception:
             try:
                 proc.kill()
@@ -2695,34 +2913,28 @@ class AgentExecutor:
         #874: this used to POST an empty {} and discard `detail`, so a result
         lived only on the local disk of whichever node ran the lane -- a verdict
         produced on one machine was unreadable from every other.
+
+        #897: if the POST fails (main unreachable — the multi-minute rollout
+        windows measured 2026-09-14), the report is QUEUED and retried with
+        exponential backoff instead of being dropped. A lost completion used to
+        leave the task `running` until lease expiry + recovery rescheduled it:
+        the lane's work was DONE but the factory paid for it twice.
         """
         payload = {"result": result} if result else {}
-        result_ok = _signed_request(
-            self._cluster_endpoint,
-            "POST",
-            f"/api/v1/tasks/{task_id}/complete",
-            payload,
-            self._token,
-            self._node_id,
-        )
-        if result_ok:
-            logger.info(
-                'task %s marked completed: %s (result: %s)',
-                task_id, detail or 'ok',
-                f'{len(result)} chars carried' if result else 'none',
-            )
-        else:
-            logger.error('failed to mark task %s completed', task_id)
+        self._queue_report("complete", task_id, payload,
+                           detail=f"completed: {detail or 'ok'}")
 
     def _report_failure(self, task_id: str, reason: str,
                         fallback: str = "") -> bool:
-        """Mark a task as failed on the main node.
+        """Mark a task as failed on the main node (queued + retried — #897).
 
         #858: a failure must carry a real reason — the busy-lane incident
         reached operators as `failed` with `error: None`. A blank reason is
         replaced by *fallback* when the caller has one, and the report is
         REFUSED (returns False, loudly logged) when neither exists: no
-        reasonless failure goes on the wire.
+        reasonless failure goes on the wire — not even into the #897 retry
+        queue. Once the reason is real, delivery follows the #897 path:
+        attempted now, queued with backoff if main is unreachable.
         """
         reason = (reason or "").strip() or (fallback or "").strip()
         if not reason:
@@ -2732,16 +2944,79 @@ class AgentExecutor:
                 "the caller is required; the task stays un-failed and "
                 "visible as stuck", task_id)
             return False
-        result = _signed_request(
-            self._cluster_endpoint,
-            "POST",
-            f"/api/v1/tasks/{task_id}/fail",
-            {"reason": reason},
-            self._token,
-            self._node_id,
+        self._queue_report("fail", task_id, {"reason": reason},
+                           detail=f"failed: {reason[:100]}")
+        return True
+
+    # ------------------------------------------------------------------ #
+    # #897 — pending terminal-report queue
+    # ------------------------------------------------------------------ #
+
+    _REPORT_BACKOFF_BASE = 0.5    # seconds; doubles per failed attempt
+    _REPORT_BACKOFF_CAP = 60.0    # never wider than the poll loop needs anyway
+    _REPORT_MAX_ATTEMPTS = 100    # ~1h+ of retries at the cap; then give up LOUD
+
+    def _queue_report(self, verb: str, task_id: str, payload: dict,
+                      detail: str = "") -> None:
+        """POST a terminal report now; on failure queue it for retry.
+
+        Keyed by (verb, task_id): a task can hold one pending complete AND one
+        pending fail (e.g. reap raced a manual fail); last write wins per verb.
+        """
+        path = f"/api/v1/tasks/{task_id}/{verb}"
+        ok = _signed_request(
+            self._cluster_endpoint, "POST", path, payload,
+            self._token, self._node_id,
         )
-        if result:
-            logger.info("task %s marked failed: %s", task_id, reason[:100])
-        else:
-            logger.error("failed to mark task %s failed", task_id)
-        return bool(result)
+        if ok:
+            logger.info("task %s %s", task_id, detail or verb)
+            return
+        with self._lock:
+            self._pending_reports[(verb, task_id)] = {
+                "path": path,
+                "payload": payload,
+                "detail": detail,
+                "attempts": 1,
+                "next_at": time.monotonic() + self._REPORT_BACKOFF_BASE,
+            }
+        logger.warning(
+            "main unreachable — queued %s report for task %s (#897 retry)",
+            verb, task_id)
+
+    def _drain_pending_reports(self, now: Optional[float] = None) -> None:
+        """Retry queued terminal reports whose backoff has elapsed.
+
+        Called from _poll_once every cycle; `now` is injectable for tests.
+        Never marks anything failed because main could not be reached — the
+        whole point (#897 direction 3) is that an outage must not cost a task.
+        """
+        if now is None:
+            now = time.monotonic()
+        with self._lock:
+            due = [(k, v) for k, v in self._pending_reports.items()
+                   if v["next_at"] <= now]
+        for key, entry in due:
+            ok = _signed_request(
+                self._cluster_endpoint, "POST", entry["path"], entry["payload"],
+                self._token, self._node_id,
+            )
+            with self._lock:
+                current = self._pending_reports.get(key)
+                if current is None:
+                    continue                      # superseded while we posted
+                if ok:
+                    del self._pending_reports[key]
+                    logger.info("task %s %s (after %d queued attempt(s))",
+                                key[1], entry["detail"] or key[0], entry["attempts"])
+                    continue
+                current["attempts"] += 1
+                if current["attempts"] >= self._REPORT_MAX_ATTEMPTS:
+                    del self._pending_reports[key]
+                    logger.error(
+                        "report %s for task %s abandoned after %d attempts — "
+                        "main unreachable too long (#897)",
+                        key[0], key[1], current["attempts"])
+                    continue
+                current["next_at"] = now + min(
+                    self._REPORT_BACKOFF_BASE * (2 ** (current["attempts"] - 1)),
+                    self._REPORT_BACKOFF_CAP)

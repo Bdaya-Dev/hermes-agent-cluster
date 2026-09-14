@@ -11,6 +11,7 @@ from ..models import (
     TaskStatus,
 )
 from ..state import ClusterState
+from ..core.node_manager import DuplicateInstanceJoin
 from ..core.disk_preflight import (
     DEFAULT_MIN_FREE_DISK_GB,
     disk_reason,
@@ -32,13 +33,21 @@ def init(state: ClusterState, node_manager=None):
 @router.post("/join", response_model=JoinResponse)
 async def join(req: JoinRequest):
     if _node_manager:
-        node = _node_manager.join(
-            node_id="node_" + req.node_name,
-            name=req.node_name,
-            capabilities=req.capabilities,
-            max_concurrent=req.max_concurrent,
-            disk_free_gb=req.disk_free_gb,
-        )
+        try:
+            node = _node_manager.join(
+                node_id="node_" + req.node_name,
+                name=req.node_name,
+                capabilities=req.capabilities,
+                max_concurrent=req.max_concurrent,
+                disk_free_gb=req.disk_free_gb,
+                # #899: refuse a SECOND executor for one node id while the
+                # first instance is still heartbeating (policy + rationale in
+                # NodeManager.join; older tokenless workers keep the
+                # idempotent pre-#899 re-join behaviour).
+                instance_token=req.instance_token,
+            )
+        except DuplicateInstanceJoin as exc:
+            raise HTTPException(status_code=409, detail=str(exc))
     else:
         # Fallback to direct state
         node_id = "node_" + req.node_name
@@ -48,6 +57,7 @@ async def join(req: JoinRequest):
             capabilities=req.capabilities,
             max_concurrent=req.max_concurrent,
             disk_free_gb=req.disk_free_gb,
+            instance_token=req.instance_token,
         )
         _state.register_node(node)
     return JoinResponse(node_id=node.id, status="registered")
@@ -55,12 +65,23 @@ async def join(req: JoinRequest):
 
 @router.post("/heartbeat")
 async def heartbeat(req: HeartbeatRequest):
+    # #897: DISTINGUISH unknown-node beats. After any main restart the store
+    # can lose (or not yet have) a worker's node row; NodeManager and every
+    # store silently drop the beat while this endpoint answered
+    # {"status":"ok"}, so the worker connector stayed orphaned until the
+    # WORKER restarted (its own module NOTE documented this). 200 is kept —
+    # a 4xx would make old connectors log an auth failure instead.
+    node_exists = True
     if _node_manager:
         _node_manager.send_heartbeat(req.node_id, disk_free_gb=req.disk_free_gb)
+        node_exists = _node_manager.get_node(req.node_id) is not None
     else:
         reason = disk_reason(req.disk_free_gb, _min_free_disk_gb())
+        node_exists = _state.get_node(req.node_id) is not None
         _state.update_heartbeat(req.node_id, disk_free_gb=req.disk_free_gb,
                                 status_reason=reason)
+    if not node_exists:
+        return {"status": "unknown_node", "node_id": req.node_id}
     return {"status": "ok"}
 
 

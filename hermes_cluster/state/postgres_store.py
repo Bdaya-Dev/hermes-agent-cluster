@@ -120,7 +120,8 @@ CREATE TABLE IF NOT EXISTS nodes (
     load DOUBLE PRECISION DEFAULT 0.0,
     max_concurrent INTEGER DEFAULT 0,
     disk_free_gb DOUBLE PRECISION,
-    status_reason TEXT DEFAULT ''
+    status_reason TEXT DEFAULT '',
+    instance_token TEXT DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS tasks (
@@ -360,6 +361,10 @@ class PostgresClusterStore:
                 "ALTER TABLE nodes ADD COLUMN IF NOT EXISTS disk_free_gb DOUBLE PRECISION")
             await conn.execute(
                 "ALTER TABLE nodes ADD COLUMN IF NOT EXISTS status_reason TEXT DEFAULT ''")
+            # #899: the /join duplicate-executor gate stores the current
+            # instance token per node id.
+            await conn.execute(
+                "ALTER TABLE nodes ADD COLUMN IF NOT EXISTS instance_token TEXT DEFAULT ''")
             await conn.execute(
                 "ALTER TABLE tasks ADD COLUMN IF NOT EXISTS attempts INTEGER DEFAULT 0")
             # #874: the lane deliverable, so a result outlives the node that made it.
@@ -478,8 +483,8 @@ class PostgresClusterStore:
     async def register_node(self, node: Node) -> None:
         await self._fetch(
             """INSERT INTO nodes (id, name, capabilities, status, last_heartbeat, load, max_concurrent,
-                 disk_free_gb, status_reason)
-               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                 disk_free_gb, status_reason, instance_token)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
                ON CONFLICT (id) DO UPDATE SET
                  name = EXCLUDED.name,
                  capabilities = EXCLUDED.capabilities,
@@ -488,11 +493,13 @@ class PostgresClusterStore:
                  load = EXCLUDED.load,
                  max_concurrent = EXCLUDED.max_concurrent,
                  disk_free_gb = EXCLUDED.disk_free_gb,
-                 status_reason = EXCLUDED.status_reason""",
+                 status_reason = EXCLUDED.status_reason,
+                 instance_token = EXCLUDED.instance_token""",
             node.id, node.name, _json_dumps(node.capabilities),
             node.status.value, _aware(node.last_heartbeat), float(node.load),
             int(node.max_concurrent),
             node.disk_free_gb, getattr(node, "status_reason", ""),
+            getattr(node, "instance_token", ""),
         )
         if self._on_node_online:
             try:
@@ -591,6 +598,15 @@ class PostgresClusterStore:
             max(0, int(max_concurrent)), node_id,
         )
 
+    async def update_instance_token(self, node_id: str, instance_token: str) -> None:
+        """#899: record which executor instance currently owns this node id
+        (a re-join re-declares it; the /join gate reads it). SyncPostgresStore
+        bridges this coroutine through its loop thread like every other API."""
+        await self._fetch(
+            "UPDATE nodes SET instance_token = $1 WHERE id = $2",
+            instance_token or "", node_id,
+        )
+
     async def node_count(self) -> int:
         row = await self._row("SELECT COUNT(*) AS c FROM nodes")
         return row["c"]
@@ -627,6 +643,9 @@ class PostgresClusterStore:
             # worker that never sends disk_free_gb).
             disk_free_gb=row["disk_free_gb"] if "disk_free_gb" in keys else None,
             status_reason=row["status_reason"] if "status_reason" in keys else "",
+            # #899: a DB created before the drift ALTER lacks the column —
+            # '' = older-worker join semantics.
+            instance_token=row["instance_token"] if "instance_token" in keys else "",
         )
 
     # -------------------------------------------------------------------
