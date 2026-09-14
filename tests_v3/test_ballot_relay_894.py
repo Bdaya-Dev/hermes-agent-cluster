@@ -46,12 +46,22 @@ def client(tmp_path):
 
 @pytest.fixture
 def authed_client(tmp_path, monkeypatch):
+    """create_app with peer auth ON. Restores the module-level PeerAuthState
+    afterwards: app.py ALSO calls peer_auth.configure(...) (module global —
+    the single-process plugin path), and the intake policy tests read
+    get_default_state().is_configured() to decide the write posture. Leaving
+    it configured leaks an 'authed main' into every later test (conftest
+    restores only the env vars, not this global)."""
+    saved_state = peer_auth_mod.get_default_state()
     monkeypatch.setenv("PEER_TOKEN", "a" * 64)
     monkeypatch.setenv("PEER_TOKENS", f"gateway:{'b' * 64}")
-    app = create_app(cluster_id="t", node_id="main", node_role="main",
-                     db_path=str(tmp_path / "ballot_auth.db"))
-    with TestClient(app) as c:
-        yield c
+    try:
+        app = create_app(cluster_id="t", node_id="main", node_role="main",
+                         db_path=str(tmp_path / "ballot_auth.db"))
+        with TestClient(app) as c:
+            yield c
+    finally:
+        peer_auth_mod._default_state = saved_state
 
 
 def _sign(method, path, body=b"", node="gateway", token=None):
