@@ -105,6 +105,15 @@ class Node(BaseModel):
     last_heartbeat: datetime = Field(default_factory=datetime.utcnow)
     load: float = 0.0  # 0.0 - 1.0
     max_concurrent: int = 0  # max simultaneously-assigned tasks; 0 = unlimited
+    # #892 factory resilience: free GB on the volume holding the worker's
+    # lanes/HERMES_HOME, reported in every join/heartbeat. None = the worker
+    # did not report it (older worker) — the main's disk rules never fire on
+    # an absent field, so behaviour is byte-for-byte the pre-#892 one.
+    disk_free_gb: Optional[float] = None
+    # Why a node is not schedulable (status != online): the watchdog's
+    # staleness reason, or the disk-floor reason ("disk below floor...").
+    # Surfaced by GET /api/v1/nodes so the lead sees WHY without log-diving.
+    status_reason: str = ""
 
 
 # ===========================================================================
@@ -526,6 +535,11 @@ class NodeConfig(BaseModel):
     id: str = "node_main"
     name: str = "main-node"
     capabilities: List[str] = []
+    # #892: floor (GB) of free disk on the volume holding HERMES_HOME / the
+    # lanes dir. Below it the worker refuses to claim AND the main marks the
+    # node degraded (excluded from scheduling) until it recovers. YAML only —
+    # owner ruling: never an env var. 0 disables the rule entirely.
+    min_free_disk_gb: float = 5.0
 
 
 class ServerConfig(BaseModel):
@@ -701,20 +715,26 @@ class NodeInfo(BaseModel):
 # 16. API requests/responses (internal/api/api.go)
 # ===========================================================================
 
+class HeartbeatRequest(BaseModel):
+    node_id: str
+    # #892: optional free-disk reading on the volume holding the worker's
+    # HERMES_HOME / lanes dir (GB). Absent (None) from an older worker's
+    # payload means "no disk info" — the main keeps its exact pre-#892
+    # heartbeat semantics (unconditionally online) for those.
+    disk_free_gb: Optional[float] = None
+
+
 class JoinRequest(BaseModel):
     node_name: str
     capabilities: List[str] = []
     endpoint: str = ""
     max_concurrent: int = 0  # 0 = unlimited; scheduler honours this ceiling
+    disk_free_gb: Optional[float] = None  # #892, same absent-means-unknown rule
 
 
 class JoinResponse(BaseModel):
     node_id: str
     status: str = "registered"
-
-
-class HeartbeatRequest(BaseModel):
-    node_id: str
 
 
 class UpdateCapabilitiesRequest(BaseModel):

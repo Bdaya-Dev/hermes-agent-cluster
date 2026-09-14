@@ -230,7 +230,12 @@ def test_promotion_is_refused_before_stranded_tmp_check_cannot_run(tmp_path):
 @pytest.mark.parametrize("rc", [1, 3, -9], ids=["rc1", "rc3", "signaled"])
 def test_nonzero_exit_never_promotes(tmp_path, rc):
     """rc!=0 keeps failing (spawn_failed) even with a full transcript — the
-    narrow rule requires rc=0; a crashed mid-write lane must not be promoted."""
+    narrow rule requires rc=0; a crashed mid-write lane must not be promoted.
+
+    #892 note: the crashed lane now leaves an executor-written diagnostic file
+    (the 05:32Z full-disk deaths left NOTHING but a last-line fail_reason) —
+    the invariant this test holds is that the lane's TRANSCRIPT never rides a
+    nonzero exit into the deliverable, and that stays true."""
     executor = _executor(worker="hermes", working_dir=str(tmp_path))
     results_dir = tmp_path / "hermes-results"
     spawn = _spawn("task_rc", results_dir,
@@ -239,12 +244,17 @@ def test_nonzero_exit_never_promotes(tmp_path, rc):
     resolved = _reap(executor, spawn)
 
     assert resolved[0][2] == "spawn_failed"
-    assert not (results_dir / "task_rc.result.md").exists()
+    diag = results_dir / "task_rc.result.md"
+    assert diag.read_text(encoding="utf-8").startswith("<!-- LANE-STARTED:")
+    assert B6130AFA_TRANSCRIPT[:200] not in diag.read_text(encoding="utf-8")
 
 
 def test_whitespace_transcript_still_no_result(tmp_path):
     """The rule requires a NON-EMPTY transcript; a silent rc=0 with an empty
-    stdout.log keeps reaping no_result → failure (nothing was delivered)."""
+    stdout.log keeps reaping no_result → failure (nothing was delivered).
+
+    #892: the no-deliverable lane now leaves the executor's first-line
+    diagnostic (not a promotion — there was no transcript to promote)."""
     executor = _executor(worker="hermes", working_dir=str(tmp_path))
     results_dir = tmp_path / "hermes-results"
     spawn = _spawn("task_silent", results_dir, transcript="   \n\n")
@@ -252,7 +262,9 @@ def test_whitespace_transcript_still_no_result(tmp_path):
     resolved = _reap(executor, spawn)
 
     assert resolved[0][2] == "no_result"
-    assert not (results_dir / "task_silent.result.md").exists()
+    diag = results_dir / "task_silent.result.md"
+    assert diag.read_text(encoding="utf-8").startswith("<!-- LANE-STARTED:")
+    assert "NO deliverable" in diag.read_text(encoding="utf-8")
 
 
 def test_promotion_write_failure_surfaces_loudly(tmp_path):

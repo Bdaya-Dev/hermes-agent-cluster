@@ -33,6 +33,8 @@ from typing import Dict, List, Optional
 from urllib.request import Request, urlopen
 from urllib.error import URLError
 
+from .disk_preflight import disk_free_gb
+
 logger = logging.getLogger(__name__)
 
 
@@ -136,6 +138,7 @@ def start_worker_connector(
     heartbeat_interval: float = 10.0,
     max_concurrent: int = 0,
     capability_probes: Optional[Dict[str, dict]] = None,
+    disk_probe_path: str = "",
 ) -> None:
     """Start the outbound worker connector thread.
 
@@ -159,6 +162,12 @@ def start_worker_connector(
             to a node whose credential is missing — the #867 silent mid-lane
             failure becomes a loud dispatch-time miss. Re-run on
             interval_s (default 300); a capability lost mid-run is PATCHed off.
+        disk_probe_path: #892 — volume/path whose free space is reported as
+            ``disk_free_gb`` in EVERY join and heartbeat payload (the main
+            degrades the node while the report is below node.min_free_disk_gb).
+            Empty resolves to HERMES_HOME, then the lanes default dir, then cwd;
+            an unreadable volume reports nothing (field omitted — the main then
+            keeps the pre-#892 semantics for this worker).
     """
     global _connector_started
     with _connector_lock:
@@ -166,6 +175,20 @@ def start_worker_connector(
             logger.warning("worker connector already running")
             return
         _connector_started = True
+
+    # #892: resolve the disk-probe target ONCE per path value (per-call reads
+    # are cheap; keep a callable for tests / explicit wiring).
+    def _disk_probe_target() -> str:
+        if disk_probe_path:
+            return disk_probe_path
+        import os
+        home = os.environ.get("HERMES_HOME", "")
+        if home:
+            return home
+        return str(Path.cwd())
+
+    def _disk_report() -> Optional[float]:
+        return disk_free_gb(_disk_probe_target())
 
     token = _resolve_peer_token(peer_token)
     if not token:
@@ -239,6 +262,11 @@ def start_worker_connector(
                     "endpoint": f"http://{node_id}:0",
                     "max_concurrent": max_concurrent,
                 }
+                # #892: report free disk at join too (omit when unreadable —
+                # an absent field is the older-worker contract the main honours).
+                disk_gb = _disk_report()
+                if disk_gb is not None:
+                    join_data["disk_free_gb"] = disk_gb
                 result = _signed_post(
                     cluster_endpoint, "/api/v1/nodes/join", join_data, token, node_id
                 )
@@ -257,6 +285,13 @@ def start_worker_connector(
             # Send heartbeat if registered
             if registered_id is not None:
                 hb_data = {"node_id": registered_id}
+                # #892: every heartbeat carries disk_free_gb of the volume
+                # holding HERMES_HOME / the lanes dir — the main's watchdog
+                # degrades the node while the report sits below the floor and
+                # restores it automatically once the volume recovers.
+                disk_gb = _disk_report()
+                if disk_gb is not None:
+                    hb_data["disk_free_gb"] = disk_gb
                 _signed_post(
                     cluster_endpoint, "/api/v1/nodes/heartbeat", hb_data, token, node_id
                 )

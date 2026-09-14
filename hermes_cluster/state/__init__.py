@@ -136,12 +136,24 @@ class ClusterState:
         with self._nodes_lock:
             return list(self._nodes.values())
 
-    def update_heartbeat(self, node_id: str, load: float = 0.0) -> None:
+    def update_heartbeat(self, node_id: str, load: float = 0.0,
+                         disk_free_gb: Optional[float] = None,
+                         status_reason: str = "") -> None:
         with self._nodes_lock:
             if node_id in self._nodes:
-                self._nodes[node_id].last_heartbeat = datetime.utcnow()
-                self._nodes[node_id].status = NodeStatus.online
-                self._nodes[node_id].load = load
+                n = self._nodes[node_id]
+                n.last_heartbeat = datetime.utcnow()
+                # #892: a below-floor heartbeat (status_reason set by the
+                # NodeManager) records disk but does NOT force online — that
+                # unconditional force is what kept the full-disk node schedulable
+                # during the 05:32Z incident. disk_free_gb None → stored value
+                # kept (an older worker's beat says nothing about disk).
+                n.status = (NodeStatus.degraded if status_reason
+                            else NodeStatus.online)
+                n.status_reason = status_reason
+                if disk_free_gb is not None:
+                    n.disk_free_gb = disk_free_gb
+                n.load = load
 
     def update_capabilities(self, node_id: str, caps: List[str]) -> None:
         with self._nodes_lock:
@@ -174,11 +186,13 @@ class ClusterState:
     def set_on_capability_change(self, fn: Callable[[str, List[str], List[str]], None]) -> None:
         self._on_capability_change = fn
 
-    def set_node_status(self, node_id: str, status: NodeStatus) -> None:
-        """Set a node's status (online/degraded/offline)."""
+    def set_node_status(self, node_id: str, status: NodeStatus,
+                        reason: str = "") -> None:
+        """Set a node's status (online/degraded/offline) and why (#892)."""
         with self._nodes_lock:
             if node_id in self._nodes:
                 self._nodes[node_id].status = status
+                self._nodes[node_id].status_reason = reason if status != NodeStatus.online else ""
 
     def append_timeline(self, event) -> None:
         """Append a timeline event (non-critical, silently ignored)."""

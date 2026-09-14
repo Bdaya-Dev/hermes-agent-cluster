@@ -247,6 +247,8 @@ class ClusterCore:
         watchdog_check_interval: float = 5.0,
         watchdog_degraded_after: float = 15.0,
         watchdog_offline_after: float = 30.0,
+        # #892: node.min_free_disk_gb floor (None -> default 5.0, 0 -> rule off)
+        min_free_disk_gb: Optional[float] = None,
         # Lease timing
         lease_ttl_seconds: int = 60,
         lease_scan_rate_seconds: float = 10.0,
@@ -257,6 +259,8 @@ class ClusterCore:
         self.node_role = node_role
         self.capabilities = capabilities or ["planning", "reviewing", "scheduling"]
         self.max_concurrent = max(0, int(max_concurrent))
+        from .disk_preflight import effective_min_free_gb
+        self._min_free_disk_gb = effective_min_free_gb(min_free_disk_gb)
         self.config_path = config_path
         self.started_at = datetime.utcnow()
 
@@ -313,29 +317,37 @@ class ClusterCore:
                         node_id=n.id,
                         last_heartbeat=n.last_heartbeat,
                         status=n.status.value if isinstance(n.status, NodeStatus) else n.status,
+                        # #892: fire the disk rule on the last reported reading;
+                        # None (older worker) keeps the staleness-only behaviour.
+                        disk_free_gb=getattr(n, "disk_free_gb", None),
                     )
                     for n in nodes
                 ]
 
-            def update_node_status(self, node_id: str, status: str) -> None:
+            def update_node_status(self, node_id: str, status: str,
+                                   reason: str = "") -> None:
                 # Access internal dict directly to avoid deadlock with non-reentrant Lock.
                 # get_node() acquires _nodes_lock, so we must not hold it here.
+                # #892: `reason` explains a non-online status (disk floor /
+                # staleness) and is surfaced via Node.status_reason.
                 if hasattr(self._store, '_nodes'):
                     with self._store._nodes_lock:
                         if node_id in self._store._nodes:
                             self._store._nodes[node_id].status = NodeStatus(status)
+                            self._store._nodes[node_id].status_reason = (
+                                reason if status != "online" else "")
                 elif hasattr(self._store, '_conn'):
                     # ClusterStore: use direct SQL update
                     from datetime import datetime
                     with self._store._lock:
                         self._store._conn.execute(
-                            "UPDATE nodes SET status = ? WHERE id = ?",
-                            (status, node_id),
+                            "UPDATE nodes SET status = ?, status_reason = ? WHERE id = ?",
+                            (status, reason if status != "online" else "", node_id),
                         )
                 else:
                     # PostgresClusterStore (sync facade) and anything else:
                     # the public API is the ported surface (#829).
-                    self._store.set_node_status(node_id, NodeStatus(status))
+                    self._store.set_node_status(node_id, NodeStatus(status), reason)
 
         self._watchdog_adapter = _WatchdogAdapter(self.store)
 
@@ -351,6 +363,9 @@ class ClusterCore:
             degraded_after=watchdog_degraded_after,
             offline_after=watchdog_offline_after,
             callback=_watchdog_callback,
+            # #892: disk floor (node.min_free_disk_gb; None -> default 5.0,
+            # 0 -> rule off — same resolution as the NodeManager path).
+            min_free_disk_gb=self._min_free_disk_gb,
         )
 
         # Lease timing

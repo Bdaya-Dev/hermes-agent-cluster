@@ -103,7 +103,9 @@ CREATE TABLE IF NOT EXISTS nodes (
     status TEXT DEFAULT 'online',
     last_heartbeat TEXT,
     load REAL DEFAULT 0.0,
-    max_concurrent INTEGER DEFAULT 0
+    max_concurrent INTEGER DEFAULT 0,
+    disk_free_gb REAL,
+    status_reason TEXT DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS tasks (
@@ -351,6 +353,14 @@ class ClusterStore:
                 self._conn.execute(
                     "ALTER TABLE nodes ADD COLUMN max_concurrent INTEGER DEFAULT 0"
                 )
+            # #892 (factory resilience): the worker-reported free disk and the
+            # reason a node is not schedulable, surfaced via GET /api/v1/nodes.
+            if "disk_free_gb" not in node_cols:
+                self._conn.execute("ALTER TABLE nodes ADD COLUMN disk_free_gb REAL")
+            if "status_reason" not in node_cols:
+                self._conn.execute(
+                    "ALTER TABLE nodes ADD COLUMN status_reason TEXT DEFAULT ''"
+                )
         except Exception as e:
             logger.warning("nodes.max_concurrent migration skipped: %s", e)
         # PR#16 (stateful lanes): lanes table + idle-reap activity clock.
@@ -409,11 +419,13 @@ class ClusterStore:
         with self._tx() as conn:
             conn.execute(
                 """INSERT OR REPLACE INTO nodes
-                   (id, name, capabilities, status, last_heartbeat, load, max_concurrent)
-                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                   (id, name, capabilities, status, last_heartbeat, load, max_concurrent,
+                    disk_free_gb, status_reason)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (node.id, node.name, _json_dumps(node.capabilities),
                  node.status.value, _dt_to_str(node.last_heartbeat), node.load,
-                 node.max_concurrent),
+                 node.max_concurrent, node.disk_free_gb,
+                 getattr(node, "status_reason", "")),
             )
         if self._on_node_online:
             try:
@@ -433,13 +445,32 @@ class ClusterStore:
             rows = self._conn.execute("SELECT * FROM nodes").fetchall()
         return [self._row_to_node(r) for r in rows]
 
-    def update_heartbeat(self, node_id: str, load: float = 0.0) -> None:
+    def update_heartbeat(self, node_id: str, load: float = 0.0,
+                         disk_free_gb: Optional[float] = None,
+                         status_reason: str = "") -> None:
         now = datetime.utcnow()
+        # #892: status follows the caller's verdict — NodeManager passes
+        # status_reason when the reported disk is below the floor, and the
+        # heartbeat then refreshes the clock WITHOUT forcing online (the
+        # unconditional `status = online` is what kept the full-disk node
+        # schedulable through the 2026-09-14 incident). An empty reason keeps
+        # the old force-online semantics; disk_free_gb None (older worker)
+        # keeps whatever the stored column holds.
+        status = NodeStatus.degraded.value if status_reason else NodeStatus.online.value
         with self._tx() as conn:
-            conn.execute(
-                "UPDATE nodes SET last_heartbeat = ?, status = ?, load = ? WHERE id = ?",
-                (_dt_to_str(now), NodeStatus.online.value, load, node_id),
-            )
+            if disk_free_gb is None:
+                conn.execute(
+                    "UPDATE nodes SET last_heartbeat = ?, status = ?, load = ?, "
+                    "status_reason = ? WHERE id = ?",
+                    (_dt_to_str(now), status, load, status_reason, node_id),
+                )
+            else:
+                conn.execute(
+                    "UPDATE nodes SET last_heartbeat = ?, status = ?, load = ?, "
+                    "disk_free_gb = ?, status_reason = ? WHERE id = ?",
+                    (_dt_to_str(now), status, load, float(disk_free_gb),
+                     status_reason, node_id),
+                )
 
     def update_capabilities(self, node_id: str, caps: List[str]) -> None:
         with self._lock:
@@ -488,12 +519,13 @@ class ClusterStore:
     def set_on_capability_change(self, fn: Callable[[str, List[str], List[str]], None]) -> None:
         self._on_capability_change = fn
 
-    def set_node_status(self, node_id: str, status: NodeStatus) -> None:
-        """Set a node's status (online/degraded/offline)."""
+    def set_node_status(self, node_id: str, status: NodeStatus,
+                        reason: str = "") -> None:
+        """Set a node's status (online/degraded/offline) and why (#892)."""
         with self._tx() as conn:
             conn.execute(
-                "UPDATE nodes SET status = ? WHERE id = ?",
-                (status.value, node_id),
+                "UPDATE nodes SET status = ?, status_reason = ? WHERE id = ?",
+                (status.value, reason if status != NodeStatus.online else "", node_id),
             )
 
     def append_timeline(self, event) -> None:
@@ -509,6 +541,12 @@ class ClusterStore:
             last_heartbeat=_str_to_dt(row["last_heartbeat"]),
             load=row["load"],
             max_concurrent=row["max_concurrent"] if "max_concurrent" in row.keys() else 0,
+            # #892: old DBs (pre-migration rows mid-flight) lack the columns —
+            # default None/"" so a store without disk columns still loads.
+            disk_free_gb=(row["disk_free_gb"]
+                          if "disk_free_gb" in row.keys() else None),
+            status_reason=(row["status_reason"]
+                           if "status_reason" in row.keys() else ""),
         )
 
     # -------------------------------------------------------------------
