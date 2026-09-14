@@ -106,7 +106,8 @@ CREATE TABLE IF NOT EXISTS nodes (
     load REAL DEFAULT 0.0,
     max_concurrent INTEGER DEFAULT 0,
     disk_free_gb REAL,
-    status_reason TEXT DEFAULT ''
+    status_reason TEXT DEFAULT '',
+    instance_token TEXT DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS tasks (
@@ -362,6 +363,11 @@ class ClusterStore:
                 self._conn.execute(
                     "ALTER TABLE nodes ADD COLUMN status_reason TEXT DEFAULT ''"
                 )
+            # #899: the per-node-id instance token (/join duplicate gate).
+            if "instance_token" not in node_cols:
+                self._conn.execute(
+                    "ALTER TABLE nodes ADD COLUMN instance_token TEXT DEFAULT ''"
+                )
         except Exception as e:
             logger.warning("nodes.max_concurrent migration skipped: %s", e)
         # PR#16 (stateful lanes): lanes table + idle-reap activity clock.
@@ -421,12 +427,13 @@ class ClusterStore:
             conn.execute(
                 """INSERT OR REPLACE INTO nodes
                    (id, name, capabilities, status, last_heartbeat, load, max_concurrent,
-                    disk_free_gb, status_reason)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    disk_free_gb, status_reason, instance_token)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (node.id, node.name, _json_dumps(node.capabilities),
                  node.status.value, _dt_to_str(node.last_heartbeat), node.load,
                  node.max_concurrent, node.disk_free_gb,
-                 getattr(node, "status_reason", "")),
+                 getattr(node, "status_reason", ""),
+                 getattr(node, "instance_token", "")),
             )
         if self._on_node_online:
             try:
@@ -501,6 +508,15 @@ class ClusterStore:
                 (value, node_id),
             )
 
+    def update_instance_token(self, node_id: str, instance_token: str) -> None:
+        """#899: record which executor instance currently owns this node id
+        (a re-join re-declares it; the /join gate reads it)."""
+        with self._tx() as conn:
+            conn.execute(
+                "UPDATE nodes SET instance_token = ? WHERE id = ?",
+                (instance_token or "", node_id),
+            )
+
     def node_count(self) -> int:
         with self._lock:
             row = self._conn.execute("SELECT COUNT(*) as c FROM nodes").fetchone()
@@ -548,6 +564,10 @@ class ClusterStore:
                           if "disk_free_gb" in row.keys() else None),
             status_reason=(row["status_reason"]
                            if "status_reason" in row.keys() else ""),
+            # #899: pre-migration rows read as '' (older worker = tokenless
+            # join = pre-#899 idempotent semantics).
+            instance_token=(row["instance_token"]
+                            if "instance_token" in row.keys() else ""),
         )
 
     # -------------------------------------------------------------------

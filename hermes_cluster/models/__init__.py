@@ -114,6 +114,11 @@ class Node(BaseModel):
     # staleness reason, or the disk-floor reason ("disk below floor...").
     # Surfaced by GET /api/v1/nodes so the lead sees WHY without log-diving.
     status_reason: str = ""
+    # #899: the per-process instance token of the executor currently
+    # registered under this node id ("" = an older worker never declared
+    # one). /join compares it: same token = idempotent re-join, different
+    # token while still heartbeating = a DUPLICATE executor -> refused 409.
+    instance_token: str = ""
 
 
 # ===========================================================================
@@ -730,6 +735,16 @@ class JoinRequest(BaseModel):
     endpoint: str = ""
     max_concurrent: int = 0  # 0 = unlimited; scheduler honours this ceiling
     disk_free_gb: Optional[float] = None  # #892, same absent-means-unknown rule
+    # #899: per-process identity of the executor that is joining. A second
+    # /join for the same node name carrying a DIFFERENT token while the
+    # previous instance is still heartbeating (< offline_after) is refused
+    # 409 — the duplicate-executor class of bug the 2026-09-14
+    # windows_desktop incident measured (wrapper :loop relaunch + Start-
+    # ScheduledTask = two executors, every lane spawned twice). Absent from
+    # an older worker (empty) = pre-#899 join semantics (idempotent re-join
+    # always allowed). See NodeManager.join for the chosen policy and why
+    # refuse beats force-replace.
+    instance_token: str = ""
 
 
 class JoinResponse(BaseModel):

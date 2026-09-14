@@ -139,6 +139,7 @@ def start_worker_connector(
     max_concurrent: int = 0,
     capability_probes: Optional[Dict[str, dict]] = None,
     disk_probe_path: str = "",
+    instance_token: str = "",
 ) -> None:
     """Start the outbound worker connector thread.
 
@@ -168,6 +169,14 @@ def start_worker_connector(
             Empty resolves to HERMES_HOME, then the lanes default dir, then cwd;
             an unreadable volume reports nothing (field omitted — the main then
             keeps the pre-#892 semantics for this worker).
+        instance_token: #899 — this process's single-instance identity,
+            carried in the /join payload so the main can REFUSE a second
+            executor for the same node id while the first instance is still
+            heartbeating (409, retried loudly like any failed join — a 409
+            means a duplicate exists somewhere and an operator must stop
+            one; the survivor keeps heartbeating regardless). Empty (older
+            launch path) omits the field — pre-#899 tokenless join
+            semantics are preserved.
     """
     global _connector_started
     with _connector_lock:
@@ -262,6 +271,10 @@ def start_worker_connector(
                     "endpoint": f"http://{node_id}:0",
                     "max_concurrent": max_concurrent,
                 }
+                # #899: declare the instance identity (omitted when empty —
+                # an absent field is the older-worker join contract).
+                if instance_token:
+                    join_data["instance_token"] = instance_token
                 # #892: report free disk at join too (omit when unreadable —
                 # an absent field is the older-worker contract the main honours).
                 disk_gb = _disk_report()
