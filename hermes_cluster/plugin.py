@@ -321,7 +321,24 @@ def _api_call(method: str, path: str, data: dict = None) -> dict:
         with urlopen(req, timeout=10) as resp:
             return json.loads(resp.read().decode())
     except URLError as e:
-        return {"error": str(e)}
+        # #897 direction 3: a rollout takes the hosted main down for tens of
+        # seconds; a one-shot connection error used to surface as a tool
+        # failure and lanes papered over it with manual re-calls. Retry
+        # TRANSPORT failures only (never HTTP 4xx/5xx bodies, which parse
+        # fine) with bounded backoff: 3 attempts, 1s + 2s. Worst case adds
+        # ~3s to a genuinely-dead endpoint — still far under the executor's
+        # 10s HTTP budget expectations and never fails a TASK.
+        last = e
+        for attempt, wait in enumerate((1.0, 2.0)):
+            time.sleep(wait)
+            try:
+                with urlopen(req, timeout=10) as resp:
+                    return json.loads(resp.read().decode())
+            except URLError as e2:
+                last = e2
+            except Exception as e2:
+                return {"error": str(e2)}
+        return {"error": str(last)}
     except Exception as e:
         return {"error": str(e)}
 
