@@ -385,9 +385,15 @@ def handle_cluster_submit(args: dict, **kwargs) -> str:
             payload[opt] = args[opt]
     result = _api_call("POST", "/api/v1/tasks", payload)
     if isinstance(result, dict) and not result.get("error"):
-        trigger = _api_call("POST", "/api/v1/schedule/trigger", {})
-        if isinstance(trigger, dict) and trigger.get("error"):
-            logger.warning("schedule trigger after submit failed: %s", trigger["error"])
+        # #898: a deduped reviewer submit returned an EXISTING live task —
+        # that task is already the scheduler's problem. Re-triggering would
+        # fan churn the dedupe exists to prevent, and the response's
+        # `deduped: true` tells the lane "you already handed off; finish
+        # your turn".
+        if not result.get("deduped"):
+            trigger = _api_call("POST", "/api/v1/schedule/trigger", {})
+            if isinstance(trigger, dict) and trigger.get("error"):
+                logger.warning("schedule trigger after submit failed: %s", trigger["error"])
     return json.dumps(result)
 
 
@@ -472,7 +478,10 @@ SCHEMAS = {
             "author lane for its hand-off: pass role='reviewer', requires=['review'] "
             "and lane_key='<repo>!<mr_iid>' to dispatch the independent reviewer "
             "yourself (RV-1: a fresh context on a different lane — never approve or "
-            "merge your own work)."
+            "merge your own work). SUBMIT EXACTLY ONE reviewer task per hand-off and "
+            "then finish — never cancel or resubmit it (#898): a queued reviewer is "
+            "capacity-waiting, not lost, and a resubmit while one is live returns the "
+            "existing task (deduped: true)."
         ),
         "parameters": {
             "type": "object",
