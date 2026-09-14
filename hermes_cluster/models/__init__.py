@@ -143,6 +143,15 @@ class Task(BaseModel):
     # unreadable from every other, and "produced nothing" was
     # indistinguishable from "produced something unreachable".
     result: Optional[str] = None
+    # #762 grouped intake: the lane's FULL brief (a bundle task's description
+    # carries every issue id + the sitting discipline; the title stays a
+    # one-line summary). Empty for legacy per-issue tasks.
+    description: str = ""
+    # #762 grouped intake: bundle membership as "<project/path>#<iid>" issue
+    # ids (empty for legacy tasks). Restart-safe: intake's DEDUP FIRST + the
+    # cardinality guard read live issues from the STORE, never from a
+    # process-local map alone.
+    issues: List[str] = Field(default_factory=list)
 
     model_config = {"populate_by_name": True}
 

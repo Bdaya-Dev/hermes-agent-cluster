@@ -94,6 +94,7 @@ from ..core.scheduler import (
     ACTIVE_TASK_STATUSES,
     TERMINAL_TASK_STATUSES,
     FairScheduler,
+    lane_blocked_ready_ids,
 )
 
 logger = logging.getLogger(__name__)
@@ -133,7 +134,10 @@ CREATE TABLE IF NOT EXISTS tasks (
     attempts INTEGER DEFAULT 0,
     lane_key TEXT DEFAULT '',
     role TEXT DEFAULT 'author',
-    result TEXT
+    result TEXT,
+    -- #762 grouped intake: bundle brief + restart-safe membership.
+    description TEXT DEFAULT '',
+    issues TEXT DEFAULT '[]'
 );
 
 -- Stateful lanes: one row per lane_key, keyed to the hermes session it owns.
@@ -351,6 +355,11 @@ class PostgresClusterStore:
                 "ALTER TABLE tasks ADD COLUMN IF NOT EXISTS result TEXT")
             await conn.execute(
                 "ALTER TABLE task_spawns ADD COLUMN IF NOT EXISTS attempt INTEGER DEFAULT 0")
+            # #762 grouped intake: bundle brief + membership columns.
+            await conn.execute(
+                "ALTER TABLE tasks ADD COLUMN IF NOT EXISTS description TEXT DEFAULT ''")
+            await conn.execute(
+                "ALTER TABLE tasks ADD COLUMN IF NOT EXISTS issues TEXT DEFAULT '[]'")
         logger.info("PostgresClusterStore: connected, schema ensured")
         return self
 
@@ -586,6 +595,8 @@ class PostgresClusterStore:
         priority: int = 3,
         lane_key: str = "",
         role: str = "author",
+        description: str = "",
+        issues: Optional[List[str]] = None,
     ) -> Task:
         now = _utcnow()
         # One transaction: insert-if-absent then promote pending->ready
@@ -597,11 +608,13 @@ class PostgresClusterStore:
             await conn.execute(
                 """INSERT INTO tasks
                    (id, title, requires, depends_on, priority, status,
-                    created_at, updated_at, version, lane_key, role)
-                   VALUES ($1, $2, $3, '[]', $4, $5, $6, $6, 1, $7, $8)
+                    created_at, updated_at, version, lane_key, role,
+                    description, issues)
+                   VALUES ($1, $2, $3, '[]', $4, $5, $6, $6, 1, $7, $8, $9, $10)
                    ON CONFLICT (id) DO NOTHING""",
                 task_id, title, _json_dumps(requires), priority,
                 TaskStatus.pending.value, now, lane_key, role,
+                description, _json_dumps(list(issues or [])),
             )
             await conn.execute(
                 """UPDATE tasks SET status = $1, updated_at = $2
@@ -801,6 +814,9 @@ class PostgresClusterStore:
             attempts=int(row["attempts"] or 0) if "attempts" in row.keys() else 0,
             lane_key=row["lane_key"] or "",
             role=row["role"] or "author",
+            description=(row["description"] or "") if "description" in row.keys() else "",
+            issues=(_json_loads(row["issues"])
+                    if "issues" in row.keys() and row["issues"] else []),
         )
 
     # -------------------------------------------------------------------
@@ -1127,6 +1143,13 @@ class PostgresClusterStore:
                         )
                     }
 
+                    # LFP-1 cardinality guard (#762) — see cluster_store for
+                    # the full rationale: never assign a ready task whose
+                    # lane key already has an active/earlier sibling.
+                    all_rows = await conn.fetch("SELECT * FROM tasks")
+                    lane_blocked = lane_blocked_ready_ids(
+                        [self._row_to_task(r) for r in all_rows])
+
                     ready_tasks = [
                         self._row_to_task(r)
                         for r in await conn.fetch(
@@ -1134,7 +1157,7 @@ class PostgresClusterStore:
                             "ORDER BY priority, created_at",
                             TaskStatus.ready.value,
                         )
-                        if r["id"] not in leased
+                        if r["id"] not in leased and r["id"] not in lane_blocked
                     ]
 
                     for task in ready_tasks:

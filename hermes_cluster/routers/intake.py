@@ -70,6 +70,21 @@ The poller queries PROJECT-scoped /projects/:id/issues or GROUP-scoped
 must cover whole client groups (invora, metaphor/bayader, metaphor/morshdy);
 a group path 404s on the project endpoint, so it cannot be "just" an env var.
 
+GROUPED INTAKE (``intake.gitlab.grouping``, #762): when enabled, a cycle
+emits ONE lane-bundle task per client×repo batch (lane key '<repo>#<branch>',
+PR#16 stateful-lane shape) instead of one task per issue. DEDUP FIRST: issues
+already held by a non-terminal or completed task are never re-bundled;
+doomed labels (blocked/needs-human/needs-decision/epic), artifact-carrying
+issues (open-MR refs, D-SPAWN-1) and issues with an open out-of-batch
+is_blocked_by blocker (the GitLab DAG keeps ordering authority) are excluded.
+The cardinality guard (#762) keeps at most one queued bundle per lane key
+(band-0 business-team bundles excepted so Sami/emad never sit behind the
+backlog), and the scheduler (core/scheduler.lane_blocked_ready_ids, applied
+by all three stores) never assigns a ready task whose lane already has an
+ACTIVE sitting — the same invariant bdaya-enforcement's lane_key_guard DENIES
+at spawn time (#833 note 133037 rule #1). Default OFF: an unconfigured policy
+keeps the per-issue wiring byte-for-byte (#886 regression guard).
+
 Webhook authentication: set `GITLAB_INTAKE_WEBHOOK_SECRET` to validate the
 `X-Gitlab-Token` header. When unset, the webhook accepts any POST (logs a warning).
 """
@@ -81,6 +96,7 @@ import hmac
 import json
 import logging
 import os
+import re
 import secrets
 import threading
 import time
@@ -93,6 +109,16 @@ import httpx
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import ValidationError
 
+from ..core.intake_grouping import (
+    BundlePlan,
+    LaneView,
+    bundle_brief,
+    bundle_plan_for_repo,
+    bundle_title,
+    filter_candidates,
+    is_doomed_label,
+    lane_key_for,
+)
 from ..core.intake_policy import (
     GitLabIntakePolicy,
     IntakeScope,
@@ -100,7 +126,7 @@ from ..core.intake_policy import (
     policy_from_raw,
     validate_policy_write,
 )
-from ..models import Task
+from ..models import Task, TaskStatus
 from ..state import ClusterState
 
 logger = logging.getLogger("hermes_cluster.intake")
@@ -619,6 +645,40 @@ async def webhook(request: Request):
         dedup_key = _dedup_key("iid", "", issue_iid)
 
     title = attrs.get("title", "")
+    if policy.configured and policy.scopes and policy.grouping.enabled:
+        # --- GROUPED mode (#762): the webhook never mints per-issue tasks.
+        # Band 0 (business team, #886 author rule) still lands INSTANTLY —
+        # as a single-issue bundle on its repo's lane (the lane serializes
+        # itself; the scheduler lane guard keeps one sitting per key). Any
+        # other issue is left for the next poll cycle, which bundles the
+        # repo's whole waiting backlog into one lane task.
+        cfg = policy.grouping
+        if any(is_doomed_label(l, cfg) for l in labels):
+            return {"status": "ignored", "reason": "doomed label (grouped mode)"}
+        # Grouped membership is always the FULL shape ('<path>#<iid>') —
+        # bundles are per-repo, so an iid-only key cannot name a member.
+        dedup_key = _dedup_key("full", path_with_namespace, issue_iid)
+        view, live, legacy_iids = _grouping_view(_state)
+        if dedup_key in live or issue_iid in legacy_iids:
+            return {"status": "deduped", "reason": "issue already in a live task"}
+        if priority > 0:
+            return {"status": "queued-grouping",
+                    "reason": "grouping enabled; next poll cycle bundles it"}
+        lane = lane_key_for(path_with_namespace, cfg)
+        if any(b == 0 for _, b in view.queued_bundles.get(lane, [])):
+            # A band-0 bundle for this lane is already queued; the poller
+            # consolidates new band-0 issues into the NEXT sitting. Still
+            # ahead of every band>0 bundle by scheduler sort.
+            return {"status": "queued-grouping",
+                    "reason": f"band-0 bundle already queued on lane {lane}"}
+        plan = BundlePlan(lane_key=lane, iids=[issue_iid],
+                          project_paths=[path_with_namespace], priority=0,
+                          issue_ids=[dedup_key], reason="webhook:band0-instant")
+        task = _create_bundle_task(_state, plan, requires)
+        _issue_dedup_to_task_id[dedup_key] = task.id
+        return {"status": "created", "task_id": task.id, "priority": task.priority,
+                "lane_key": lane, "task": task.model_dump(mode="json")}
+
     task, is_new = _create_task_from_issue(
         dedup_key=dedup_key,
         display_iid=issue_iid,
@@ -639,6 +699,97 @@ def _dedup_key(mode: str, path: str, iid: int) -> str:
     if mode == "full" and path:
         return f"{path}#{iid}"
     return str(iid)
+
+
+# ---------------------------------------------------------------------------
+# Grouped (LFP-1 lane-bundle) helpers — shared/claude-plugins#762
+# ---------------------------------------------------------------------------
+
+# Statuses whose tasks still hold an issue (dedup-first) or a lane claim
+# (cardinality guard). cancel_requested counts: the worker still holds the
+# lane session until it acks; it converges to cancelled shortly.
+_ISSUE_HOLDING_STATUSES = frozenset({
+    TaskStatus.pending.value, TaskStatus.ready.value,
+    TaskStatus.running.value, TaskStatus.assigned.value,
+    TaskStatus.cancel_requested.value,
+})
+
+
+def _grouping_view(state: Any) -> Tuple[LaneView, set, set]:
+    """Build the cardinality-guard LaneView + the blocked-issue set from the
+    STORE (not the process-local map): restart-safe DEDUP FIRST.
+    A task counts as a bundle iff it carries a non-empty ``issues`` list.
+
+    Blocked = issues held by a NON-TERMINAL task (still queued/running) PLUS
+    issues held by a COMPLETED task (the sitting delivered them — the per-
+    issue VP-1 disposition closes them on GitLab; re-bundling a completed
+    issue would duplicate work the lane already did). FAILED / CANCELLED
+    tasks release their issues: a dead sitting fixed nothing, and the next
+    cycle re-groups them — never permanently strand on a transient failure.
+    """
+    view = LaneView()
+    blocked: set = set()
+    legacy_open_iids: set = set()
+    for t in state.get_all_tasks():
+        members = list(getattr(t, "issues", None) or [])
+        status = t.status.value if hasattr(t.status, "value") else str(t.status)
+        if not members:
+            # Legacy per-issue task ([#NNN] title shape, #886 wiring). While
+            # it is NON-terminal the fix is in flight — an issue with that iid
+            # must not be re-bundled anywhere. Titles carry no project path,
+            # so this over-blocks by iid across projects: safe (the next cycle
+            # re-admits once the task is terminal) and it is exactly the 12
+            # still-running per-issue tasks of the 872 wave this protects.
+            if status in ("pending", "ready", "running", "assigned",
+                          "cancel_requested"):
+                m = re.match(r"\[#(\d+)\]", t.title or "")
+                if m:
+                    legacy_open_iids.add(int(m.group(1)))
+            continue
+        if status == TaskStatus.completed.value:
+            blocked.update(members)
+            continue
+        if status not in _ISSUE_HOLDING_STATUSES:
+            continue
+        blocked.update(members)
+        lane = getattr(t, "lane_key", "") or ""
+        if not lane:
+            continue
+        # `or 3` would rewrite band 0 -> 3 (the #866 sentinel bug class):
+        # priority is only ever None-ish for legacy rows, and None -> default.
+        raw_prio = getattr(t, "priority", None)
+        entry = (t.id, 3 if raw_prio is None else int(raw_prio))
+        if status in (TaskStatus.running.value, TaskStatus.assigned.value):
+            view.active_bundles.setdefault(lane, []).append(entry)
+        else:
+            view.queued_bundles.setdefault(lane, []).append(entry)
+    return view, blocked, legacy_open_iids
+
+
+def _create_bundle_task(state: Any, plan: BundlePlan, requires: list) -> Task:
+    """Persist one grouped lane task. The title is a one-line summary; the
+    FULL brief rides in ``description`` (the executor writes it into the
+    lane's query file, and the hermes lane session gets it as its next
+    message); ``issues`` is the restart-safe membership list."""
+    task_id = "task_" + secrets.token_hex(8)
+    task = state.create_task(
+        task_id=task_id,
+        title=bundle_title(plan),
+        requires=list(requires),
+        priority=plan.priority,
+        lane_key=plan.lane_key,
+        role="author",
+        description=bundle_brief(plan),
+        issues=list(plan.issue_ids),
+    )
+    # Same 'queue it now' kick as the per-issue path: trigger + schedule. The
+    # lane-block guard inside the scheduler keeps one sitting per lane key —
+    # band-0 bundles still jump the QUEUE (priority sort), they only wait
+    # for an ACTIVE sitting on the same lane, exactly as a per-issue task
+    # did when the lane plugin denied a second session (#833 rule #1).
+    state.trigger_pending_tasks()
+    state.schedule_pending()
+    return task
 
 
 # ---------------------------------------------------------------------------
@@ -832,10 +983,195 @@ class _GitLabPoller:
                 break
         return out
 
+    async def _open_mr_issue_refs(self, client: httpx.AsyncClient,
+                                  endpoint: str, project_path: str,
+                                  open_ids: set) -> set:
+        """D-SPAWN-1 (issue already referenced by an OPEN MR = artifact-
+        carrying). Returns the subset of ``open_ids`` ('<path>#<iid>') that
+        an open MR of this project references, so intake never re-spawns a
+        fix that already exists as an MR."""
+        refs: set = set()
+        quoted = urllib.parse.quote(project_path, safe="")
+        page = 1
+        while True:
+            try:
+                resp = await client.get(
+                    f"{endpoint}/api/v4/projects/{quoted}/merge_requests",
+                    params={"state": "opened", "per_page": 100, "page": page},
+                    headers={"PRIVATE-TOKEN": self.token})
+                resp.raise_for_status()
+                batch = resp.json()
+            except (httpx.HTTPError, ValueError) as e:
+                # Fail OPEN on lookup error? NO — an MR whose existence we
+                # cannot check is exactly the duplicate spawn D-SPAWN-1
+                # prevents. Skip these issues this cycle; retry next cycle.
+                logger.warning("intake: MR census failed for %s (%s); "
+                               "holding its candidates this cycle",
+                               project_path, e)
+                return set(open_ids)
+            for mr in batch:
+                text = (mr.get("title") or "") + "\n" + (mr.get("description") or "")
+                for m in re.finditer(r"(?:[Cc]loses|[Rr]efs?|#)\s*#?(\d+)", text):
+                    refs.add(f"{project_path}#{m.group(1)}")
+            if len(batch) < 100 or page >= 5:
+                break
+            page += 1
+        return refs & set(open_ids)
+
+    async def _held_by_open_blockers(self, client: httpx.AsyncClient,
+                                     endpoint: str, issue_id: str,
+                                     batch_ids: set) -> set:
+        """GitLab DAG authority (AB-1): issue ids in ``batch_ids``
+        ('<path>#<iid>') with an is_blocked_by blocker OUTSIDE the batch that
+        is still open. Returns the held set (fail-closed: a failed links
+        lookup holds the issue for this cycle rather than bundling an
+        unordered fix)."""
+        path, iid = issue_id.rsplit("#", 1)
+        quoted = urllib.parse.quote(path, safe="")
+        held: set = set()
+        try:
+            resp = await client.get(
+                f"{endpoint}/api/v4/projects/{quoted}/issues/{iid}/links",
+                params={"per_page": 100},
+                headers={"PRIVATE-TOKEN": self.token})
+            resp.raise_for_status()
+            links = resp.json()
+        except (httpx.HTTPError, ValueError) as e:
+            logger.warning("intake: blocker links failed for %s (%s); held",
+                           issue_id, e)
+            return {issue_id}
+        for dep in (links.get("closed") or []) + (links.get("open") or []):
+            link_types = dep.get("link_types") or []
+            if not any(t in ("is_blocked_by", "blocked_by") for t in link_types):
+                continue
+            dep_refs = dep.get("references") or {}
+            dep_full = dep_refs.get("full", "")
+            if "#" not in dep_full:
+                continue
+            dep_id = dep_full  # "<path>#<iid>" — already inside batch?
+            if dep_id in batch_ids:
+                continue        # same sitting fixes both, in order
+            if dep.get("state") not in ("closed",):
+                held.add(issue_id)
+                break
+        return held
+
+    async def _grouped_cycle(self, client: httpx.AsyncClient, endpoint: str,
+                             policy: GitLabIntakePolicy,
+                             scoped: List[Tuple[List[Dict[str, Any]], IntakeScope]],
+                             created_ids: List[str]) -> None:
+        """LFP-1 grouped intake (#762): one lane-bundle task per client×repo
+        batch instead of one task per issue.
+
+        scoped: [(issues, scope)] already fetched by the caller. Candidate
+        filtering (skip labels, D-SPAWN-1, DAG, cardinality guard) lives in
+        core/intake_grouping; this method only does the GitLab I/O the pure
+        planner cannot: the open-MR census and per-batch blocker links.
+        """
+        cfg = policy.grouping
+        by_repo: Dict[str, List[Tuple[str, Dict[str, Any]]]] = {}
+        seen_pids: set = set()
+        band_of: Dict[str, int] = {}
+        for issues, scope in scoped:
+            for issue in issues:
+                self.issues_seen += 1
+                iid = issue["iid"]
+                refs = issue.get("references") or {}
+                full = refs.get("full", "")
+                proj_path = full.rsplit("#", 1)[0] if "#" in full else (
+                    scope.path if scope and scope.type == "project" else "")
+                if not proj_path:
+                    continue
+                issue_id = f"{proj_path}#{iid}"
+                if issue_id in seen_pids:
+                    continue  # an issue can surface in overlapping scopes once
+                seen_pids.add(issue_id)
+                author = issue.get("author") or {}
+                author_id = author.get("id")
+                band = (policy.priority.band_for(
+                    author_id=author_id if type(author_id) is int else None,
+                    project_path=proj_path,
+                    scope_path=scope.path if scope else "",
+                    labels=issue.get("labels") or [],
+                ) if scope is not None else 3)
+                by_repo.setdefault(proj_path, []).append((issue_id, issue))
+                prev = band_of.get(issue_id)
+                if prev is None or band < prev:
+                    band_of[issue_id] = band
+                issue["_intake_band"] = band_of[issue_id]
+
+        view, blocked_ids, legacy_iids = _grouping_view(self.state)
+        requires = policy.requires
+
+        for proj_path, pairs in by_repo.items():
+            lane_key = lane_key_for(proj_path, cfg)
+            # Candidates still WAITING: exclude issues already held by a
+            # non-terminal or completed bundle task (DEDUP FIRST, store-
+            # backed) and issues an in-flight legacy per-issue task is
+            # fixing; filter_candidates drops doomed labels and (below)
+            # artifact-carrying issues.
+            def _waiting(pid: str) -> bool:
+                if pid in blocked_ids:
+                    return False
+                try:
+                    if int(pid.rsplit("#", 1)[1]) in legacy_iids:
+                        return False
+                except ValueError:
+                    pass
+                return True
+            waiting = [(pid, iss) for pid, iss in pairs if _waiting(pid)]
+            plans = filter_candidates(
+                waiting, config=cfg,
+                band_for=lambda iss: int(iss.get("_intake_band", 3)),
+            )
+            # Guard short-circuit BEFORE the GitLab I/O: bundle_plan_for_repo
+            # is pure and cheap; when it already says "nothing can be created"
+            # (queued band>0 bundle + band>0 backlog), skip the open-MR census
+            # and blocker links for this repo entirely. D-SPAWN-1 filtering
+            # can only REMOVE candidates, never enable a blocked guard, so
+            # skipping is safe.
+            pre = bundle_plan_for_repo(lane_key, plans, cfg, view=view,
+                                       project_of=lambda pid: pid.rsplit("#", 1)[0])
+            if pre is None:
+                continue
+            # D-SPAWN-1: drop artifact-carrying issues (open-MR refs).
+            artifact = await self._open_mr_issue_refs(
+                client, endpoint, proj_path, {p[0] for p in plans})
+            if artifact:
+                plans = [p for p in plans if p[0] not in artifact]
+            plan = bundle_plan_for_repo(lane_key, plans, cfg, view=view,
+                                        project_of=lambda pid: pid.rsplit("#", 1)[0])
+            if plan is None:
+                continue
+            # DAG: hold any batch issue whose out-of-batch blocker is open.
+            batch_ids = set(plan.issue_ids)
+            held: set = set()
+            for pid in plan.issue_ids:
+                held |= await self._held_by_open_blockers(client, endpoint, pid, batch_ids)
+            if held:
+                keep = [c for c in plans if c[0] not in held]
+                if not keep:
+                    continue
+                plan = bundle_plan_for_repo(lane_key, keep, cfg, view=view,
+                                            project_of=lambda pid: pid.rsplit("#", 1)[0])
+                if plan is None:
+                    continue
+            task = _create_bundle_task(self.state, plan, requires)
+            for pid in plan.issue_ids:
+                _issue_dedup_to_task_id[pid] = task.id
+                self._seen_keys.add(pid)
+            self.tasks_created += 1
+            created_ids.append(task.id)
+            logger.info("intake: grouped lane task %s lane=%s bundle=%s (%s)",
+                        task.id, plan.lane_key, plan.issue_ids, plan.reason)
+
     async def poll_once(self) -> Dict[str, Any]:
         """One intake cycle: policy scopes when configured, else legacy env.
 
         Returns {created: [task ids], interval_seconds: effective interval}.
+        With ``grouping.enabled`` the cycle emits ONE lane-bundle task per
+        client×repo batch (#762); otherwise the per-issue wiring runs
+        byte-for-byte.
         """
         defaults = self.defaults
         policy = load_policy(self.state, default_endpoint=defaults["endpoint"],
@@ -878,6 +1214,29 @@ class _GitLabPoller:
 
         created_ids: List[str] = []
         async with self._client() as client:
+            # When grouping is ON, fetch everything first and run the grouped
+            # cycle once (bundle planning needs the whole repo backlog in
+            # view, not a per-scope stream).
+            if policy.grouping.enabled and policy.configured:
+                scoped: List[Tuple[List[Dict[str, Any]], Optional[IntakeScope]]] = []
+                for base, label, scope_path, scope in work:
+                    try:
+                        issues = await self._fetch_issues(client, base, endpoint, label)
+                    except httpx.HTTPStatusError as e:
+                        self.last_errors[base] = f"HTTP {e.response.status_code}"
+                        logger.error("intake: scope %s failed: HTTP %s", base, e.response.status_code)
+                        continue
+                    except httpx.RequestError as e:
+                        self.last_errors[base] = str(e)
+                        logger.error("intake: scope %s failed: %s", base, e)
+                        continue
+                    self.last_errors.pop(base, None)
+                    scoped.append((issues, scope))
+                await self._grouped_cycle(client, endpoint, policy, scoped, created_ids)
+                self.last_poll = datetime.now(timezone.utc)
+                result["created"] = created_ids
+                return result
+
             for base, label, scope_path, scope in work:
                 try:
                     issues = await self._fetch_issues(client, base, endpoint, label)
