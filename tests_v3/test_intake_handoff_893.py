@@ -76,6 +76,36 @@ def test_bundle_brief_never_self_approve_and_no_parking():
     assert "does not park for the lead" in text
 
 
+def test_bundle_brief_ready_gate_before_handoff_ordering():
+    """Measured bounce (invora/invora-flutter!479, 2026-09-14): a Draft MR or
+    a red required job at head makes the reviewer pipeline refuse at Stage 1
+    and bounce a NEEDS-CHANGES follow-up onto the SAME author lane — wasted
+    credits. The brief must therefore state the hand-off preconditions in
+    ORDER: push ONCE -> CI green at head (terminal traces, fix locally if
+    red) -> mark the MR READY -> THEN kanban_cluster_submit the reviewer."""
+    text = bundle_brief(_plan())
+    # the ordered preconditions, by their tokens
+    assert "push ONCE" in text
+    assert "mark the MR READY" in text
+    assert "bdaya-glab mr update --ready" in text
+    assert "markPullRequestReadyForReview" in text
+    assert "green" in text
+    # the bounce warning is explicit
+    assert "Draft is not" in text or "a Draft is not a merge candidate" in text
+    assert "wasted credits" in text
+    # ORDERING: CI-green and READY both precede the reviewer submit, and the
+    # numbered list runs push -> green -> READY -> submit.
+    i_push = text.index("1. push ONCE")
+    i_green = text.index("2. wait for the required CI jobs at head to be green")
+    i_ready = text.index("3. mark the MR READY")
+    i_submit = text.index("kanban_cluster_submit", i_ready)
+    assert i_push < i_green < i_ready < i_submit
+    # and the generic "green before kanban_cluster_submit" pin: the first
+    # hand-off-section 'green' sits strictly before the hand-off submit.
+    i_green_any = text.index("green", text.index("HAND-OFF"))
+    assert i_green_any < i_submit
+
+
 def test_reviewer_handoff_brief_renders_mr_url_and_sha():
     text = reviewer_handoff_brief(_plan(), MR_URL, SHA)
     assert MR_URL in text
