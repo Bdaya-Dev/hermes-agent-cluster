@@ -217,18 +217,20 @@ def acquire(node_id: str,
         data = _read_lock(path) or {}
         holder_pid = int(data.get("pid") or 0)
         holder_token = str(data.get("token") or "")
-        if holder_pid and not pid_alive(holder_pid):
-            # Stale descriptor AND stale pid: the port is held by some
-            # unrelated process that reused it after our holder died.
-            # Rebind cannot work while a stranger holds the port — raise
-            # loudly (port collisions in the derived band are ~1/30000
-            # per node; operators resolve by restarting or renaming).
+        if not holder_pid or not pid_alive(holder_pid):
+            # Either no descriptor at all (a foreign process grabbed the
+            # derived port) or a descriptor whose pid is DEAD while the
+            # port is still held — both mean the port holder is NOT our
+            # sibling. Rebind cannot work while a stranger holds the
+            # port — raise loudly (port collisions in the derived band
+            # are rare; operators resolve by freeing the port or
+            # renaming the node id).
             raise RuntimeError(
                 f"single-instance lock: node '{node_id}' lock port "
                 f"127.0.0.1:{port} is taken by an unrelated process "
-                f"(lock file pid {holder_pid or '?'} is dead). Free the "
-                f"port or change the node id — refusing to start a "
-                f"worker that could not guarantee single-instance."
+                f"(lock file pid {holder_pid or '?'} is dead or missing). "
+                f"Free the port or change the node id — refusing to start "
+                f"a worker that could not guarantee single-instance."
             )
         raise LockHeldByLiveInstance(node_id, holder_pid, path,
                                      holder_token) from exc

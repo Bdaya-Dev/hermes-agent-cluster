@@ -26,10 +26,25 @@ from unittest.mock import patch
 
 import pytest
 
-from hermes_cluster.core import single_instance as si
 from hermes_cluster.serve import main as serve_main
 
+# #899: import-clean against main — the new module surfaces as an
+# assertion ("lock module missing"), not an ImportError.
+from typing import Any
+si: Any = None
+try:
+    from hermes_cluster.core import single_instance as _si_mod
+    si = _si_mod
+except ImportError:  # pragma: no cover - the RED shape on main
+    pass
+
 LOCK_REFUSAL = "ALREADY RUNNING"  # the token the .cmd wrappers back off on
+
+
+def _have_si():
+    assert si is not None, (
+        "#899: hermes_cluster.core.single_instance does not exist — "
+        "serve has no per-node-id single-instance lock")
 
 
 def _run_worker_serve(tmp_path, node_id="w1", token=None, role="worker"):
@@ -60,6 +75,7 @@ class TestServeWorkerLock:
     def test_second_worker_instance_refused_nonzero(self, tmp_path):
         """Two live serve instances for one node id: the second exits
         non-zero with the clear refusal naming the holder pid."""
+        _have_si()
         first = si.acquire("w1", data_dir=tmp_path)  # real bind held
         try:
             rc, printed = _run_worker_serve(tmp_path, node_id="w1")
@@ -75,6 +91,7 @@ class TestServeWorkerLock:
     def test_after_release_the_node_id_can_start_again(self, tmp_path):
         """Crash/restart path: once the holder releases (or dies), the
         same node id starts cleanly."""
+        _have_si()
         first = si.acquire("w8", data_dir=tmp_path)
         first.release()
         rc, printed = _run_worker_serve(tmp_path, node_id="w8")
@@ -82,6 +99,7 @@ class TestServeWorkerLock:
 
     def test_different_node_ids_both_start(self, tmp_path):
         """The lock is PER node id: w2 starts while w1 holds its own."""
+        _have_si()
         first = si.acquire("w1", data_dir=tmp_path)
         try:
             rc, printed = _run_worker_serve(tmp_path, node_id="w2")
@@ -94,6 +112,7 @@ class TestServeWorkerLock:
         lock is the worker-role reflex the brief specifies (the main's own
         --port uvicorn bind already refuses a second main on the same
         socket, so a second mechanism there is moot)."""
+        _have_si()
         first = si.acquire("node_main", data_dir=tmp_path)
         try:
             rc, printed = _run_worker_serve(tmp_path, node_id="node_main",
@@ -106,6 +125,7 @@ class TestServeWorkerLock:
     def test_stale_lock_file_does_not_wedge_restart(self, tmp_path):
         """Crash leaves a lock FILE naming a dead pid but the port is free
         (the OS released it with the process): the restart takes over."""
+        _have_si()
         lock_dir = tmp_path / "locks"
         lock_dir.mkdir(parents=True, exist_ok=True)
         node_id = "wstale"
@@ -121,6 +141,7 @@ class TestServeWorkerLock:
         """The unambiguous-collision case: the derived port is held by a
         foreign live socket while our lock file names a DEAD pid — exit
         non-zero with a loud error (never start a possibly-duplicate)."""
+        _have_si()
         node_id = "wsquat"
         port = si.derive_port(node_id)
         squatter = socket.socket()
@@ -193,6 +214,25 @@ class TestLockModule:
         assert si.pid_alive(0) is False
         assert si.pid_alive(-1) is False
         assert si.pid_alive(None) is False  # defensive: records predate pid persist
+
+    def test_bind_collision_without_descriptor_fails_loud(self, tmp_path):
+        """No lock file at all + port held by a foreign live socket =>
+        RuntimeError ('unrelated process'), NOT a LockHeld — the refusal
+        must never name a phantom holder pid."""
+        node_id = "mnodesc"
+        port = si.derive_port(node_id)
+        squatter = socket.socket()
+        try:
+            squatter.bind(("127.0.0.1", port))
+        except OSError:
+            pytest.skip(f"port {port} already in use on this machine")
+        try:
+            with pytest.raises(RuntimeError) as ei:
+                si.acquire(node_id, data_dir=tmp_path)
+            assert "unrelated process" in str(ei.value)
+            assert not isinstance(ei.value, si.LockHeldByLiveInstance)
+        finally:
+            squatter.close()
 
     def test_live_sibling_pid_makes_refusal_name_the_holder(self, tmp_path):
         """The refusal must carry the holder pid a wrapper can inspect —
