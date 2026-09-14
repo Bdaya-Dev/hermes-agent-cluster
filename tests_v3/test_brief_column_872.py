@@ -209,12 +209,14 @@ def test_intake_task_carries_issue_body_in_description():
     """The GitLab intake path — the issue's own 'better shape' — moves the
     issue BODY into description while the title stays `[#iid] Issue title`."""
     from hermes_cluster.routers import intake
+    from hermes_cluster.state import ClusterState
 
     body = "## Summary\n\nThe real brief lives here now.\n"
+    st = ClusterState()
     try:
         t = intake._create_task_from_issue(
-            issue_iid=999001, title="Some issue", label="tooling",
-            description=body,
+            dedup_key="999001", display_iid=999001, title="Some issue",
+            description=body, state=st,
         )
     except TypeError as e:
         raise AssertionError(f"intake takes no 'description': {e}")
