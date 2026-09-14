@@ -317,6 +317,7 @@ def _api_call(method: str, path: str, data: dict = None) -> dict:
                 req.add_header(key, value)
     except Exception as e:
         logger.debug("Peer auth signing skipped: %s", e)
+    from urllib.error import HTTPError as _HTTPError
     try:
         with urlopen(req, timeout=10) as resp:
             return json.loads(resp.read().decode())
@@ -324,10 +325,21 @@ def _api_call(method: str, path: str, data: dict = None) -> dict:
         # #897 direction 3: a rollout takes the hosted main down for tens of
         # seconds; a one-shot connection error used to surface as a tool
         # failure and lanes papered over it with manual re-calls. Retry
-        # TRANSPORT failures only (never HTTP 4xx/5xx bodies, which parse
-        # fine) with bounded backoff: 3 attempts, 1s + 2s. Worst case adds
-        # ~3s to a genuinely-dead endpoint — still far under the executor's
-        # 10s HTTP budget expectations and never fails a TASK.
+        # TRANSPORT failures only with bounded backoff: 3 attempts, 1s + 2s.
+        # Worst case adds ~3s to a genuinely-dead endpoint — still far under
+        # the executor's 10s HTTP budget expectations and never fails a TASK.
+        #
+        # Reviewer note (PR #50 review @ 6f57a2b): HTTPError subclasses
+        # URLError, so a bare `except URLError` ALSO retried real 4xx/5xx
+        # answers and discarded their bodies (str(HTTPError) is the reason
+        # phrase, not the JSON). A main that answers 404/409 IS reachable —
+        # decoding and returning its body keeps the error surface honest;
+        # only pure transport failures (connection refused/reset/DNS) retry.
+        if isinstance(e, _HTTPError):
+            try:
+                return json.loads(e.read().decode())
+            except Exception:
+                return {"error": str(e)}
         last = e
         for attempt, wait in enumerate((1.0, 2.0)):
             time.sleep(wait)
@@ -335,6 +347,11 @@ def _api_call(method: str, path: str, data: dict = None) -> dict:
                 with urlopen(req, timeout=10) as resp:
                     return json.loads(resp.read().decode())
             except URLError as e2:
+                if isinstance(e2, _HTTPError):
+                    try:
+                        return json.loads(e2.read().decode())
+                    except Exception:
+                        return {"error": str(e2)}
                 last = e2
             except Exception as e2:
                 return {"error": str(e2)}
@@ -402,9 +419,15 @@ def handle_cluster_submit(args: dict, **kwargs) -> str:
             payload[opt] = args[opt]
     result = _api_call("POST", "/api/v1/tasks", payload)
     if isinstance(result, dict) and not result.get("error"):
-        trigger = _api_call("POST", "/api/v1/schedule/trigger", {})
-        if isinstance(trigger, dict) and trigger.get("error"):
-            logger.warning("schedule trigger after submit failed: %s", trigger["error"])
+        # #898: a deduped reviewer submit returned an EXISTING live task —
+        # that task is already the scheduler's problem. Re-triggering would
+        # fan churn the dedupe exists to prevent, and the response's
+        # `deduped: true` tells the lane "you already handed off; finish
+        # your turn".
+        if not result.get("deduped"):
+            trigger = _api_call("POST", "/api/v1/schedule/trigger", {})
+            if isinstance(trigger, dict) and trigger.get("error"):
+                logger.warning("schedule trigger after submit failed: %s", trigger["error"])
     return json.dumps(result)
 
 
@@ -489,7 +512,10 @@ SCHEMAS = {
             "author lane for its hand-off: pass role='reviewer', requires=['review'] "
             "and lane_key='<repo>!<mr_iid>' to dispatch the independent reviewer "
             "yourself (RV-1: a fresh context on a different lane — never approve or "
-            "merge your own work)."
+            "merge your own work). SUBMIT EXACTLY ONE reviewer task per hand-off and "
+            "then finish — never cancel or resubmit it (#898): a queued reviewer is "
+            "capacity-waiting, not lost, and a resubmit while one is live returns the "
+            "existing task (deduped: true)."
         ),
         "parameters": {
             "type": "object",

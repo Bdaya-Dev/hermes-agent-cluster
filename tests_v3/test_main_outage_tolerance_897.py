@@ -305,3 +305,34 @@ def test_plugin_api_call_still_surfaces_http_error_bodies():
          patch.object(plugin, "urlopen", lambda req, timeout=None: _Resp()):
         out = plugin._api_call("POST", "/api/v1/tasks/9999/complete")
     assert out.get("error") == "task not found"
+
+
+def test_plugin_api_call_real_httperror_not_retried_body_decoded():
+    """Reviewer note on PR #50 @ 6f57a2b (applied): a REAL urllib HTTPError
+    (4xx/5xx — main IS reachable) must NOT be swallowed by the URLError
+    retry branch: no retries (one call only) and the response body is
+    decoded and returned, so a 409/404 JSON error from the main surfaces
+    intact instead of degrading to 'HTTP Error 404: Not Found'.
+
+    RED before the narrowing: HTTPError subclasses URLError, so the bare
+    `except URLError` retried it twice and returned str(e) (the reason
+    phrase, body lost)."""
+    import io
+    import urllib.error as uerr
+    from hermes_cluster import plugin
+
+    calls = {"n": 0}
+
+    def fake_urlopen(req, timeout=None):
+        calls["n"] += 1
+        raise uerr.HTTPError(
+            "http://main.invalid:8787/api/v1/tasks/x/fail", 409,
+            "Conflict", {}, io.BytesIO(b'{"error": "already terminal"}'))
+
+    with patch.object(plugin, "_base_url", "http://main.invalid:8787"), \
+         patch.object(plugin, "urlopen", fake_urlopen), \
+         patch.object(plugin.time, "sleep"):
+        out = plugin._api_call("POST", "/api/v1/tasks/x/fail", {"reason": "r"})
+    assert calls["n"] == 1, f"HTTPError must not be retried, calls={calls['n']}"
+    assert out.get("error") == "already terminal", \
+        f"RED pre-narrowing (str(HTTPError), body lost): {out!r}"
