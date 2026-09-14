@@ -139,6 +139,91 @@ def _record_attempt(record: dict) -> int:
     except (TypeError, ValueError):
         return 0
 
+
+# ---------------------------------------------------------------------------
+# #882 — lane role stamp for spawned sessions
+# ---------------------------------------------------------------------------
+
+# The estate's READ-ONLY reviewer enforcement (claude-plugins !921:
+# plugins/bdaya-defaults/hooks/readonly-lane-merge-guard.js,
+# readonly-lane-mcp-guard.js, and the Hermes port
+# hermes/plugins/bdaya-enforcement/readonly_reviewer_gate.py) resolves a
+# session's role from exactly these channels:
+#   1. env BDAYA_LANE_ROLE            (the dispatch path's --role stamp)
+#   2. <lanes_dir>/lane-role-<id>.json via env BDAYA_LANE_ID
+#   3. a SQLite lanes.db session registry (hosted-main deployments are
+#      Postgres-backed, so this leg is dead on this node — measured 2026-09-14)
+# The native hermes spawn path used to pass NONE of them: every dispatched
+# reviewer lane ran with the same merge-capable posture as its author, and
+# the brief's READ-ONLY line was the only restraint — the exact shape of the
+# rv918d/rv919b incidents. These helpers close the gap from the executor side.
+
+_LANE_ROLE_VOCAB = ("reviewer", "author")
+
+
+def _lane_role_safe_id(value: str) -> str:
+    """Same sanitisation bdaya-dispatch.js uses for lane-role file names
+    (replace [^A-Za-z0-9._-] with _, cap at 64 chars) — the guards compute the
+    path with the identical rule, so the file name must match byte-for-byte."""
+    import re as _re
+    return _re.sub(r"[^A-Za-z0-9._-]", "_", str(value or ""))[:64]
+
+
+def _lane_roles_dir(env: dict, config_lanes_dir: str) -> str:
+    """Resolve the durable lane-role dir: explicit config, then
+    BDAYA_LANES_DIR, then the bdaya-dispatch ledger dir (CLAUDE_CONFIG_DIR or
+    ~/.claude + '.bdaya-dispatch') — the path
+    readonly_reviewer_gate._default_lanes_dir and readonly-lane-merge-guard
+    fall back to."""
+    if config_lanes_dir:
+        return config_lanes_dir
+    override = (env.get("BDAYA_LANES_DIR") or "").strip()
+    if override:
+        return override
+    home = env.get("USERPROFILE") or env.get("HOME") or os.path.expanduser("~")
+    config_dir = (env.get("CLAUDE_CONFIG_DIR") or "").strip() or os.path.join(home, ".claude")
+    return os.path.join(config_dir, ".bdaya-dispatch")
+
+
+def _stamp_lane_role_env(env: dict, lane_key: str, role: str) -> str:
+    """Return the normalized role and stamp the child env (#882).
+
+    The stamp is ALWAYS explicit — for author lanes too — so a stale
+    BDAYA_LANE_ROLE inherited from the executor's own environment can never
+    misclassify a lane in either direction (an author wrongly stamped reviewer
+    would be denied its merge surface; a reviewer missing the stamp keeps a
+    merge-capable posture)."""
+    normalized = (role or "author").strip().lower()
+    if normalized not in _LANE_ROLE_VOCAB:
+        normalized = "author"
+    env["BDAYA_LANE_ROLE"] = normalized
+    if lane_key:
+        env["BDAYA_LANE_KEY"] = lane_key
+        env["BDAYA_LANE_ID"] = lane_key
+    else:
+        env.pop("BDAYA_LANE_ID", None)
+    return normalized
+
+
+def _write_lane_role_marker(lanes_dir: str, lane_key: str, role: str) -> str:
+    """Write the durable lane-role-<id>.json registry file pre-spawn, mirroring
+    bdaya-dispatch.js's registry (same file name + {role, lane} shape). Returns
+    the path, or '' when there is nothing to write (no lane_key) — best-effort:
+    a marker write failure logs and continues; the env stamp is the live
+    channel and the marker is its crash-resume backup."""
+    if not lane_key:
+        return ""
+    path = os.path.join(lanes_dir, f"lane-role-{_lane_role_safe_id(lane_key)}.json")
+    try:
+        os.makedirs(lanes_dir, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump({"role": role, "lane": lane_key}, fh)
+        return path
+    except OSError as e:
+        logger.warning("could not write lane-role marker %s: %s", path, e)
+        return ""
+
+
 logger = logging.getLogger(__name__)
 
 
@@ -182,6 +267,12 @@ class AgentExecutorConfig:
     # is below it. Sourced from cluster YAML node.min_free_disk_gb (owner
     # ruling: never an env var). None -> default 5.0; 0 -> guard disabled.
     min_free_disk_gb: Optional[float] = None
+    # #882: directory for the durable lane-role markers (lane-role-<id>.json).
+    # Default "" resolves to the bdaya-dispatch ledger dir (CLAUDE_CONFIG_DIR
+    # or ~/.claude, + .bdaya-dispatch) — the SAME dir the readonly guards'
+    # registry fallback reads, so a crash-resumed or --resumed lane stays
+    # recognisable as reviewer even after the env stamp is lost.
+    lanes_dir: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -875,6 +966,14 @@ class AgentExecutor:
             "--profile", self._config.profile,
             "--require-goal",
             "--force",
+            # #882: explicit --role so the dispatch path stamps BDAYA_LANE_ROLE
+            # into the lane's settings env + writes the durable lane-role
+            # registry. The executor's lane names (`hermes-<task_id>`) match no
+            # reviewer-shaped default, so without this a reviewer dispatched via
+            # bdaya-dispatch got the author posture (the readonly gates inert).
+            "--role", (role or "author").strip().lower()
+            if (role or "author").strip().lower() in ("reviewer", "author")
+            else "author",
         ]
 
         # bdaya-dispatch resolves the CALLER's cpm profile from CLAUDE_CONFIG_DIR and
@@ -1289,6 +1388,18 @@ class AgentExecutor:
             task_id, " ".join(cmd),
         )
 
+        # #882: stamp the lane's role into the child env + write the durable
+        # lane-role marker BEFORE spawn. Without this, a dispatched reviewer
+        # lane on the native hermes path carries no role signal at all and the
+        # readonly gates (which key on exactly that signal) are inert — the
+        # rv918d/rv919b posture returns. The stamp is explicit for authors too
+        # so a stale inherited BDAYA_LANE_ROLE can never misclassify a lane.
+        child_env = dict(os.environ)
+        lane_role = _stamp_lane_role_env(child_env, lane_key, role)
+        _write_lane_role_marker(
+            _lane_roles_dir(child_env, getattr(self._config, "lanes_dir", "") or ""),
+            lane_key, lane_role)
+
         # Hold the STDOUT + stderr transcript files open for the child's
         # lifetime (closing the parent handle too early breaks stdout
         # inheritance on Windows). The DELIVERABLE path (result.md) is never
@@ -1303,6 +1414,7 @@ class AgentExecutor:
             proc = subprocess.Popen(
                 cmd,
                 cwd=self._config.working_dir,
+                env=child_env,
                 # Agent final response (stdout) lands in the transcript log;
                 # stderr (incl. the session_id line) goes to its own log file.
                 stdout=stdout_file,
