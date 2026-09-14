@@ -28,6 +28,8 @@ from httpx import ASGITransport, AsyncClient
 
 from hermes_cluster.app import create_app
 from hermes_cluster.core import metering as mt
+from hermes_cluster.hooks.manager import HookManager
+from hermes_cluster.hooks.payload import HookEventType, sign_payload
 from hermes_cluster.core.metering import (
     ALGORITHM,
     MeteringConfig,
@@ -187,6 +189,31 @@ class _RecordingHookManager:
         self.emitted.append((event_type.value, data))
         return 1
 
+    def get_hooks_for_event(self, event_type):
+        return []  # the stub registry has no subscribers
+
+
+def _recording_manager(alerts_seen, monkeypatch):
+    """REAL HookManager + the real Dispatcher class with its transport
+    patched (via monkeypatch, auto-reverted): emit_alert builds a fresh
+    Dispatcher per cycle (loop-binding), so intercept at the class. Proves
+    the wire path (payload -> HMAC header -> delivery history) end to end
+    without a network listener."""
+    from hermes_cluster.hooks.dispatcher import Dispatcher
+
+    async def fake_send(self, url, secret, body):
+        assert secret, "hook secret must reach the signer"
+        sig = sign_payload(body, secret)
+        assert sig.startswith("sha256=")
+        alerts_seen.append(json.loads(body))
+        return 200, None
+
+    monkeypatch.setattr(Dispatcher, "_send_request", fake_send)
+    m = HookManager()
+    m.register(url="http://telegram-bot.invalid/hook",
+               events=[HookEventType.TASK_FAILED], secret="test-hook-secret")
+    return m
+
 
 def _poller(client, hooks=None, alert_below=25000, enabled=True):
     state = ClusterState()
@@ -222,38 +249,65 @@ def test_poll_success_stores_sample_and_clears_errors():
     assert st["last_errors"] == {}
 
 
-def test_poll_alerts_below_threshold_once_then_suppresses():
-    hooks = _RecordingHookManager()
+def test_poll_alerts_below_threshold_once_then_suppresses(monkeypatch):
+    seen = []
     client = _FakeClient(_seat_fixture())
-    poller = _poller(client, hooks=hooks, alert_below=200000)  # 191307 < 200000
+    poller = _poller(client, hooks=_recording_manager(seen, monkeypatch),
+                     alert_below=200000)  # 191307 < 200000 -> alert
     poller.poll_once()
-    assert len(hooks.emitted) == 1
-    event, data = hooks.emitted[0]
-    assert event == "task_failed" and data["source"] == "metering"
-    assert data["kind"] == "credits_low"
+    assert len(seen) == 1
+    body = seen[0]
+    assert body["event_type"] == "task_failed"
+    data = body["data"]
+    assert data["source"] == "metering" and data["kind"] == "credits_low"
     assert "200000" in data["message"]
+    assert data["detail"]["credits_remaining_total"] == pytest.approx(191307.22449352)
+    # delivery recorded in the hook history (operator-visible via
+    # GET /api/v1/hooks/{id}/deliveries)
+    hist = poller.hook_manager.get_deliveries_all()
+    assert hist and hist[-1].status == "success"
     # identical live condition: suppressed (no 15-min message spam)
     poller.poll_once()
-    assert len(hooks.emitted) == 1
+    assert len(seen) == 1
     # condition changes (new low total) -> alert again
     fixture = _seat_fixture()
     fixture["Data"]["Items"][0]["EquityList"][0]["CycleSurplusValue"] = 150000.0
     client._raw = fixture
     poller.poll_once()
-    assert len(hooks.emitted) == 2
+    assert len(seen) == 2
+    # recovery above threshold clears suppression entirely
+    fixture["Data"]["Items"][0]["EquityList"][0]["CycleSurplusValue"] = 300000.0
+    poller.poll_once()
+    assert len(seen) == 2  # no new alert, nothing to spam
+    # a SECOND dip (same as first total) may alert again (key changed via
+    # recovery reset) — assert suppression is keyed, not sticky-forever
+    fixture["Data"]["Items"][0]["EquityList"][0]["CycleSurplusValue"] = 191307.22449352
+    poller.poll_once()
+    assert len(seen) == 3
 
 
-def test_three_consecutive_failures_alert_and_error_is_sanitised():
-    hooks = _RecordingHookManager()
+def test_alert_without_subscribers_records_nothing_and_returns_zero():
+    """No hook registered -> emit_alert returns 0 and the streak logic still
+    holds (the instrument must not claim delivery it did not make)."""
+    client = _FakeClient(_seat_fixture())
+    poller = _poller(client, hooks=HookManager(), alert_below=200000)
+    result = poller.poll_once()
+    assert result["alert"]["kind"] == "credits_low"
+    assert poller.last_errors.get("alert_delivery") is None
+
+
+def test_three_consecutive_failures_alert_and_error_is_sanitised(monkeypatch):
+    seen = []
     exc = mt.ApiError("GetSubscriptionSeatDetails: HTTP 403 code=Forbidden")
-    poller = _poller(_FakeClient(exc=exc), hooks=hooks)
+    poller = _poller(_FakeClient(exc=exc), hooks=_recording_manager(seen, monkeypatch))
     poller.poll_once()
     poller.poll_once()
-    assert hooks.emitted == []  # below threshold, no alert yet
+    assert seen == []  # below threshold, no alert yet
     poller.poll_once()
-    assert len(hooks.emitted) == 1
-    event, data = hooks.emitted[0]
+    assert len(seen) == 1
+    data = seen[0]["data"]
     assert data["kind"] == "fetch_failed" and data["consecutive_failures"] == 3
+    assert data["source"] == "metering"
     st = poller.status()
     assert st["credits_available"] is False
     assert "HTTP 403" in (st["last_error"] or "")
@@ -374,6 +428,28 @@ def test_client_non_200_raises_sanitised():
 @pytest.fixture
 def app():
     return create_app(cluster_id="test", node_id="test-node", node_role="main")
+
+
+def test_default_main_creates_no_metering_thread(app):
+    """CI regression (run 34828677799, exit 139): a metering-disabled main
+    must not run ANY background thread — the poller object exists for the
+    read surface, the thread does not exist until enabled."""
+    import hermes_cluster.routers.metering as mrouter
+    poller = mrouter._poller
+    assert poller is not None
+    assert poller._thread is None
+    assert poller.ensure_started() is False   # still disabled -> no thread
+    assert poller._thread is None
+    # and the runtime store flipped to enabled is what arms it:
+    poller.state.set_config({"metering": {"enabled": True}})
+    # neutralise the body so arming is asserted without any real fetch/SM read
+    poller.poll_once = lambda: {"ok": True, "enabled": True,
+                                "interval_seconds": 3600}
+    try:
+        assert poller.ensure_started() is True
+        assert poller._thread is not None and poller._thread.is_alive()
+    finally:
+        poller.stop()
 
 
 @pytest.mark.asyncio

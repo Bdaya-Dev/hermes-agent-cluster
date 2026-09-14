@@ -77,8 +77,9 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+from ..hooks.dispatcher import Dispatcher
 from ..hooks.manager import HookManager
-from ..hooks.payload import HookEventType
+from ..hooks.payload import DeliveryStatus, HookEventType, Payload
 
 logger = logging.getLogger("hermes_cluster.metering")
 
@@ -587,8 +588,25 @@ class MeteringPoller:
 
     # -- lifecycle ----------------------------------------------------------
 
+    def current_enabled(self) -> bool:
+        ok, settings = parse_metering_settings(
+            self.state.get_config() if hasattr(self.state, "get_config") else {})
+        return bool(ok and settings and settings.enabled)
+
+    def ensure_started(self) -> bool:
+        """Start the loop iff metering is currently enabled in the runtime
+        store (idempotent; returns running state). Called at boot and after
+        runtime config writes (routers/config.py) — a default-off node runs
+        NO background thread at all, matching the agent_executor gating and
+        keeping test/CI processes free of always-on daemons (CI run
+        34828677799 exited 139 with one)."""
+        if not self.current_enabled():
+            return False
+        self.start()
+        return True
+
     def start(self) -> None:
-        if self._thread and self._thread.is_alive():
+        if self._thread and self._thread.is_alive() and not self._stop.is_set():
             return
         self._stop.clear()
         self._thread = threading.Thread(target=self._run, daemon=True,
@@ -597,6 +615,7 @@ class MeteringPoller:
 
     def stop(self) -> None:
         self._stop.set()
+        self._thread = None
 
     def _run(self) -> None:
         while not self._stop.is_set():
@@ -717,29 +736,69 @@ class MeteringPoller:
         except Exception as exc:
             return None, str(exc)[:300]
 
-    # -- alert fan-out (existing webhook channel) ----------------------------
+    # -- alert fan-out (existing webhook channel, end-to-end) ----------------
 
     def emit_alert(self, alert: Dict[str, Any]) -> int:
-        """Deliver the alert through the cluster HookManager (TASK_FAILED +
-        source=metering) on a private event loop so the fire-and-forget
-        dispatch tasks the manager creates actually run to completion."""
+        """Deliver the alert through the cluster's EXISTING webhook stack:
+        HookManager.get_hooks_for_event (registry) -> Dispatcher.deliver
+        (X-Hub-Signature-256 HMAC, retry ladder) -> _record_delivery (history,
+        visible on GET /api/v1/hooks/{id}/deliveries). The Telegram bot
+        subscribes to task_failed like any third party — no new channel.
+
+        The dispatcher is start()ed on demand: the app never starts it (no
+        prior emitter existed) and deliver() fails closed while
+        ``_running`` is False — that silent no-op is exactly what this method
+        must not regress into. Runs on the poller's fresh per-cycle loop via
+        _run_coro_blocking, so it works from both the thread and the async
+        manual-poll route. Returns delivered-to count; failures are recorded
+        in last_errors.
+        """
         if self.hook_manager is None:
             logger.warning("metering alert (no hook manager): %s", alert.get("message"))
             return 0
+        hooks = self.hook_manager.get_hooks_for_event(HookEventType.TASK_FAILED)
+        if not hooks:
+            logger.warning("metering alert with NO subscribers (register a "
+                           "task_failed hook to receive it): %s",
+                           alert.get("message"))
+            return 0
+        payload = Payload(event_type=HookEventType.TASK_FAILED,
+                          timestamp=datetime.now(timezone.utc),
+                          data={"source": "metering", **alert})
 
         async def _emit() -> int:
-            n = self.hook_manager.emit(HookEventType.TASK_FAILED,
-                                       {"source": "metering", **alert})
-            if n:
-                # emit() schedules deliver() tasks on the RUNNING loop — give
-                # them bounded time to finish their real network I/O, then
-                # cancel stragglers (the dispatcher records failures itself).
-                loop = asyncio.get_running_loop()
-                deadline = loop.time() + 35
-                while (len(asyncio.all_tasks(loop=loop)) > 1
-                       and loop.time() < deadline):
-                    await asyncio.sleep(0.05)
-            return n
+            # A dedicated Dispatcher per cycle: the SHARED manager dispatcher
+            # binds its semaphore to whichever loop first awaits it, and this
+            # poller owns a FRESH loop per cycle — reusing the shared one
+            # across loops would crash (asyncio "bound to a different event
+            # loop"). Same class, same retry ladder + HMAC + delivery-history
+            # callback, so the wire contract is unchanged.
+            shared = self.hook_manager._dispatcher
+            dispatcher = Dispatcher(max_retries=shared.max_retries,
+                                    http_timeout=shared.http_timeout)
+            dispatcher.start()
+            try:
+                results = await asyncio.gather(*[
+                    dispatcher.deliver(
+                        hook_id=h.id, hook_url=h.url, hook_secret=h.secret,
+                        payload=payload,
+                        callback=self.hook_manager._record_delivery)
+                    for h in hooks], return_exceptions=True)
+            finally:
+                dispatcher.stop()
+            ok = 0
+            for hook, res in zip(hooks, results):
+                if isinstance(res, BaseException):
+                    self._record_error("alert_delivery", res)
+                    continue
+                if res.status == DeliveryStatus.SUCCESS.value:
+                    ok += 1
+                else:
+                    self._record_error("alert_delivery", ApiError(
+                        f"metering alert to "
+                        f"{urllib.parse.urlparse(hook.url).netloc}: "
+                        f"{res.status} {res.error}"[:200]))
+            return ok
 
         try:
             return _run_coro_blocking(_emit)

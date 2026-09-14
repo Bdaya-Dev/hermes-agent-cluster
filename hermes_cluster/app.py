@@ -285,21 +285,26 @@ def create_app(
     intake_mod.init(state)
 
     # --- Alibaba Token Plan metering poller (main-side, same process as the
-    # intake poller). The thread runs only on role=main; the `metering`
-    # section — enabled/interval/alert_below — is re-read EVERY cycle from
-    # the runtime store (YAML file seeds an empty store once, the intake
-    # precedent), so enabling/disabling needs no redeploy. With the section
-    # absent the cycle is a cheap no-op (default enabled: false).
+    # intake poller). Gated: the thread only exists while metering.enabled is
+    # true in the runtime store (boot seed or a runtime PUT — the intake
+    # poller is gated the same way on its token env). A default-off node
+    # starts NO thread, no network, no SM read (and keeps test/CI processes
+    # clean — CI run 34828677799 exited 139 with an always-on idle daemon).
     _metering_poller = None
     if node_role == "main":
         from .core.metering import MeteringPoller, _seed_metering_from_config_file
         _seed_metering_from_config_file(state)
         _metering_poller = MeteringPoller(state=state, hook_manager=hook_manager)
-        _metering_poller.start()
         state._metering_poller = _metering_poller
-        logger.info("Alibaba metering poller thread started "
-                    "(armed per-cycle by metering.enabled in runtime config)")
+        if _metering_poller.ensure_started():
+            logger.info("Alibaba metering poller started "
+                        "(metering.enabled: true in runtime config)")
     metering_mod.set_poller(_metering_poller)
+    # Turning metering on/off at runtime: PUT /api/v1/config carries the
+    # `metering` section (ConfigJSON extra=allow) -> post-save hook arms or
+    # disarms the loop without a redeploy.
+    config_mod.set_post_save_callback(
+        (lambda: _metering_poller.ensure_started()) if _metering_poller else None)
 
     # Register routers
     app.include_router(nodes_router)
