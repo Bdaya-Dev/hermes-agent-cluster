@@ -12,6 +12,9 @@ provides_tools:
   - kanban_cluster_complete
   - kanban_cluster_status
   - kanban_cluster_config
+  # #894: decision-ballot relay (lane escalates / owner answers)
+  - kanban_cluster_block
+  - kanban_cluster_answer
 provides_hooks:
   - on_session_start
   - on_session_end

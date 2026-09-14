@@ -371,6 +371,30 @@ class ClusterState:
                 return True
             return False
 
+    def set_task_ballot(self, task_id: str, ballot: Optional[dict]) -> bool:
+        """Record a decision ballot on the task (#894). None clears it."""
+        with self._tasks_lock:
+            task = self._tasks.get(task_id)
+            if task is None:
+                return False
+            task.ballot = ballot
+            task.updated_at = datetime.utcnow()
+            task.version += 1
+            return True
+
+    def unblock_to_ready(self, task_id: str) -> bool:
+        """/answer path (#894): a blocked task with an ANSWERED ballot returns
+        to ``ready`` (not ``pending`` like legacy unblock) so its lane-affinity
+        re-dispatches to the SAME worker holding the lane session."""
+        with self._tasks_lock:
+            task = self._tasks.get(task_id)
+            if task is None or task.status != TaskStatus.blocked:
+                return False
+            task.status = TaskStatus.ready
+            task.updated_at = datetime.utcnow()
+            task.version += 1
+            return True
+
     def requeue_task(self, task_id: str, reason: str = "") -> bool:
         """#870: a delivery whose result body was not a deliverable — the
         task returns to ``ready`` for another attempt instead of being

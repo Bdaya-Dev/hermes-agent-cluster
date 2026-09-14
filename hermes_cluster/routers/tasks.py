@@ -14,11 +14,19 @@ from ..models import (
     CompleteTaskRequest,
     FailTaskRequest,
     CancelTaskRequest,
+    BlockTaskRequest,
+    AnswerTaskRequest,
     SetDependenciesRequest,
     ClaimTaskRequest,
     ReleaseTaskRequest,
     Task,
     TaskStatus,
+)
+from ..core.ballot import (
+    BallotError,
+    build_ballot,
+    record_answer,
+    validate_answer,
 )
 from ..state import ClusterState
 
@@ -206,6 +214,45 @@ async def get_task(task_id: str):
     if not task:
         raise HTTPException(status_code=404, detail="task not found")
     return task
+
+
+# ---------------------------------------------------------------------------
+# #894 — pending-ballots read for the gateway relay. Lives under its own
+# /api/v1/ballots prefix (NOT public — the peer-HMAC middleware covers it
+# exactly like the task reads the gateway already performs).
+# ---------------------------------------------------------------------------
+
+ballots_router = APIRouter(prefix="/api/v1/ballots", tags=["ballots"])
+
+
+@ballots_router.get("/pending")
+async def pending_ballots():
+    """Every blocked task whose ballot the owner has NOT answered yet.
+
+    This is the notifier's poll surface: the gateway plugin reads it on a
+    tick, renders each ballot exactly once (dedup key: task_id + asked_at),
+    and posts the tap back to /tasks/{id}/answer. Only the fields a phone
+    render needs travel; the full task stays behind /tasks/{id}.
+    """
+    out = []
+    for t in _state.get_all_tasks():
+        if t.status != TaskStatus.blocked or not t.ballot:
+            continue
+        b = t.ballot
+        if b.get("answer") not in (None, ""):
+            continue
+        out.append({
+            "task_id": t.id,
+            "title": (t.title or "")[:120],
+            "lane_key": t.lane_key or "",
+            "node": t.assigned_to or "",
+            "question": b.get("question", ""),
+            "options": b.get("options", []),
+            "class": b.get("class", "technical"),
+            "asked_at": b.get("asked_at", ""),
+        })
+    out.sort(key=lambda x: x.get("asked_at") or "")
+    return {"ballots": out}
 
 
 @router.post("/{task_id}/complete")
@@ -399,6 +446,113 @@ async def unblock_task(task_id: str):
     if not _state.unblock_task(task_id):
         raise HTTPException(status_code=400, detail="task not in blocked state")
     return {"status": "unblocked"}
+
+
+# ---------------------------------------------------------------------------
+# #894 — decision ballots: a headless lane escalates here, the owner answers
+# from their phone. Both endpoints sit BEHIND the peer-HMAC middleware (they
+# are not in auth_middleware.PUBLIC_PATHS), i.e. exactly the same trust domain
+# as submit/cancel — shared/claude-plugins#894: "the answer endpoint rides the
+# same 3-leg action gate + peer HMAC as submit/cancel".
+# ---------------------------------------------------------------------------
+
+
+@router.post("/{task_id}/block")
+async def block_task(task_id: str, req: BlockTaskRequest):
+    """Record a decision ballot and park the task as `blocked` (#894).
+
+    Posted by a WORKER (the executor's escalation flip, or a lane directly via
+    the plugin's kanban_cluster_block) when the run hits a decision it cannot
+    make headless. The escalating worker's lease is released — the delivery is
+    over; the ANSWER re-dispatches the lane on its own session.
+
+    Guards mirror the cancel protocol: 404 unknown, 409 terminal, 409 when a
+    ballot is already outstanding (one question, one record — a double flip
+    must not reset the owner's clock or bury the first ask).
+    """
+    task = _state.get_task(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="task not found")
+    if task.status in (
+        TaskStatus.completed,
+        TaskStatus.failed,
+        TaskStatus.cancelled,
+        TaskStatus.cancel_requested,
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail=f"task is terminal (status={task.status.value}); a ballot cannot be filed",
+        )
+    if task.status == TaskStatus.blocked:
+        raise HTTPException(
+            status_code=409,
+            detail="task is already blocked — one outstanding ballot per task",
+        )
+    try:
+        ballot = build_ballot(req.question, req.options, cls=req.cls,
+                              lane_key=req.lane_key or task.lane_key)
+    except BallotError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+
+    # Release the escalating worker's claim (same lease branch shape as cancel)
+    # so the blocked task holds no node hostage while waiting on the phone.
+    if _lease_manager:
+        lease = _lease_manager.get_by_task(task_id)
+        if lease:
+            _lease_manager.revoke(lease.id)
+
+    # Ballot BEFORE the status flip: a reader that sees `blocked` must never
+    # see it without the question attached (the #874 completion-ordering rule
+    # inverted — the question IS the payload of this state).
+    _state.set_task_ballot(task_id, ballot)
+    ok = _state.set_task_status(task_id, TaskStatus.blocked,
+                                fail_reason="awaiting owner decision (ballot)")
+    if not ok:
+        # Lost a race to a terminal transition — undo the ballot record.
+        _state.set_task_ballot(task_id, None)
+        raise HTTPException(status_code=409, detail="task transitioned concurrently; not blocked")
+    logger.info("task %s blocked on owner ballot (class=%s): %s",
+                task_id, ballot["class"], ballot["question"][:80])
+    return {"status": "blocked", "ballot": ballot}
+
+
+@router.post("/{task_id}/answer")
+async def answer_task(task_id: str, req: AnswerTaskRequest):
+    """Store the owner's answer and unblock the task (#894).
+
+    The task goes to READY (not pending): lane affinity then re-dispatches it
+    to the SAME worker, whose executor resumes the lane's live hermes session
+    with the answer rendered as the next message (see agent_executor
+    _write_brief ballot path).
+    """
+    task = _state.get_task(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="task not found")
+    if task.status != TaskStatus.blocked or not task.ballot:
+        raise HTTPException(
+            status_code=409,
+            detail=("no outstanding ballot (status=%s, ballot=%s)"
+                    % (task.status.value, bool(task.ballot))),
+        )
+    answer = validate_answer(req.answer)
+    if answer is None:
+        raise HTTPException(status_code=422,
+                            detail="answer must be a non-empty string")
+    try:
+        ballot = record_answer(dict(task.ballot), answer, req.answered_by)
+    except BallotError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+
+    _state.set_task_ballot(task_id, ballot)
+    if not _state.unblock_to_ready(task_id):
+        # Lost a race (e.g. cancel between the read and the flip). Keep the
+        # recorded answer — it is the owner's decision and the audit trail
+        # wins — but tell the caller the task did not return to ready.
+        return {"status": "answered_but_not_resumed",
+                "reason": f"task status is {task.status.value}; answer recorded"}
+    logger.info("task %s answered by %s: %s", task_id,
+                ballot.get("answered_by") or "?", answer[:80])
+    return {"status": "answered", "task_status": "ready", "ballot": ballot}
 
 
 @router.post("/{task_id}/advance")

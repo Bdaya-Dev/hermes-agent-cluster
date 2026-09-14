@@ -96,6 +96,7 @@ from ..core.scheduler import (
     FairScheduler,
     lane_blocked_ready_ids,
 )
+from ..core.ballot import parse_ballot_column
 from ..core.lane_affinity import AffinityScheduler
 
 logger = logging.getLogger(__name__)
@@ -140,7 +141,10 @@ CREATE TABLE IF NOT EXISTS tasks (
     result TEXT,
     -- #762 grouped intake: bundle brief + restart-safe membership.
     description TEXT DEFAULT '',
-    issues TEXT DEFAULT '[]'
+    issues TEXT DEFAULT '[]',
+    -- #894: the lane's decision ballot (JSON TEXT): question/options/class/
+    -- asked_at/answer/answered_at/answered_by. See hermes_cluster.core.ballot.
+    ballot TEXT
 );
 
 -- Stateful lanes: one row per lane_key, keyed to the hermes session it owns.
@@ -368,6 +372,10 @@ class PostgresClusterStore:
                 "ALTER TABLE tasks ADD COLUMN IF NOT EXISTS description TEXT DEFAULT ''")
             await conn.execute(
                 "ALTER TABLE tasks ADD COLUMN IF NOT EXISTS issues TEXT DEFAULT '[]'")
+            # #894: the lane's decision ballot (JSON TEXT) — idempotent for
+            # hosted DBs created before this column existed.
+            await conn.execute(
+                "ALTER TABLE tasks ADD COLUMN IF NOT EXISTS ballot TEXT")
         logger.info("PostgresClusterStore: connected, schema ensured")
         return self
 
@@ -776,6 +784,28 @@ class PostgresClusterStore:
         )
         return n > 0
 
+    async def set_task_ballot(self, task_id: str, ballot: Optional[dict]) -> bool:
+        """Record a decision ballot on the task (#894). None clears it."""
+        import json as _json
+        payload = None if ballot is None else _json.dumps(ballot, default=str)
+        n = await self._exec_status_rowcount(
+            """UPDATE tasks SET ballot = $1, updated_at = $2, version = version + 1
+               WHERE id = $3""",
+            payload, _utcnow(), task_id,
+        )
+        return n > 0
+
+    async def unblock_to_ready(self, task_id: str) -> bool:
+        """#894: /answer path — blocked (with an answered ballot) goes back to
+        ``ready`` so lane affinity re-dispatches it to the SAME worker.
+        Guarded single statement mirrors unblock_task."""
+        n = await self._exec_status_rowcount(
+            """UPDATE tasks SET status = $1, updated_at = $2, version = version + 1
+               WHERE id = $3 AND status = $4""",
+            TaskStatus.ready.value, _utcnow(), task_id, TaskStatus.blocked.value,
+        )
+        return n > 0
+
     async def requeue_task(self, task_id: str, reason: str = "") -> bool:
         """#870: return a task to 'ready' for another delivery attempt after
         a worker reported a NON-DELIVERABLE result body. Mirrors the SQLite
@@ -901,6 +931,8 @@ class PostgresClusterStore:
             description=(row["description"] or "") if "description" in row.keys() else "",
             issues=(_json_loads(row["issues"])
                     if "issues" in row.keys() and row["issues"] else []),
+            ballot=(parse_ballot_column(row["ballot"])
+                    if "ballot" in row.keys() else None),
         )
 
     # -------------------------------------------------------------------

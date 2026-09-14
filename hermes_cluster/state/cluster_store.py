@@ -44,6 +44,7 @@ from ..core.scheduler import (
     FairScheduler,
     lane_blocked_ready_ids,
 )
+from ..core.ballot import parse_ballot_column
 from ..core.lane_affinity import AffinityScheduler
 
 logger = logging.getLogger(__name__)
@@ -125,7 +126,11 @@ CREATE TABLE IF NOT EXISTS tasks (
     result TEXT,
     -- #762 grouped intake: bundle brief + restart-safe membership.
     description TEXT DEFAULT '',
-    issues TEXT DEFAULT '[]'
+    issues TEXT DEFAULT '[]',
+    -- #894: the lane's decision ballot (JSON: question/options/class/
+    -- asked_at/answer/answered_at/answered_by). Set on escalation, read by
+    -- the gateway relay, filled by POST /tasks/{id}/answer.
+    ballot TEXT
 );
 
 -- Stateful lanes: one row per lane_key, keyed to the hermes session it owns.
@@ -337,6 +342,8 @@ class ClusterStore:
             # #762 grouped intake: bundle brief + membership columns.
             ("tasks", "description", "ALTER TABLE tasks ADD COLUMN description TEXT DEFAULT ''"),
             ("tasks", "issues", "ALTER TABLE tasks ADD COLUMN issues TEXT DEFAULT '[]'"),
+            # #894: the lane's decision ballot (JSON TEXT) on old DBs.
+            ("tasks", "ballot", "ALTER TABLE tasks ADD COLUMN ballot TEXT"),
         ):
             try:
                 cols = [r[1] for r in self._conn.execute(f"PRAGMA table_info({table})")]
@@ -734,6 +741,32 @@ class ClusterStore:
             )
             return result.rowcount > 0
 
+    def set_task_ballot(self, task_id: str, ballot: Optional[dict]) -> bool:
+        """Record a decision ballot on the task (#894). None clears it."""
+        import json as _json
+        now = datetime.utcnow()
+        payload = None if ballot is None else _json.dumps(ballot, default=str)
+        with self._tx() as conn:
+            result = conn.execute(
+                "UPDATE tasks SET ballot = ?, updated_at = ?, version = version + 1 WHERE id = ?",
+                (payload, _dt_to_str(now), task_id),
+            )
+            return result.rowcount > 0
+
+    def unblock_to_ready(self, task_id: str) -> bool:
+        """#894: /answer path — blocked (with an answered ballot) goes back to
+        ``ready``, not ``pending``: lane affinity then re-dispatches it to the
+        SAME worker holding the lane session. Guarded single statement like
+        unblock_task."""
+        now = datetime.utcnow()
+        with self._tx() as conn:
+            result = conn.execute(
+                """UPDATE tasks SET status = ?, updated_at = ?, version = version + 1
+                   WHERE id = ? AND status = ?""",
+                (TaskStatus.ready.value, _dt_to_str(now), task_id, TaskStatus.blocked.value),
+            )
+            return result.rowcount > 0
+
     def requeue_task(self, task_id: str, reason: str = "") -> bool:
         """#870: return a task to 'ready' for another delivery attempt after
         a worker reported a NON-DELIVERABLE result body. Atomic guarded
@@ -880,6 +913,8 @@ class ClusterStore:
             description=(row["description"] or "") if "description" in keys else "",
             issues=(_json_loads(row["issues"])
                     if "issues" in keys and row["issues"] else []),
+            ballot=(parse_ballot_column(row["ballot"])
+                    if "ballot" in keys else None),
         )
 
     # -------------------------------------------------------------------
