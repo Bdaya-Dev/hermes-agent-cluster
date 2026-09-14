@@ -754,6 +754,13 @@ class SubmitTaskRequest(BaseModel):
     priority: Optional[int] = Field(default=None, ge=0, le=5)
     lane_key: str = ""  # stateful lane identity (e.g. "shared/claude-plugins#feat/x")
     role: str = "author"  # "author" | "reviewer"
+    # #898 item 0: the task id the submitting SESSION was spawned to run.
+    # The cluster plugin stamps it from HERMES_CLUSTER_TASK_ID (the executor
+    # sets it at spawn). If that task is no longer active on main — it was
+    # cancelled/failed while the lane's process tree survived (#898 note
+    # 138234: a killed-pending zombie kept submitting reviewers) — the submit
+    # is refused. Absent/empty = manual or lead submit: unchanged behaviour.
+    source_task_id: str = ""
 
 
 class CompleteTaskRequest(BaseModel):

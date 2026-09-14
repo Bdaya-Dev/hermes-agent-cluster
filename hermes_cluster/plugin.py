@@ -26,7 +26,7 @@ import time
 from pathlib import Path
 from typing import Any, Dict, Optional
 from urllib.request import Request, urlopen
-from urllib.error import URLError
+from urllib.error import URLError, HTTPError
 
 logger = logging.getLogger(__name__)
 
@@ -320,6 +320,17 @@ def _api_call(method: str, path: str, data: dict = None) -> dict:
     try:
         with urlopen(req, timeout=10) as resp:
             return json.loads(resp.read().decode())
+    except HTTPError as e:
+        # #898: a refused submit (409 zombie gate, 422 brief guard) carries
+        # the reason in the response BODY; str(e) alone gives the lane
+        # "HTTP Error 409: Conflict" and no idea why. Surface the detail.
+        try:
+            body = json.loads(e.read().decode())
+        except Exception:
+            body = {"error": str(e)}
+        if isinstance(body, dict) and "error" not in body:
+            body = {"error": body.get("detail") or str(e), **body}
+        return body
     except URLError as e:
         return {"error": str(e)}
     except Exception as e:
@@ -383,7 +394,25 @@ def handle_cluster_submit(args: dict, **kwargs) -> str:
     for opt in ("role", "lane_key"):
         if args.get(opt):
             payload[opt] = args[opt]
+    # #898 zombie-session gate: inside a cluster spawn the executor stamps
+    # HERMES_CLUSTER_TASK_ID into the lane's env; declaring it lets main
+    # REFUSE this submit if our own task was cancelled — a session that
+    # outlived its cancel must not mint tasks. Absent (manual/lead use)
+    # sends nothing: unchanged behaviour.
+    source = os.environ.get("HERMES_CLUSTER_TASK_ID", "").strip()
+    if source:
+        payload["source_task_id"] = source
     result = _api_call("POST", "/api/v1/tasks", payload)
+    if isinstance(result, dict) and result.get("deduped"):
+        # #898: the lane_key already has an OPEN task — this is NOT a new
+        # submission, it is the same one. Say so in the tool result so the
+        # lane cannot mistake a dedup for a fresh submit and start the
+        # measured submit/cancel/resubmit loop (that loop held FOUR open
+        # reviewer tasks on one lane_key while the PR sat Draft).
+        result["note"] = (
+            "DEDUPED: your lane_key already has an open task (id above). "
+            "Do NOT cancel or resubmit it — wait is over; the reviewer runs "
+            "when the scheduler frees the lane. FINISH this lane now.")
     if isinstance(result, dict) and not result.get("error"):
         trigger = _api_call("POST", "/api/v1/schedule/trigger", {})
         if isinstance(trigger, dict) and trigger.get("error"):

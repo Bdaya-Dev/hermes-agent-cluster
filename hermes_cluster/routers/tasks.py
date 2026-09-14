@@ -128,8 +128,79 @@ def _action_ref_mismatches(brief: str, target: str) -> list:
     return [n for n in _brief_action_numbers(brief) if not _brief_names_target(n, target)]
 
 
+# Statuses that still OCCUPY a lane: the task is created but has not run to a
+# terminal outcome. `pending`/`blocked` count — a dep-held bundle still owns
+# the lane and would release into it later (the same rule intake's
+# #762 cardinality guard applies via _ISSUE_HOLDING_STATUSES).
+# `cancel_requested` counts too: the worker still holds the lane session
+# until it acks, and it converges to `cancelled` shortly (measured #898 —
+# the loop was author submits -> cancels -> resubmits WHILE queued).
+_OPEN_LANE_STATUSES = frozenset({
+    TaskStatus.pending, TaskStatus.ready, TaskStatus.assigned,
+    TaskStatus.running, TaskStatus.blocked, TaskStatus.cancel_requested,
+})
+
+
+def _find_open_lane_task(lane_key: str):
+    """The single OPEN task on lane_key, or None. Empty lane_key (legacy
+    per-task sessions) never matches — there is nothing to key on."""
+    if not lane_key:
+        return None
+    for t in _state.get_all_tasks():
+        if getattr(t, "lane_key", "") == lane_key and t.status in _OPEN_LANE_STATUSES:
+            return t
+    return None
+
+
 @router.post("")
 async def submit_task(req: SubmitTaskRequest):
+    # #898 single-open-task-per-lane_key: a lane_key that already has an OPEN
+    # task answers with THAT task (HTTP 200, `deduped: true`) instead of
+    # creating a second one. Measured 2026-09-14: lane `metering-poller`
+    # submitted its reviewer 4x and cancelled 3 while reviewers sat queued —
+    # four OPEN tasks on one lane_key, PR stayed Draft, lead cancelled the
+    # lane. The scheduler already serializes a lane at ASSIGN time (LFP-1);
+    # this closes the CREATE side of the same invariant. Replacing an open
+    # task stays possible through exactly one door: the explicit cancel
+    # endpoint, then resubmit. The dedup answer is returned BEFORE the
+    # #872 brief guards because a deduped submit creates nothing — there is
+    # no new lane to hand a mismatched brief.
+    # NOTE (harmless race): check-then-create is not one transaction; two
+    # concurrent submits for a free lane can both create. The #898 loop was
+    # one lane resubmitting seconds apart, which this catches; a true
+    # race would need a store UNIQUE partial index and is a separate change.
+    #
+    # #898 item 0 (zombie gate): a submit that declares its spawning task
+    # (source_task_id — the plugin stamps it from HERMES_CLUSTER_TASK_ID)
+    # is REFUSED when that task is no longer active. The executor's tree
+    # kill is the primary defense; this is the backstop for a session that
+    # escaped it (measured: pid 64584 + children survived a cancel and kept
+    # submitting). Unknown id -> refuse too: a stale env from a recycled
+    # container must not authorize anything.
+    if req.source_task_id:
+        src = _state.get_task(req.source_task_id)
+        if src is None:
+            raise HTTPException(
+                status_code=409,
+                detail=(f"source_task_id {req.source_task_id!r} names no task: "
+                        "the submitting session cannot be verified as active "
+                        "(#898 zombie-session gate)"),
+            )
+        if src.status not in (TaskStatus.ready, TaskStatus.assigned,
+                              TaskStatus.running, TaskStatus.pending):
+            raise HTTPException(
+                status_code=409,
+                detail=(f"submitting session's task {req.source_task_id} is not "
+                        f"active (status={src.status.value}) — a cancelled or "
+                        "terminal session may not create tasks (#898)"),
+            )
+
+    open_task = _find_open_lane_task(req.lane_key)
+    if open_task is not None:
+        payload = open_task.model_dump(mode="json")
+        payload["deduped"] = True
+        return payload
+
     # #872: a task's `title` IS its brief -- the schema has no description
     # column. On 2026-09-12 the authoring path wrote one task's brief verbatim
     # into another task's title: the reviewer lane for PR#274 received an

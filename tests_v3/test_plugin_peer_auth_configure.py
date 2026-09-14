@@ -1,7 +1,36 @@
 """plugin-only mode must configure peer-auth signing from env (else _api_call is unsigned → 401)."""
 import os
+from pathlib import Path
+
+import pytest
+
 from hermes_cluster import plugin
 from hermes_cluster.core import peer_auth
+
+
+@pytest.fixture(autouse=True)
+def _isolate_fleet_ambient_state(tmp_path, monkeypatch):
+    """Keep the REAL fleet config out of every test in this file (#872
+    ambient-state class — same reasoning as the conftest PEER_TOKEN scrub).
+
+    On a fleet member (this node among them) two ambient files win the
+    resolution order over anything a test sets via env/monkeypatch:
+      * ~/.config/bdaya/hermes-cluster.yaml — names the hosted endpoint AND
+        this node's identity, so plugin.register's config override stamps
+        node_id=windows_desktop_worker and _base_url=https://... instead of
+        the loopback/default the assertions model;
+      * ~/.config/bdaya/hermes-peer-token — the signing fallback.
+    Point Path.home() at an empty dir for the resolver and the token-file
+    reader, and reset the plugin's process globals between tests.
+    """
+    from hermes_cluster.core import cluster_endpoint as ce
+    empty_home = tmp_path / "no-home"
+    empty_home.mkdir()
+    monkeypatch.setattr(ce.Path, "home", classmethod(lambda cls: empty_home))
+    monkeypatch.setattr(plugin, "_peer_token_from_file", lambda: "")
+    monkeypatch.setattr(plugin, "_base_url", "")
+    monkeypatch.setattr(plugin, "_endpoint_error", "")
+    yield
 
 
 def test_parse_peer_tokens_shape():

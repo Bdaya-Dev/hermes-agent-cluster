@@ -475,10 +475,165 @@ class AgentExecutor:
             self._stop_event.wait(timeout=self._config.poll_interval)
         logger.info("agent executor poll loop ended")
 
+    def _pid_alive(self, pid: int) -> bool:
+        """Signal-0 liveness probe (POSIX) / OpenProcess-style via tasklist
+        fallback kept simple: on Windows, os.kill(pid, 0) raises OSError for
+        dead pids (WinError 87) — same handling as _ResumedProcess.poll()."""
+        if not pid:
+            return False
+        try:
+            os.kill(pid, 0)
+            return True
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True  # exists, just not ours
+        except OSError as exc:
+            if os.name == "nt" and (
+                getattr(exc, "winerror", None) == 87
+                or exc.errno == errno.EINVAL
+            ):
+                return False
+            return True
+        except Exception:
+            return False
+
+    def _kill_process_tree(self, spawn: "ActiveSpawn") -> None:
+        """#898: terminate a spawn's WHOLE process tree, not just the direct
+        child. Measured (note 138234): a cancelled lane's pid 64584 + 2
+        children survived a plain kill and kept submitting reviewers.
+
+        Windows: taskkill /F /T /PID (the /T flag is the tree). POSIX: walk
+        the subtree with `pgrep -P` and kill bottom-up — the children were
+        NOT started in our process group (no setsid), so a group kill would
+        take the executor with it. Every step is best-effort: a process that
+        already exited is success, not failure.
+        """
+        proc = spawn.process
+        pid = getattr(proc, "pid", None)
+        if not pid:
+            return
+        if os.name == "nt":
+            try:
+                subprocess.run(
+                    ["taskkill", "/F", "/T", "/PID", str(pid)],
+                    capture_output=True, timeout=15,
+                )
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+            return
+        # POSIX: recursive children first (depth-limited), then the pid.
+        def _kill_children(target: int, depth: int) -> None:
+            if depth > 5:
+                return
+            try:
+                cp = subprocess.run(["pgrep", "-P", str(target)],
+                                    capture_output=True, text=True, timeout=5)
+                kids = (getattr(cp, "stdout", "") or "").split()
+            except Exception:
+                kids = []
+            for kid in kids:
+                try:
+                    _kill_children(int(kid), depth + 1)
+                    os.kill(int(kid), 9)
+                except Exception:
+                    pass
+        try:
+            _kill_children(int(pid), 0)
+        except Exception:
+            pass
+        try:
+            os.kill(int(pid), 9)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+
+    def _close_spawn_handles(self, spawn: "ActiveSpawn") -> None:
+        """Release the parent's transcript file handles (child already dead
+        or about to be — copies only, #868: the deliverable is never held)."""
+        for attr in ("stdout_file", "stderr_file", "result_file"):
+            fh = getattr(spawn, attr, None)
+            if fh is not None:
+                try:
+                    fh.flush()
+                    fh.close()
+                except Exception:
+                    pass
+                finally:
+                    setattr(spawn, attr, None)
+
+    def _handle_cancellations(self) -> None:
+        """#898 item 0: a spawn whose task is no longer live on main must
+        die — process tree included — on THIS poll cycle, not at the outer
+        spawn_timeout.
+
+        Two-phase cancel protocol (tasks.py): cancel of a leased task →
+        `cancel_requested` (lease revoked); the worker's /complete or /fail
+        closes it to `cancelled`. The killed child cannot ack, so the
+        executor acks with a /fail carrying the cancel reason. `cancelled`/
+        `failed` with a still-live local spawn (e.g. lease expiry raced) are
+        terminal for the lane too: kill and drop the record silently.
+
+        This runs BEFORE the reap so a killed spawn is gone before the
+        reap judges its exit code (a SIGKILL exit is not a lane failure —
+        the task is already cancelled on main).
+        """
+        with self._lock:
+            tracked = {tid: s for tid, s in self._active_spawns.items()}
+        if not tracked:
+            return
+        tasks = _signed_request(
+            self._cluster_endpoint, "GET", "/api/v1/tasks", None,
+            self._token, self._node_id,
+        )
+        if not tasks:
+            return  # query failure: keep waiting (reap/timeout bound it)
+        statuses = {
+            t.get("id", ""): t.get("status", "") for t in tasks
+        }
+        for task_id, spawn in tracked.items():
+            status = statuses.get(task_id)
+            if status is None:
+                # Task vanished from main entirely (state pruned / synced
+                # away) — nothing to deliver it to; treat as cancelled.
+                status = "cancelled"
+            if status not in ("cancel_requested", "cancelled", "failed"):
+                continue
+            logger.warning(
+                "task %s is %s on main — terminating lane process tree "
+                "(pid %s) (#898)", task_id, status,
+                getattr(spawn.process, "pid", "?"),
+            )
+            self._kill_process_tree(spawn)
+            self._close_spawn_handles(spawn)
+            with self._lock:
+                self._active_spawns.pop(task_id, None)
+            self._drop_persisted_spawn(task_id)
+            self._lane_queue_meta.pop(task_id, None)
+            if status == "cancel_requested":
+                # Worker-ack closes the two-phase cancel (main:
+                # cancel_requested -> cancelled on /fail). Reason is
+                # required and non-blank (#858).
+                self._report_failure(task_id,
+                                     "task cancelled by main: worker "
+                                     "acknowledged and terminated the lane")
+            # Lane session stays on disk (stateful lanes): the NEXT task on
+            # this lane_key resumes it; only this delivery is dead.
+
     def _poll_once(self) -> None:
         """Single poll cycle: check results, find new tasks, renew leases."""
         # 1. Check completed/failed spawns
         self._reap_finished_spawns()
+
+        # 1a. #898 item 0: main says this spawn's task is cancelled or
+        # terminal -> kill the whole process tree NOW (a zombie lane keeps
+        # submitting: measured 4 reviewer submits from a cancelled lane).
+        self._handle_cancellations()
 
         # 1b. Reap idle stateful lanes (lead requirement, #833 2026-09-10):
         # a lane idle past lane_idle_timeout has its lanes row cleared so the
@@ -824,6 +979,10 @@ class AgentExecutor:
             "CLAUDE_CONFIG_DIR",
             str(Path.home() / ".claude-profiles" / self._config.profile),
         )
+        # #898 zombie-session gate: the child's cluster plugin stamps every
+        # kanban_cluster_submit with this task id (source_task_id); main
+        # refuses submits whose source task is no longer active.
+        env["HERMES_CLUSTER_TASK_ID"] = task_id
 
         logger.info(
             "spawning worker for task %s: lane=%s goal=%s",
@@ -1230,12 +1389,18 @@ class AgentExecutor:
         # deliverables.
         stdout_file = None
         stderr_file = None
+        # #898 zombie-session gate: same stamp as the bdaya path — the lane's
+        # cluster plugin reads HERMES_CLUSTER_TASK_ID and declares it as
+        # source_task_id on every submit; main refuses it if the task died.
+        hermes_env = dict(os.environ)
+        hermes_env["HERMES_CLUSTER_TASK_ID"] = task_id
         try:
             stdout_file = self._open_stdout_log(stdout_path)
             stderr_file = open(stderr_path, "w", encoding="utf-8")
             proc = subprocess.Popen(
                 cmd,
                 cwd=self._config.working_dir,
+                env=hermes_env,
                 # Agent final response (stdout) lands in the transcript log;
                 # stderr (incl. the session_id line) goes to its own log file.
                 stdout=stdout_file,
@@ -2001,20 +2166,17 @@ class AgentExecutor:
             ))
 
     def _kill_spawn_process(self, spawn: ActiveSpawn) -> None:
-        """Best-effort terminate of a spawn's child process (tree on Windows)."""
+        """Best-effort terminate of a spawn's child process (TREE, #898).
+
+        A plain proc.kill() leaves grandchildren orphaned — measured on the
+        spawn-timeout and cancel paths both: the timed-out hermes CLI's tool
+        subprocesses survived and kept acting as the lane. Delegate to
+        _kill_process_tree (taskkill /F /T on Windows, recursive pgrep
+        bottom-up kill on POSIX)."""
         proc = spawn.process
         if proc is None or isinstance(proc, _ResumedProcess):
             return  # nothing to kill (reconciled record holds no live handle)
-        try:
-            if os.name == "nt":
-                proc.kill()
-            else:
-                proc.terminate()
-        except Exception:
-            try:
-                proc.kill()
-            except Exception:
-                pass
+        self._kill_process_tree(spawn)
 
     def _capture_spawn_exits(self) -> None:
         """Check if any spawn processes have exited and capture diagnostics."""
