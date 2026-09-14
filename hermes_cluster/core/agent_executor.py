@@ -382,6 +382,11 @@ class AgentExecutor:
         # maintained in-memory by _persist_spawn/_drop_persisted_spawn so the
         # poll loop never re-reads SQLite. Reseeded by reconcile on start.
         self._persisted_ids: set = set()
+        # #897: terminal reports (complete/fail) that could not be delivered
+        # because main was unreachable — retried every poll cycle with
+        # exponential backoff. Keyed by (verb, task_id); each value holds
+        # path/payload/attempts/next_at.
+        self._pending_reports: Dict[tuple, dict] = {}
         # Per-lane FIFO of task dicts waiting for the lane's in-flight
         # delivery to reap (#858 defect 1). Guarded by self._lock.
         self._lane_queue: Dict[str, List[dict]] = {}
@@ -493,6 +498,9 @@ class AgentExecutor:
         """Single poll cycle: check results, find new tasks, renew leases."""
         # 1. Check completed/failed spawns
         self._reap_finished_spawns()
+
+        # 1a. #897: retry terminal reports queued during a main outage.
+        self._drain_pending_reports()
 
         # 1b. Reap idle stateful lanes (lead requirement, #833 2026-09-10):
         # a lane idle past lane_idle_timeout has its lanes row cleared so the
@@ -2619,34 +2627,28 @@ class AgentExecutor:
         #874: this used to POST an empty {} and discard `detail`, so a result
         lived only on the local disk of whichever node ran the lane -- a verdict
         produced on one machine was unreadable from every other.
+
+        #897: if the POST fails (main unreachable — the multi-minute rollout
+        windows measured 2026-09-14), the report is QUEUED and retried with
+        exponential backoff instead of being dropped. A lost completion used to
+        leave the task `running` until lease expiry + recovery rescheduled it:
+        the lane's work was DONE but the factory paid for it twice.
         """
         payload = {"result": result} if result else {}
-        result_ok = _signed_request(
-            self._cluster_endpoint,
-            "POST",
-            f"/api/v1/tasks/{task_id}/complete",
-            payload,
-            self._token,
-            self._node_id,
-        )
-        if result_ok:
-            logger.info(
-                'task %s marked completed: %s (result: %s)',
-                task_id, detail or 'ok',
-                f'{len(result)} chars carried' if result else 'none',
-            )
-        else:
-            logger.error('failed to mark task %s completed', task_id)
+        self._queue_report("complete", task_id, payload,
+                           detail=f"completed: {detail or 'ok'}")
 
     def _report_failure(self, task_id: str, reason: str,
                         fallback: str = "") -> bool:
-        """Mark a task as failed on the main node.
+        """Mark a task as failed on the main node (queued + retried — #897).
 
         #858: a failure must carry a real reason — the busy-lane incident
         reached operators as `failed` with `error: None`. A blank reason is
         replaced by *fallback* when the caller has one, and the report is
         REFUSED (returns False, loudly logged) when neither exists: no
-        reasonless failure goes on the wire.
+        reasonless failure goes on the wire — not even into the #897 retry
+        queue. Once the reason is real, delivery follows the #897 path:
+        attempted now, queued with backoff if main is unreachable.
         """
         reason = (reason or "").strip() or (fallback or "").strip()
         if not reason:
@@ -2656,16 +2658,79 @@ class AgentExecutor:
                 "the caller is required; the task stays un-failed and "
                 "visible as stuck", task_id)
             return False
-        result = _signed_request(
-            self._cluster_endpoint,
-            "POST",
-            f"/api/v1/tasks/{task_id}/fail",
-            {"reason": reason},
-            self._token,
-            self._node_id,
+        self._queue_report("fail", task_id, {"reason": reason},
+                           detail=f"failed: {reason[:100]}")
+        return True
+
+    # ------------------------------------------------------------------ #
+    # #897 — pending terminal-report queue
+    # ------------------------------------------------------------------ #
+
+    _REPORT_BACKOFF_BASE = 0.5    # seconds; doubles per failed attempt
+    _REPORT_BACKOFF_CAP = 60.0    # never wider than the poll loop needs anyway
+    _REPORT_MAX_ATTEMPTS = 100    # ~1h+ of retries at the cap; then give up LOUD
+
+    def _queue_report(self, verb: str, task_id: str, payload: dict,
+                      detail: str = "") -> None:
+        """POST a terminal report now; on failure queue it for retry.
+
+        Keyed by (verb, task_id): a task can hold one pending complete AND one
+        pending fail (e.g. reap raced a manual fail); last write wins per verb.
+        """
+        path = f"/api/v1/tasks/{task_id}/{verb}"
+        ok = _signed_request(
+            self._cluster_endpoint, "POST", path, payload,
+            self._token, self._node_id,
         )
-        if result:
-            logger.info("task %s marked failed: %s", task_id, reason[:100])
-        else:
-            logger.error("failed to mark task %s failed", task_id)
-        return bool(result)
+        if ok:
+            logger.info("task %s %s", task_id, detail or verb)
+            return
+        with self._lock:
+            self._pending_reports[(verb, task_id)] = {
+                "path": path,
+                "payload": payload,
+                "detail": detail,
+                "attempts": 1,
+                "next_at": time.monotonic() + self._REPORT_BACKOFF_BASE,
+            }
+        logger.warning(
+            "main unreachable — queued %s report for task %s (#897 retry)",
+            verb, task_id)
+
+    def _drain_pending_reports(self, now: Optional[float] = None) -> None:
+        """Retry queued terminal reports whose backoff has elapsed.
+
+        Called from _poll_once every cycle; `now` is injectable for tests.
+        Never marks anything failed because main could not be reached — the
+        whole point (#897 direction 3) is that an outage must not cost a task.
+        """
+        if now is None:
+            now = time.monotonic()
+        with self._lock:
+            due = [(k, v) for k, v in self._pending_reports.items()
+                   if v["next_at"] <= now]
+        for key, entry in due:
+            ok = _signed_request(
+                self._cluster_endpoint, "POST", entry["path"], entry["payload"],
+                self._token, self._node_id,
+            )
+            with self._lock:
+                current = self._pending_reports.get(key)
+                if current is None:
+                    continue                      # superseded while we posted
+                if ok:
+                    del self._pending_reports[key]
+                    logger.info("task %s %s (after %d queued attempt(s))",
+                                key[1], entry["detail"] or key[0], entry["attempts"])
+                    continue
+                current["attempts"] += 1
+                if current["attempts"] >= self._REPORT_MAX_ATTEMPTS:
+                    del self._pending_reports[key]
+                    logger.error(
+                        "report %s for task %s abandoned after %d attempts — "
+                        "main unreachable too long (#897)",
+                        key[0], key[1], current["attempts"])
+                    continue
+                current["next_at"] = now + min(
+                    self._REPORT_BACKOFF_BASE * (2 ** (current["attempts"] - 1)),
+                    self._REPORT_BACKOFF_CAP)

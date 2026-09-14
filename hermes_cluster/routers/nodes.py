@@ -66,22 +66,36 @@ async def join(req: JoinRequest):
 
 @router.post("/heartbeat")
 async def heartbeat(req: HeartbeatRequest):
+    # #897: DISTINGUISH unknown-node beats. After any main restart the store
+    # can lose (or not yet have) a worker's node row; NodeManager and every
+    # store silently drop the beat while this endpoint answered
+    # {"status":"ok"}, so the worker connector stayed orphaned until the
+    # WORKER restarted (its own module NOTE documented this). 200 is kept —
+    # a 4xx would make old connectors log an auth failure instead.
+    # #899: a beat whose instance token disagrees with the node's current
+    # owner is refused as "replaced" (checked FIRST — a replaced twin's beat
+    # must not even reach the clock refresh; unknown_node outranking it
+    # would send the zombie into the #897 re-join loop, which is the
+    # join-storm shape #899 forbids).
     if _node_manager:
         accepted = _node_manager.send_heartbeat(
             req.node_id, disk_free_gb=req.disk_free_gb,
             instance_id=req.instance_id or None,
         )
-        # #899: answer "replaced" (still 200 — the answer is in the status
-        # field, matching the older-worker contract that only reads .status)
-        # so the stale twin's connector can stop itself.
-        return {"status": "ok" if accepted else "replaced"}
-    node = _state.get_node(req.node_id)
-    stored = getattr(node, "instance_id", "") if node else ""
-    if stored and req.instance_id and req.instance_id != stored:
-        return {"status": "replaced"}
-    reason = disk_reason(req.disk_free_gb, _min_free_disk_gb())
-    _state.update_heartbeat(req.node_id, disk_free_gb=req.disk_free_gb,
-                            status_reason=reason)
+        if not accepted:
+            return {"status": "replaced", "node_id": req.node_id}
+        node_exists = _node_manager.get_node(req.node_id) is not None
+    else:
+        node = _state.get_node(req.node_id)
+        stored = getattr(node, "instance_id", "") if node else ""
+        if stored and req.instance_id and req.instance_id != stored:
+            return {"status": "replaced", "node_id": req.node_id}
+        reason = disk_reason(req.disk_free_gb, _min_free_disk_gb())
+        node_exists = node is not None
+        _state.update_heartbeat(req.node_id, disk_free_gb=req.disk_free_gb,
+                                status_reason=reason)
+    if not node_exists:
+        return {"status": "unknown_node", "node_id": req.node_id}
     return {"status": "ok"}
 
 

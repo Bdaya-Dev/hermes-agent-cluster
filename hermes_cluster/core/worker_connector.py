@@ -244,13 +244,13 @@ def start_worker_connector(
         last_probe_at = time.time()
         probe_interval = min([int(s.get("interval_s", 300)) for s in probes.values()] or [300])
         #
-        # NOTE: Post-registration main restarts are NOT handled. The main's
-        # ClusterState is in-memory; after a restart, the worker's heartbeat
-        # is rejected as "unknown node" but the response is {"status":"ok"}
-        # so the connector cannot detect it. The worker remains orphaned
-        # until its own process restarts. Fixing this requires the main to
-        # return a distinguishable response (e.g. 404 or {"status":"unknown_node"})
-        # for unknown-node heartbeats, which is a separate change.
+        # #897: post-registration main restarts ARE now handled. The main
+        # answers {"status":"unknown_node"} for a heartbeat whose node it does
+        # not know; the cycle below drops registered_id so the next iteration
+        # re-JOINs (main's join is idempotent — it re-registers and refreshes
+        # the heartbeat). A transport failure (None) deliberately does NOT
+        # touch registered_id: during a real #897 outage the worker keeps
+        # beating toward the endpoint instead of churning joins.
         registered_id = None
 
         while True:
@@ -332,7 +332,9 @@ def start_worker_connector(
                 # relaunches within 5 s, and the new instance's join re-
                 # confirms ownership; if the live owner is actually gone the
                 # lock's pid probe steals it (the crash path, test_lock_
-                # steals_a_stale_holder).
+                # steals_a_stale_holder). Checked BEFORE the unknown_node
+                # branch: a replaced instance must not "re-join storm" its
+                # way back over the live owner.
                 rc = _replaced_exit_code(hb)
                 if rc is not None:
                     logger.error(
@@ -341,6 +343,20 @@ def start_worker_connector(
                         INSTANCE_ID[:8], node_id,
                     )
                     os._exit(rc)
+                # #897: act on the beat's ANSWER. A restarted main whose store
+                # lost this node answers {"status":"unknown_node"}; dropping
+                # registered_id sends the loop through the (idempotent) join
+                # above on the NEXT cycle, so the worker self-heals instead of
+                # staying orphaned until its own process restarts — the exact
+                # failure this module's original NOTE documented as unhandled.
+                # A None result (transport failure — main simply unreachable
+                # for the #897 multi-minute windows) keeps registered_id: the
+                # beat is retried next cycle, and a join storm is impossible.
+                if isinstance(hb, dict) and hb.get("status") == "unknown_node":
+                    logger.warning(
+                        "worker connector: main does not know %s (post-restart?) "
+                        "— re-joining next cycle", registered_id)
+                    registered_id = None
 
             time.sleep(heartbeat_interval)
 
