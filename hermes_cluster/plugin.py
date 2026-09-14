@@ -317,11 +317,45 @@ def _api_call(method: str, path: str, data: dict = None) -> dict:
                 req.add_header(key, value)
     except Exception as e:
         logger.debug("Peer auth signing skipped: %s", e)
+    from urllib.error import HTTPError as _HTTPError
     try:
         with urlopen(req, timeout=10) as resp:
             return json.loads(resp.read().decode())
     except URLError as e:
-        return {"error": str(e)}
+        # #897 direction 3: a rollout takes the hosted main down for tens of
+        # seconds; a one-shot connection error used to surface as a tool
+        # failure and lanes papered over it with manual re-calls. Retry
+        # TRANSPORT failures only with bounded backoff: 3 attempts, 1s + 2s.
+        # Worst case adds ~3s to a genuinely-dead endpoint — still far under
+        # the executor's 10s HTTP budget expectations and never fails a TASK.
+        #
+        # Reviewer note (PR #50 review @ 6f57a2b): HTTPError subclasses
+        # URLError, so a bare `except URLError` ALSO retried real 4xx/5xx
+        # answers and discarded their bodies (str(HTTPError) is the reason
+        # phrase, not the JSON). A main that answers 404/409 IS reachable —
+        # decoding and returning its body keeps the error surface honest;
+        # only pure transport failures (connection refused/reset/DNS) retry.
+        if isinstance(e, _HTTPError):
+            try:
+                return json.loads(e.read().decode())
+            except Exception:
+                return {"error": str(e)}
+        last = e
+        for attempt, wait in enumerate((1.0, 2.0)):
+            time.sleep(wait)
+            try:
+                with urlopen(req, timeout=10) as resp:
+                    return json.loads(resp.read().decode())
+            except URLError as e2:
+                if isinstance(e2, _HTTPError):
+                    try:
+                        return json.loads(e2.read().decode())
+                    except Exception:
+                        return {"error": str(e2)}
+                last = e2
+            except Exception as e2:
+                return {"error": str(e2)}
+        return {"error": str(last)}
     except Exception as e:
         return {"error": str(e)}
 
