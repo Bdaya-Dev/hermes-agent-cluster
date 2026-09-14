@@ -12,7 +12,16 @@ Two spawn modes (config ``agent_executor.worker``; default ``bdaya-dispatch``):
     (``hermes -p <profile> chat --query-file <brief> -Q``) that runs the task
     to completion, writes a result file, and exits non-zero on failure; this
     mode tracks the process (pid + exit code + result file) instead of lane
-    status.
+    status. The child's inherited STDOUT goes to ``<task>.stdout.log`` (a
+    transcript) and ``<task>.result.md`` is left FREE for the lane to write
+    its deliverable into — the executor never opens it (shared/claude-plugins
+    #868: holding the deliverable path open made Windows refuse the lane's
+    tmp-then-rename write and silently stranded whole verdicts). Lanes,
+    however, deliver by PRINTING their final message; when one exits 0 with
+    no result.md and a non-empty transcript, the executor promotes the
+    transcript into result.md under a loud marker and reaps
+    ``transcript_promoted`` — completion without a verdict-grade ``done``
+    (shared/claude-plugins#871).
 
 Restart safety (#804 note 132791): the task→lane map is persisted in the
 ClusterStore SQLite (``task_spawns`` table) and reconciled on start — a lane
@@ -63,10 +72,14 @@ import subprocess
 import threading
 import time
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 from urllib.request import Request, urlopen
 from urllib.error import URLError
+
+from .deliverable_guard import classify_non_deliverable, has_no_turn_stderr
+from . import lane_cost as _lane_cost
 
 
 def _npx_bin() -> str:
@@ -77,6 +90,18 @@ def _npx_bin() -> str:
     Node is on PATH. shutil.which applies PATHEXT and returns the real file.
     """
     return shutil.which("npx") or "npx"
+
+
+def _record_attempt(record: dict) -> int:
+    """#870: the delivery count carried by a persisted spawn record.
+
+    Tolerates pre-#870 records (column absent/NULL) and non-integer junk —
+    a reconcile of an old record must not crash the executor start.
+    """
+    try:
+        return max(0, int(record.get("attempt") or 0))
+    except (TypeError, ValueError):
+        return 0
 
 logger = logging.getLogger(__name__)
 
@@ -108,6 +133,19 @@ class AgentExecutorConfig:
     # accepts their verdicts; author lanes use the profile default (no -m).
     hermes_reviewer_model: str = "qwen3.7-plus"
     bdaya_dispatch_package: str = "@shared/bdaya-dispatch@latest"
+    # #870: deliveries main may re-queue after the reap rejects a
+    # NON-DELIVERABLE result body (provider error / echoed brief) before the
+    # task is consumed as failed. 3 = two recovery chances after the first
+    # rejection: enough to clear a transient provider blip (the fleet hit
+    # two in one evening), small enough that a genuinely broken brief cannot
+    # burn a node's quota looping.
+    retry_limit: int = 3
+    # #892: the same floor the worker connector reports against — the executor
+    # REFUSES to claim any task while the volume holding working_dir (where
+    # hermes-briefs/hermes-results live, i.e. the lanes dir / HERMES_HOME volume)
+    # is below it. Sourced from cluster YAML node.min_free_disk_gb (owner
+    # ruling: never an env var). None -> default 5.0; 0 -> guard disabled.
+    min_free_disk_gb: Optional[float] = None
 
 
 # ---------------------------------------------------------------------------
@@ -124,8 +162,10 @@ class ActiveSpawn:
     started_at: float = 0.0
     lane_name: str = ""
     mode: str = "bdaya-dispatch"  # which worker mode spawned this (matches config.worker)
-    result_path: str = ""  # hermes mode: path of the result file the lane writes
-    result_file: Optional[object] = None  # open handle for the result file (hermes)
+    result_path: str = ""  # hermes mode: DELIVERABLE path the lane writes; the executor NEVER opens it (#868)
+    result_file: Optional[object] = None  # DEPRECATED (#868): old handle field, kept for reconciled records
+    stdout_path: str = ""  # hermes mode: path of the child's inherited stdout (transcript, #868)
+    stdout_file: Optional[object] = None  # open handle for the stdout log (hermes)
     stderr_path: str = ""  # hermes mode: path of the child's stderr log
     stderr_file: Optional[object] = None  # open handle for the stderr log (hermes)
     resumed: bool = False  # True when reconstructed from the persisted spawn map
@@ -141,6 +181,17 @@ class ActiveSpawn:
     # tracking, and a refused delivery never started).
     task_payload: Optional[dict] = None
     busy_attempts: int = 0  # refusal-retries already spent by the LANE on this task
+    # #870: count of PRIOR deliveries of this task observed at spawn time
+    # (from the persisted record; main's task.attempts is the authority).
+    # Rides through persistence so an executor restart cannot reset it.
+    attempt: int = 0
+    # #929: cumulative per-model token buckets for this lane's session read AT
+    # SPAWN. The reap-time footnote prices the delta (now - baseline), so a
+    # resumed long-lived lane's earlier tasks are not double-counted and this
+    # delivery's figure is exactly its own spend. Empty dict = no baseline
+    # (fresh session — everything it records belongs to this task — or the
+    # store was unreadable at spawn; the footnote discloses either case).
+    cost_baseline: Dict[str, Dict[str, int]] = field(default_factory=dict)
 
 
 class _ResumedProcess:
@@ -396,6 +447,7 @@ class AgentExecutor:
                     "pid": spawn.process.pid,
                     "poll_alive": spawn.process.poll() is None,
                     "result_path": spawn.result_path,
+                    "stdout_path": getattr(spawn, "stdout_path", ""),
                 })
             return {
                 "running": self._running,
@@ -464,6 +516,14 @@ class AgentExecutor:
 
     def _claim_and_spawn(self, max_spawns: int) -> None:
         """Poll main for assigned tasks and spawn workers for them."""
+        # #892 disk preflight: refuse the WHOLE cycle below the configured floor
+        # (a full disk killed every lane this node took on 2026-09-14 05:32Z —
+        # Errno 28 in concurrent_log_handler, then rc=120). One clear log line;
+        # tasks stay unclaimed on the main for re-dispatch to a healthy node.
+        from .disk_gate import disk_gate_blocks
+        if disk_gate_blocks(self._config.working_dir or "",
+                            getattr(self._config, "min_free_disk_gb", None)):
+            return
         # Drain lane FIFOs the reap just released: head-of-queue tasks for
         # now-idle lanes spawn first, in arrival order (FIFO), consuming the
         # cycle's spawn budget before any newly-claimed task does.
@@ -478,10 +538,13 @@ class AgentExecutor:
             budget -= 1
         if leftover:
             # Out of executor slots this cycle: put the heads back at the
-            # FRONT of their lane queues (FIFO preserved; the queued-id
-            # filter keeps the board from double-handling them).
+            # FRONT of their lane queues in arrival order (FIFO preserved;
+            # the queued-id filter keeps the board from double-handling
+            # them). Insert in REVERSE so each front-to-back pass lands the
+            # earlier task ahead of the later one — inserting forward at
+            # index 0 reversed each lane's order (#858 review, PR #23).
             with self._lock:
-                for task in leftover:
+                for task in reversed(leftover):
                     lane_key = task.get("lane_key", "") or ""
                     self._lane_queue.setdefault(lane_key, []).insert(0, task)
         if budget <= 0:
@@ -553,8 +616,19 @@ class AgentExecutor:
         description: str,
         lane_key: str = "",
         role: str = "author",
+        deliverable_path: str = "",
     ) -> Path:
-        """Write the per-task brief file the guarded worker lane reads."""
+        """Write the per-task brief file the guarded worker lane reads.
+
+        ``deliverable_path`` (hermes mode) makes the #868/#871 delivery
+        contract EXPLICIT at the one place every lane is guaranteed to read:
+        printing the final message is NOT delivery — the lane must WRITE this
+        exact file before exiting. (#871: lanes deliver by printing; two
+        diligent reviewer lanes in a row did exactly that and were recorded
+        FAILED. The executor's transcript fallback catches that now, but the
+        contract is stated here so a compliant lane reaps a plain 'done',
+        not a marker-stamped promotion a merge gate must refuse.)
+        """
         d = Path(self._config.working_dir or ".") / "hermes-briefs"
         d.mkdir(parents=True, exist_ok=True)
         path = d / f"{task_id}.md"
@@ -584,6 +658,56 @@ class AgentExecutor:
             "- When done, state exactly what you produced (files, MR links, proof) in your final message.",
             "",
         ]
+        if role == "author":
+            # #893: the author lane hands off to an INDEPENDENT reviewer
+            # itself — no lead session in the loop. Written into the SHARED
+            # template (the one place every lane reads), not copy-pasted per
+            # brief. RV-1: the reviewer runs in a fresh context on a
+            # different lane; the author lane MUST NOT approve or merge; a
+            # needs-human label stays a live hard gate.
+            lines += [
+                "### Author hand-off (shared/claude-plugins#893 — no lead in the loop)",
+                "- When your work is done and the Draft MR/PR is open, DO NOT stop and wait for a "
+                "lead to notice. Submit your own reviewer task with `kanban_cluster_submit`: "
+                "`role='reviewer'`, `requires=['review']`, `lane_key='<repo>!<mr_iid>'` (the reviewer "
+                "lane key), and a title that carries the MR/PR URL and the exact head sha.",
+                "- Exception: a LANDING task (its brief names an existing reviewer PASS at the "
+                "current head sha) merges — it does NOT dispatch another reviewer. A reviewer "
+                "task only ever comes from an author lane that produced the diff.",
+                "- You are the AUTHOR lane. You MUST NOT approve or merge your own MR — RV-1 is not "
+                "negotiable. On a reviewer PASS at head the merge is actuated by a dedicated "
+                "LANDING task: submit it with role='author' on a landing lane key "
+                "(e.g. '<repo>#land-<mr_iid>', never the authoring lane key) carrying the "
+                "MR URL, the head sha AND the reviewer's PASS verdict reference. Never by you, "
+                "and never by the reviewer lane itself (#882's read-only gate mechanically "
+                "denies a reviewer merge).",
+                "",
+            ]
+        if role == "reviewer":
+            # #893 close of the loop, same shared template (not per-brief).
+            lines += [
+                "### Reviewer landing hand-off (shared/claude-plugins#893)",
+                "- Post your sha-pinned verdict as an MR note first (the durable oracle).",
+                "- On PASS at head: you MUST NOT merge (#882 denies it). Submit the LANDING task "
+                "yourself with `kanban_cluster_submit`: `role='author'`, "
+                "`lane_key='<repo>#land-<mr_iid>'`, title naming the MR URL, the verified head "
+                "sha, and your PASS. On NEEDS-CHANGES: do not submit landing; the verdict note "
+                "is the hand-back.",
+                "",
+            ]
+        if deliverable_path:
+            lines += [
+                "### Delivery contract (cluster executor)",
+                f"- Your deliverable is the file `{deliverable_path}`. WRITE it "
+                "explicitly with write_file before you exit — your printed final "
+                "message is NOT auto-captured there (shared/claude-plugins#868).",
+                "- If you exit 0 without writing it, the executor promotes your "
+                "stdout transcript into that file under a visible marker and the "
+                "task completes as TRANSCRIPT-PROMOTED — never a plain done, and "
+                "a merge gate will refuse to treat it as a verdict "
+                "(shared/claude-plugins#871). Write the file; it is one call.",
+                "",
+            ]
         path.write_text(chr(10).join(lines), encoding="utf-8")
         return path
 
@@ -774,6 +898,201 @@ class AgentExecutor:
         d.mkdir(parents=True, exist_ok=True)
         return d / f"{task_id}.result.md"
 
+    def _hermes_stdout_path(self, task_id: str) -> Path:
+        """Transcript file for a native hermes lane's child STDOUT (#868).
+
+        This — NOT the result file — is the path the executor opens and keeps
+        for the child's lifetime so stdout inheritance works. Before #868 the
+        same handle served ``<task>.result.md``: on Windows the parent's open
+        handle made the lane's own tmp-then-rename write to that path fail
+        with a sharing violation, so whole deliverables (a NEEDS-CHANGES
+        verdict in the incident that prompted this) stranded as
+        ``.hermes-tmp.*`` while a truncated stdout copy read as a pass.
+        Transcript and deliverable are genuinely different things; each now
+        has its own path.
+        """
+        d = Path(self._config.working_dir or ".") / "hermes-results"
+        d.mkdir(parents=True, exist_ok=True)
+        return d / f"{task_id}.stdout.log"
+
+    @staticmethod
+    def _remove_quiet(path: Path) -> None:
+        """Delete a file if present; never raise. Used for spawn-time cleanup
+        of a previous delivery's files — a file another (live) process holds
+        open cannot be deleted on Windows and is left alone."""
+        try:
+            path.unlink()
+        except OSError:
+            pass
+
+    @staticmethod
+    def _open_stdout_log(path: Path):
+        """Open the child's inherited-stdout transcript log (#868).
+
+        Fresh spawn: truncate. A file that survives the spawn-time cleanup
+        below is held open by a still-live (crashed-child) writer, in which
+        case truncating would destroy its transcript and 'a' at least keeps
+        the delivery's own bytes appended instead of failing mid-spawn.
+        """
+        if path.exists():
+            return open(path, "a", encoding="utf-8")
+        return open(path, "w", encoding="utf-8")
+
+    @staticmethod
+    def _stranded_tmps(results_dir: Path, since: float) -> List[Path]:
+        """.hermes-tmp.* files in the results dir modified at/after ``since``.
+
+        A lane's deliverable write stages a ``.hermes-tmp.XXXXXX`` and renames
+        it over the target; on Windows the rename fails against an open file,
+        so the tmp is all that survives (shared/claude-plugins#868). Modified
+        within the window of the delivery that just finished — a stale temp
+        from a previous run is not evidence about THIS task, and the file is
+        surfaced (never deleted) either way.
+        """
+        out: List[Path] = []
+        try:
+            entries = list(results_dir.glob(".hermes-tmp.*"))
+        except OSError:
+            return out
+        for entry in entries:
+            try:
+                if entry.is_file() and entry.stat().st_mtime >= since:
+                    out.append(entry)
+            except OSError:
+                continue
+        return out
+
+    # -------------------------------------------------------------------
+    # First-line diagnostic (#892): the 2026-09-14 full-disk deaths left the
+    # LAST stderr line as fail_reason and nothing in the result file. The
+    # runner now writes a sentinel into the task's result file BEFORE starting
+    # hermes; a clean lane overwrites the path (write_file) or transcript
+    # promotion replaces it, a dead lane leaves the sentinel plus appended
+    # crash diagnostics. Machine-checkable first line, same contract as the
+    # #871 PROMOTION_MARKER below.
+    # -------------------------------------------------------------------
+
+    RESULT_SENTINEL = (
+        "<!-- LANE-STARTED: the executor wrote this before launching hermes; "
+        "the lane never delivered a result. Crash diagnostics follow (if any) "
+        "— NOT a verdict (shared/claude-plugins#892). -->"
+    )
+
+    def _write_result_sentinel(self, result_path: Path, task_id: str) -> bool:
+        """Best-effort sentinel write; False when even this fails (disk full!).
+        The spawn proceeds regardless — the sentinel is a diagnostic bonus,
+        never a precondition of running a lane."""
+        try:
+            result_path.parent.mkdir(parents=True, exist_ok=True)
+            result_path.write_text(
+                f"{self.RESULT_SENTINEL}\n<!-- task: {task_id} -->\n",
+                encoding="utf-8",
+            )
+            return True
+        except OSError as e:
+            logger.warning(
+                "could not write result sentinel for task %s at %s: %s",
+                task_id, result_path, e,
+            )
+            return False
+
+    @staticmethod
+    def _content_after_sentinel(contents: str) -> str:
+        """Strip our own executor-written lines so a sentinel-only file reads
+        as NO content. Without this, the #892 diagnostic would itself become a
+        false-completion body at the rc==0 content gate (the pre-#870 trap):
+        a file whose only lines are ours is not a lane deliverable."""
+        if not contents:
+            return contents
+        lines = contents.splitlines()
+        while lines and (
+            lines[0] == AgentExecutor.RESULT_SENTINEL
+            or lines[0].startswith("<!-- task:")
+        ):
+            lines.pop(0)
+        return "\n".join(lines).strip()
+
+
+    def _append_crash_diagnostics(self, spawn: "ActiveSpawn", text: str) -> None:
+        """Guarantee the sentinel + crash block in the lane's result file (rc!=0
+        / timeout reap) — the #892 first-line diagnostic.
+
+        Three cases: (a) file absent (sentinel write itself failed on the full
+        disk, or the lane deleted it) → write sentinel + diagnostics fresh, the
+        whole point being a dead lane leaves SOMETHING; (b) first line is our
+        sentinel → append the crash block; (c) any other content (the lane
+        delivered) → never rewritten. Silent on any OSError: fail_reason
+        carries the same detail regardless, so this write must not break the
+        reap itself.
+        """
+        path = getattr(spawn, "result_path", "") or ""
+        if not path:
+            return
+        try:
+            p = Path(path)
+            if not p.is_file():
+                self._write_result_sentinel(p, getattr(spawn, "task_id", "?"))
+                # fall through and append even if the sentinel write failed —
+                # direct append is the last best-effort chance.
+            else:
+                with p.open("r", encoding="utf-8", errors="replace") as f:
+                    first = f.readline()
+                if not first.startswith("<!-- LANE-STARTED:"):
+                    return
+            with p.open("a", encoding="utf-8") as f:
+                f.write(text)
+        except OSError:
+            pass
+
+    # Marker line stamped at the top of a promoted result.md (#871). Loud for
+    # humans, exact for machines: a merge gate can grep the first line and
+    # refuse to treat the file as a verdict. Keep in sync with tests.
+    PROMOTION_MARKER = (
+        "<!-- TRANSCRIPT-PROMOTED: the executor copied this from the child's "
+        "stdout; the lane did not write a deliverable. NOT a verdict-grade "
+        "result (shared/claude-plugins#871). -->"
+    )
+
+    def _write_promoted_result(
+        self, result_path: Path, stdout_path: Path,
+        task_id: str, transcript_text: str,
+    ) -> bool:
+        """Promote a transcript into the deliverable path, VISIBLY (#871).
+
+        Writes marker + provenance + the transcript bytes to ``result_path``
+        via tmp-then-rename — the same mechanism the lane itself uses, and
+        safe on Windows because after #868 the executor holds no handle on
+        result.md. Returns False on any OSError; the caller must then surface
+        the loss loudly, never silently.
+        """
+        body = (
+            f"{self.PROMOTION_MARKER}\n"
+            f"<!-- promoted_from: {stdout_path} task: {task_id} "
+            f"promoted_at: {datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')} -->\n\n"
+            f"{transcript_text}"
+        )
+        tmp = result_path.with_name(f".hermes-promoted-tmp.{task_id}")
+        try:
+            result_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp.write_text(body, encoding="utf-8")
+            try:
+                os.replace(tmp, result_path)
+            except OSError:
+                # Windows refuses a rename over a path a live process holds
+                # open (the #868 mechanic). The lane may have exited leaving
+                # the path to another writer — direct open('w') still lands
+                # the promotion on POSIX and anywhere the path is merely
+                # locked-but-writable; if THAT fails too the loss is real.
+                try:
+                    result_path.write_text(body, encoding="utf-8")
+                finally:
+                    self._remove_quiet(tmp)
+            return True
+        except OSError:
+            self._remove_quiet(tmp)
+            return False
+
+
     def _hermes_stderr_path(self, task_id: str) -> Path:
         """Directory/log file where a native hermes lane's stderr is captured.
 
@@ -832,12 +1151,35 @@ class AgentExecutor:
         role = task.get("role", "author") or "author"
 
         lane_name = f"hermes-{task_id}"
+        result_path = self._hermes_result_path(task_id)
+        stdout_path = self._hermes_stdout_path(task_id)
+        stderr_path = self._hermes_stderr_path(task_id)
         brief_path = self._write_brief(
             task_id, task_title, task.get("description") or "",
             lane_key=lane_key, role=role,
+            deliverable_path=str(result_path),
         )
-        result_path = self._hermes_result_path(task_id)
-        stderr_path = self._hermes_stderr_path(task_id)
+
+        # Spawn-time cleanup of a PREVIOUS delivery's files (#868): the result
+        # check below is content-based, so a stale result.md from an earlier
+        # run of this task id must not mark a live lane done (#851 semantics —
+        # previously the open(result_path, "w") truncate provided it). If a
+        # crashed child still holds its stdout/stderr logs open we cannot
+        # delete them (Windows sharing violation); opening in append mode
+        # below then protects the orphan's transcript from truncation, and a
+        # fresh result.md is still removed so the new deliverable has a free
+        # path.
+        self._remove_quiet(result_path)
+        self._remove_quiet(stdout_path)
+        self._remove_quiet(stderr_path)
+        # NOTE (#892): the executor deliberately does NOT create result.md at
+        # spawn time — the #868 contract is that the deliverable path must not
+        # pre-exist (a lane's tmp-then-rename can fail with WinError 183 when
+        # it does, and test_agent_executor_result_file_868 proves both). The
+        # first-line diagnostic instead lands HERE at reap: _reap_hermes_spawn
+        # writes the sentinel+diagnostics file for a lane that died without
+        # one, which is the moment we know it never delivered.
+
 
         # Stateful lane resolution: resume an existing live lane's session,
         # else this is the lane's first delivery (fresh titled session).
@@ -880,19 +1222,23 @@ class AgentExecutor:
             task_id, " ".join(cmd),
         )
 
-        # Hold the result + stderr files open for the child's lifetime (closing
-        # the parent handle too early breaks stdout inheritance on Windows).
-        result_file = None
+        # Hold the STDOUT + stderr transcript files open for the child's
+        # lifetime (closing the parent handle too early breaks stdout
+        # inheritance on Windows). The DELIVERABLE path (result.md) is never
+        # opened here — #868: holding it open is what made the lane's own
+        # tmp-then-rename write fail on Windows and silently stranded whole
+        # deliverables.
+        stdout_file = None
         stderr_file = None
         try:
-            result_file = open(result_path, "w", encoding="utf-8")
+            stdout_file = self._open_stdout_log(stdout_path)
             stderr_file = open(stderr_path, "w", encoding="utf-8")
             proc = subprocess.Popen(
                 cmd,
                 cwd=self._config.working_dir,
-                # Agent final response (stdout) lands in the result file;
+                # Agent final response (stdout) lands in the transcript log;
                 # stderr (incl. the session_id line) goes to its own log file.
-                stdout=result_file,
+                stdout=stdout_file,
                 stderr=stderr_file,
                 # On Windows, create a new process group so we can kill the tree
                 creationflags=subprocess.CREATE_NEW_PROCESS_GROUP
@@ -900,7 +1246,7 @@ class AgentExecutor:
                 else 0,
             )
         except FileNotFoundError:
-            for f in (result_file, stderr_file):
+            for f in (stdout_file, stderr_file):
                 if f is not None:
                     try:
                         f.close()
@@ -914,7 +1260,7 @@ class AgentExecutor:
             self._report_failure(task_id, "executor_error: hermes not found on PATH")
             return
         except Exception as e:
-            for f in (result_file, stderr_file):
+            for f in (stdout_file, stderr_file):
                 if f is not None:
                     try:
                         f.close()
@@ -935,7 +1281,8 @@ class AgentExecutor:
             lane_name=lane_name,
             mode="hermes",
             result_path=str(result_path),
-            result_file=result_file,
+            stdout_path=str(stdout_path),
+            stdout_file=stdout_file,
             stderr_path=str(stderr_path),
             stderr_file=stderr_file,
             lane_key=lane_key,
@@ -944,6 +1291,14 @@ class AgentExecutor:
             resumed=bool(resume_session_id),
             task_payload=dict(task),  # #858: re-queue source on busy refusal
             busy_attempts=self._lane_queue_meta.get(task_id, (0, 0.0))[0],
+            attempt=self._prior_attempt(task_id, task),
+            # #929: snapshot the session's cumulative usage NOW (a resumed
+            # lane's earlier rows belong to earlier deliveries and must not be
+            # priced against this one). A fresh lane has no rows yet — empty
+            # baseline, and the full session total is this task's spend.
+            cost_baseline=_lane_cost.spawn_baseline(
+                self._config.hermes_profile, resume_session_id
+            ) if resume_session_id else {},
         )
 
         with self._lock:
@@ -951,8 +1306,8 @@ class AgentExecutor:
         self._persist_spawn(spawn)
 
         logger.info(
-            "spawned native hermes worker: task=%s pid=%d result=%s",
-            task_id, proc.pid, result_path,
+            "spawned native hermes worker: task=%s pid=%d result=%s stdout=%s",
+            task_id, proc.pid, result_path, stdout_path,
         )
 
     # -------------------------------------------------------------------
@@ -977,6 +1332,7 @@ class AgentExecutor:
                 lane_key=spawn.lane_key,
                 role=spawn.role,
                 session_id=spawn.session_id,
+                attempt=spawn.attempt,
             )
             # Reflect the lane in the stateful-lanes table whenever a lane_key
             # exists (session_id filled in later, on reap, from stderr).
@@ -1050,6 +1406,12 @@ class AgentExecutor:
                     lane_name=record.get("lane_name") or f"hermes-{task_id}",
                     mode=record.get("mode") or "bdaya-dispatch",
                     result_path=record.get("result_path") or "",
+                    attempt=_record_attempt(record),
+                    stdout_path=(
+                        str(self._hermes_stdout_path(task_id))
+                        if record.get("mode") == "hermes"
+                        else ""
+                    ),
                     stderr_path=(
                         record.get("stderr_path")
                         or str(self._hermes_stderr_path(task_id))
@@ -1235,19 +1597,140 @@ class AgentExecutor:
                 continue
             # Stateful lane: capture the hermes session id from this delivery's
             # stderr into the lanes table BEFORE the record is dropped, so the
-            # next task with the same lane_key resumes that session.
-            if outcome == "done" and spawn.mode == "hermes":
+            # next task with the same lane_key resumes that session. A
+            # promoted delivery is still a real, completed turn — the next
+            # brief must resume the same session, so it gets the same care
+            # (#871).
+            if (outcome in ("done", "transcript_promoted")
+                    and spawn.mode == "hermes"):
                 self._touch_lane_from_spawn(spawn, task_id)
+                # #929: the executor-side cost footnote. The #860 enforcement
+                # hook appends the footnote to the lane's PRINTED final text —
+                # which since #868 is NOT the deliverable unless it was
+                # promoted — and it is dead on any node whose pinned
+                # bdaya-enforcement predates #860. Reap-time, the child has
+                # exited and its session's usage rows are on disk: price the
+                # delta against the spawn-time baseline and append to the
+                # DELIVERABLE itself, so every cluster lane result carries its
+                # own credit figure regardless of hook state. Fail-open.
+                self._append_cost_footnote(spawn)
             # A terminal lane's persisted record is dropped so a future run of
             # the same task may spawn again; an active lane's record survives
             # restarts and blocks a duplicate spawn.
             self._drop_persisted_spawn(task_id)
             self._lane_queue_meta.pop(task_id, None)  # done with queue state
 
-            if outcome == "done":
-                self._report_completion(task_id, detail=detail)
+            if outcome in ("done", "transcript_promoted"):
+                # A promoted transcript COMPLETES the task — that is the #871
+                # fix: no false failure, no re-dispatch loop. The
+                # distinction is not lost: result.md carries a loud marker
+                # and the executor logs a warning (see _write_promoted_result).
+                self._report_completion(
+                    task_id, detail=detail, result=self._read_result_body(spawn)
+                )
+            elif outcome == "non_deliverable":
+                # #870: the result body was NOT a deliverable (provider/
+                # transport error or an echo of the dispatched brief). The
+                # task must not be consumed — re-queue under the cap so a
+                # genuinely broken brief cannot loop forever. The attempt
+                # count rides the spawn (authoritative across executor
+                # restarts via the persisted record) — it is read BEFORE
+                # _drop_persisted_spawn cleared the store row.
+                self._requeue_task(
+                    task_id, outcome, f"lane {spawn.lane_name}: {detail}",
+                    attempt=spawn.attempt,
+                )
             else:
                 self._report_failure(task_id, f"lane {spawn.lane_name}: {detail}")
+
+    # -------------------------------------------------------------------
+    # Deliverable-content guard (#870)
+    # -------------------------------------------------------------------
+
+    def _brief_text_for(self, task_id: str) -> str:
+        """The dispatched brief the executor itself wrote for this task.
+
+        ``_write_brief`` puts it at ``<working_dir>/hermes-briefs/<task>.md``
+        and it is deterministic from task fields; a retry rebuilds the same
+        text. Absent (bdaya mode, pruned dir) → '' so the echo rule no-ops
+        rather than guessing.
+        """
+        path = (
+            Path(self._config.working_dir or ".") / "hermes-briefs"
+            / f"{task_id}.md"
+        )
+        try:
+            return path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return ""
+
+    def _prior_attempt(self, task_id: str, task: Optional[dict] = None) -> int:
+        """Deliveries already re-queued for this task (the cap's numerator).
+
+        Authority is main's own counter: the scheduler hands the task dict
+        around (GET /api/v1/tasks) and the router bumps ``attempts`` on every
+        re-queued /fail, so it survives executor restarts and is shared
+        across nodes. Fallback (key absent — an older main predating the
+        field): the persisted spawn record left from an earlier delivery.
+        No record → 0.
+        """
+        if task is not None and "attempts" in task:
+            try:
+                return max(0, int(task["attempts"]))
+            except (TypeError, ValueError):
+                pass
+        store = getattr(self, "_store", None)
+        if store is None:
+            return 0
+        try:
+            record = store.get_task_spawn(task_id)
+        except Exception:
+            record = None
+        try:
+            return int((record or {}).get("attempt") or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    def _requeue_task(self, task_id: str, reason: str, detail: str,
+                      attempt: int = 0) -> None:
+        """Tell main this delivery failed as a non-deliverable (#870).
+
+        Same endpoint as a plain failure (POST /fail) with ``requeue=true``:
+        under the retry cap main resets the task to ready for another
+        delivery; at/over the cap it consumes the task as failed so a
+        genuinely broken brief cannot loop. The cap lives on the MAIN node —
+        the scheduler's source of truth — so the count survives executor
+        restarts and is authoritative across nodes; the executor sends the
+        attempt it observed only as a courtesy, never as the authority.
+        """
+        limit = int(getattr(self._config, "retry_limit", 3))
+        will_exceed = attempt >= limit
+        body = {"reason": f"{reason}: {detail}"[:2000], "requeue": not will_exceed}
+        result = _signed_request(
+            self._cluster_endpoint,
+            "POST",
+            f"/api/v1/tasks/{task_id}/fail",
+            body,
+            self._token,
+            self._node_id,
+        )
+        if result:
+            if will_exceed or not result.get("requeued", False):
+                logger.error(
+                    "task %s consumed as failed (%s, attempt %d, cap %d): %s",
+                    task_id, reason, attempt + 1, limit, detail[:200],
+                )
+            else:
+                logger.warning(
+                    "task %s re-queued (attempt %d/%d, %s): %s",
+                    task_id, attempt + 1, limit, reason, detail[:200],
+                )
+        else:
+            logger.error(
+                "failed to report non-deliverable for task %s (%s) — the "
+                "task will be retried after its lease expires",
+                task_id, reason,
+            )
 
     def _reap_hermes_spawn(
         self,
@@ -1260,7 +1743,11 @@ class AgentExecutor:
 
         Completion contract (hermes ``chat --query-file ... -Q``):
           - RC 0 and a non-empty result file → done
-          - RC 0 without a result file → fail (agent produced nothing)
+          - RC 0 without a result file but with a non-empty transcript and no
+            stranded tmp → transcript_promoted (the transcript is copied into
+            result.md under a loud marker — completes the task but is never a
+            verdict-grade done; shared/claude-plugins#871)
+          - RC 0 with nothing to deliver → fail (agent produced nothing)
           - RC != 0 → fail with captured stderr tail
           - still running → keep waiting (bounded by spawn_timeout)
         A resumed spawn (executor restarted mid-task) drives completion off the
@@ -1269,10 +1756,11 @@ class AgentExecutor:
         """
         rc = spawn.process.poll()
 
-        # A resolved hermes spawn releases its result/stderr handles (the child
-        # has exited by then, so the close only releases the parent's copies).
+        # A resolved hermes spawn releases its stdout/stderr transcript
+        # handles (the child has exited by then, so the close only releases
+        # the parent's copies). The DELIVERABLE is never a held handle (#868).
         if rc is not None:
-            for attr in ("result_file", "stderr_file"):
+            for attr in ("stdout_file", "result_file", "stderr_file"):
                 fh = getattr(spawn, attr, None)
                 if fh is not None:
                     try:
@@ -1283,14 +1771,36 @@ class AgentExecutor:
                     finally:
                         setattr(spawn, attr, None)
 
-        # Result file is the primary completion signal for hermes: the agent
-        # writes its final response there, then exits 0. The file is the
-        # child's STDOUT, so content alone proves nothing while the process is
-        # alive — startup warnings (e.g. "Warning: Unknown toolsets: …") land
-        # there within seconds and used to mark a live lane done, freeing its
-        # lane slot while the agent kept running (shared/claude-plugins#851).
-        # A lane is done only once it has EXITED cleanly with content.
+        # The DELIVERABLE (result.md) is the primary completion signal for
+        # hermes (#868): the agent writes its final response there with its
+        # own write_file, then exits 0. Content still proves nothing while the
+        # process is alive — the lane may be mid-write, and #851's lesson
+        # (never resolve a LIVE lane as done on file content alone) carries
+        # over: a lane is done only once it has EXITED cleanly with content.
         result_ok = bool(spawn.result_path) and Path(spawn.result_path).is_file()
+        # Reap-time lost-deliverable check (#868): a .hermes-tmp.* in the
+        # results dir written within THIS delivery's window is a deliverable
+        # whose rename never landed — silent loss is the whole bug, so it is
+        # surfaced loudly (and never swept up) ahead of any 'done'.
+        stranded = []
+        if rc is not None:
+            results_dir = (
+                Path(spawn.result_path).parent if spawn.result_path
+                else Path(self._config.working_dir or ".") / "hermes-results"
+            )
+            stranded = self._stranded_tmps(results_dir, spawn.started_at)
+
+        if rc == 0 and stranded:
+            names = ", ".join(str(p) for p in stranded)
+            resolved.append((
+                task_id, spawn, "lost_deliverable",
+                f"hermes exited rc=0 but {len(stranded)} stranded "
+                f".hermes-tmp.* file(s) from this delivery were never renamed "
+                f"into place (lost deliverable — shared/claude-plugins#868): "
+                f"{names}",
+            ))
+            return
+
         if rc == 0 and result_ok:
             try:
                 contents = Path(spawn.result_path).read_text(
@@ -1298,7 +1808,53 @@ class AgentExecutor:
                 )
             except OSError:
                 contents = ""
+            # #892: drop our own pre-spawn sentinel lines BEFORE judging — a
+            # file containing only the sentinel is a died-lane diagnostic, not
+            # content, and must fall through to the no-deliverable paths below.
+            contents = self._content_after_sentinel(contents)
             if contents.strip():
+                # #870: non-empty is NOT sufficient — two production shapes
+                # rode this exact gate to a fabricated 'completed': a
+                # provider/transport error body and the dispatched brief
+                # echoed back (a reviewer lane — an unreviewed MR passes a
+                # gate that trusts the status word). The classifier is
+                # conservative by design: a real deliverable may quote its
+                # brief and may say the word "error".
+                stderr_text = self._read_spawn_stderr(spawn) or ""
+                reason = classify_non_deliverable(
+                    contents,
+                    self._brief_text_for(task_id),
+                    is_error_response=("API failed after" in stderr_text),
+                )
+                if reason:
+                    no_turn = has_no_turn_stderr(stderr_text)
+                    detail = (
+                        f"result body is not a deliverable ({reason}"
+                        + ("; agent produced no turn — session restored zero "
+                           "messages" if no_turn else "")
+                        + f"): {contents.strip()[:200]!r}"
+                    )
+                    logger.error(
+                        "#870 false-completed guard fired: task %s (%s) — "
+                        "reaping as %s, never 'done'",
+                        task_id, reason, "non_deliverable",
+                    )
+                    resolved.append((task_id, spawn, "non_deliverable", detail))
+                    return
+                if has_no_turn_stderr(stderr_text):
+                    # The body passed the guards but the resumed session
+                    # restored ZERO messages — the lane answered without its
+                    # prior context (#870 R2-1 class). Deliverable wins over
+                    # veto (a fresh execution of the same query can be real
+                    # work — vetoing here would reject good lanes), but the
+                    # consumer must not read the status word blind.
+                    logger.warning(
+                        "task %s: deliverable accepted but stderr shows "
+                        "'found but has no messages' — the resumed session "
+                        "had no history; verify the body used the right "
+                        "lane context",
+                        task_id,
+                    )
                 resolved.append((
                     task_id, spawn, "done",
                     f"hermes result written in {elapsed:.0f}s ({spawn.result_path})",
@@ -1328,15 +1884,99 @@ class AgentExecutor:
                     return
             if spawn.spawn_exit_stderr:
                 detail += f": {spawn.spawn_exit_stderr[:300]}"
+            # #892: a crashed lane leaves the FIRST-LINE diagnostic in its
+            # result file, not just the last stderr line in fail_reason.
+            self._append_crash_diagnostics(
+                spawn,
+                f"\n## Crash diagnostics (written by the executor at reap)\n\n"
+                f"- outcome: rc={rc} after {elapsed:.0f}s\n"
+                + (f"- last stderr:\n\n```\n{spawn.spawn_exit_stderr}\n```\n"
+                   if spawn.spawn_exit_stderr else "- no stderr captured\n"),
+            )
             resolved.append((task_id, spawn, "spawn_failed", detail))
             return
 
         if rc is not None and rc == 0:
-            # Exited cleanly but produced no result file/content.
+            # Exited cleanly with no deliverable. Lanes deliver by PRINTING
+            # their final message; pre-#868 that print WAS result.md (the
+            # inherited-stdout handle), so it reaped done. Post-#868 the print
+            # lands in stdout.log and result.md must be written explicitly —
+            # and diligent lanes were reaping a false FAILURE (the #871
+            # specimens: two live verdicts posted to !280, both recorded
+            # FAILED, feeding an unbounded re-dispatch loop).
+            #
+            # So the transcript is promoted to the deliverable — but NEVER
+            # silently. #868's refusal still governs the !23 trap (a truncated
+            # transcript whose per-section "Verdict: CORRECT" lines read as a
+            # pass): (a) a stranded .hermes-tmp.* was already surfaced above
+            # as lost_deliverable and returns before ever reaching here; (b)
+            # promotion writes a loud machine-checkable header marker into
+            # result.md; and (c) the outcome is ``transcript_promoted``, never
+            # plain ``done`` — a merge gate can and must refuse to treat it
+            # as a verdict (shared/claude-plugins#871).
+            transcript_text = ""
+            if getattr(spawn, "stdout_path", ""):
+                try:
+                    if Path(spawn.stdout_path).is_file():
+                        transcript_text = Path(spawn.stdout_path).read_text(
+                            encoding="utf-8", errors="replace"
+                        )
+                except OSError:
+                    transcript_text = ""
+            if transcript_text.strip() and spawn.result_path:
+                marker_written = self._write_promoted_result(
+                    Path(spawn.result_path), Path(spawn.stdout_path),
+                    task_id, transcript_text,
+                )
+                if marker_written:
+                    resolved.append((
+                        task_id, spawn, "transcript_promoted",
+                        f"hermes exited rc=0 after {elapsed:.0f}s without "
+                        f"writing {spawn.result_path}; the executor PROMOTED "
+                        f"the transcript at {spawn.stdout_path} into it with "
+                        f"a visible marker — outcome transcript_promoted, NOT "
+                        f"a lane verdict (shared/claude-plugins#871)",
+                    ))
+                    logger.warning(
+                        "task %s: transcript promoted to deliverable "
+                        "(lane printed its final message instead of writing "
+                        "result.md) — NOT a verdict-grade 'done' (#871)",
+                        task_id,
+                    )
+                    return
+                # Promotion itself failed (e.g. path held by another live
+                # writer): fall through to the loud lost-deliverable surface —
+                # silent loss is still the bug #868 exists to prevent.
+                resolved.append((
+                    task_id, spawn, "lost_deliverable",
+                    f"hermes exited rc=0 after {elapsed:.0f}s but wrote no "
+                    f"deliverable at {spawn.result_path} and the transcript "
+                    f"promotion write FAILED; transcript at "
+                    f"{spawn.stdout_path} — do NOT treat it as the verdict "
+                    f"(shared/claude-plugins#868 #871)",
+                ))
+                return
+            if transcript_text.strip():
+                resolved.append((
+                    task_id, spawn, "lost_deliverable",
+                    f"hermes exited rc=0 after {elapsed:.0f}s but wrote no "
+                    f"deliverable at {spawn.result_path}; transcript present "
+                    f"at {spawn.stdout_path} — do NOT treat it as the verdict "
+                    f"(shared/claude-plugins#868)",
+                ))
+                return
             resolved.append((
                 task_id, spawn, "no_result",
                 f"hermes exited rc=0 after {elapsed:.0f}s but wrote no result",
             ))
+            # #892: same class as a crash — a lane that leaves nothing gets the
+            # first-line diagnostic written by the executor at reap.
+            self._append_crash_diagnostics(
+                spawn,
+                f"\n## Crash diagnostics (written by the executor at reap)\n\n"
+                f"- outcome: rc=0 after {elapsed:.0f}s but NO deliverable "
+                f"(lane printed its final message without writing result.md)\n",
+            )
             return
 
         # Timeout is the outer bound for a still-running lane. Kill the child so
@@ -1347,6 +1987,14 @@ class AgentExecutor:
                 self._config.spawn_timeout, task_id, getattr(spawn.process, "pid", "?"),
             )
             self._kill_spawn_process(spawn)
+            # #892: a timed-out lane is a crashed lane — leave the first-line
+            # diagnostic unless the lane already delivered something.
+            self._append_crash_diagnostics(
+                spawn,
+                f"\n## Crash diagnostics (written by the executor at reap)\n\n"
+                f"- outcome: killed after exceeding {self._config.spawn_timeout:.0f}s "
+                f"spawn timeout\n",
+            )
             resolved.append((
                 task_id, spawn, "timeout",
                 f"exceeded {self._config.spawn_timeout:.0f}s",
@@ -1426,6 +2074,38 @@ class AgentExecutor:
                 if val:
                     return val
         return ""
+
+    def _append_cost_footnote(self, spawn: ActiveSpawn) -> None:
+        """#929 — append this delivery's credit footnote to its result file.
+
+        Runs at reap, after the child exited (its usage rows are on disk) and
+        after _touch_lane_from_spawn bound spawn.session_id. Every failure
+        mode is silent-by-design (fail-open): a meter that breaks lane
+        delivery is worse than no meter. Idempotent via the shared marker —
+        when the #860 enforcement hook already footnoted the print (and it
+        became the deliverable), this pass is a no-op.
+        """
+        try:
+            path = Path(spawn.result_path) if spawn.result_path else None
+            if path is None or not path.is_file():
+                return
+            if not spawn.session_id:
+                return
+            footnote = _lane_cost.footnote_for_delivery(
+                profile=self._config.hermes_profile,
+                session_id=spawn.session_id,
+                baseline=spawn.cost_baseline or {},
+                lane_key=spawn.lane_key,
+            )
+            if footnote is None:
+                return
+            if _lane_cost.append_footnote(path, footnote):
+                logger.info(
+                    "#929: cost footnote appended to lane result %s (lane %s)",
+                    path, spawn.lane_key or "?",
+                )
+        except Exception:
+            logger.exception("#929: cost footnote pass failed (delivery unaffected)")
 
     def _touch_lane_from_spawn(self, spawn: ActiveSpawn, task_id: str) -> None:
         """Record a lane's session id + last task into the lanes table.
@@ -1773,20 +2453,71 @@ class AgentExecutor:
     # Reporting results back to the cluster
     # -------------------------------------------------------------------
 
-    def _report_completion(self, task_id: str, detail: str = "") -> None:
-        """Mark a task as completed on the main node."""
-        result = _signed_request(
+    # #874: cap on the deliverable carried over the wire. A result is normally
+    # a verdict or a short report; anything past this is a transcript dump, and
+    # the tail is the part that matters (verdict lines land at the end), so the
+    # HEAD is dropped and the truncation is announced in-band.
+    RESULT_BODY_MAX_BYTES = 256 * 1024
+
+    def _read_result_body(self, spawn: Any) -> Optional[str]:
+        """The lane's deliverable, for transport to the main node (#874).
+
+        Returns None when there is nothing worth carrying. Never raises: a
+        completion must not fail because a result file is unreadable -- losing
+        the body is bad, losing the completion is worse.
+        """
+        path = getattr(spawn, "result_path", "") or ""
+        if not path:
+            return None
+        try:
+            body = Path(path).read_text(encoding="utf-8", errors="replace")
+        except OSError as exc:
+            logger.warning("could not read result body at %s: %s", path, exc)
+            return None
+        # #892: a sentinel-only file is the executor's own diagnostic, never a
+        # deliverable — carry nothing (same strip as the completion gate).
+        body = self._content_after_sentinel(body)
+        if not body.strip():
+            return None
+        raw = body.encode("utf-8")
+        if len(raw) > self.RESULT_BODY_MAX_BYTES:
+            kept = raw[-self.RESULT_BODY_MAX_BYTES:].decode("utf-8", errors="replace")
+            logger.warning(
+                "result body truncated for transport: task result at %s is %d bytes",
+                path, len(raw),
+            )
+            return (
+                f"[truncated: {len(raw)} bytes, kept the last "
+                f"{self.RESULT_BODY_MAX_BYTES}]" + chr(10) + kept
+            )
+        return body
+
+    def _report_completion(
+        self, task_id: str, detail: str = "", result: Optional[str] = None
+    ) -> None:
+        """Mark a task as completed on the main node, carrying its deliverable.
+
+        #874: this used to POST an empty {} and discard `detail`, so a result
+        lived only on the local disk of whichever node ran the lane -- a verdict
+        produced on one machine was unreadable from every other.
+        """
+        payload = {"result": result} if result else {}
+        result_ok = _signed_request(
             self._cluster_endpoint,
             "POST",
             f"/api/v1/tasks/{task_id}/complete",
-            {},
+            payload,
             self._token,
             self._node_id,
         )
-        if result:
-            logger.info("task %s marked completed: %s", task_id, detail or "ok")
+        if result_ok:
+            logger.info(
+                'task %s marked completed: %s (result: %s)',
+                task_id, detail or 'ok',
+                f'{len(result)} chars carried' if result else 'none',
+            )
         else:
-            logger.error("failed to mark task %s completed", task_id)
+            logger.error('failed to mark task %s completed', task_id)
 
     def _report_failure(self, task_id: str, reason: str,
                         fallback: str = "") -> bool:

@@ -270,3 +270,58 @@ async def test_iid_bool_rejected():
         assert resp.status_code == 400, \
             f"bool iid must be rejected with 400, got {resp.status_code}"
         assert "Invalid or missing iid" in resp.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_requires_is_independent_of_filter_label(monkeypatch):
+    """#873: `requires` must name a CAPABILITY, never the ingest filter label.
+
+    The deployed main node runs with GITLAB_INTAKE_LABEL=hermes-factory. No
+    worker advertises that, so before the fix every ingested task was created
+    `ready` and could never be claimed -- silently, because an unclaimable task
+    is indistinguishable from a queued one. The pre-existing tests never caught
+    it: their fixture leaves GITLAB_INTAKE_LABEL unset, so it defaulted to
+    "tooling" and the assertion passed vacuously.
+    """
+    monkeypatch.setenv("GITLAB_INTAKE_LABEL", "hermes-factory")
+    monkeypatch.delenv("GITLAB_INTAKE_REQUIRES", raising=False)
+    monkeypatch.delenv("GITLAB_INTAKE_TOKEN", raising=False)
+    monkeypatch.delenv("GITLAB_INTAKE_WEBHOOK_SECRET", raising=False)
+    app = create_app(cluster_id="test", node_id="test-node", node_role="main")
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        payload = {
+            "object_kind": "issue",
+            "object_attributes": {
+                "iid": 8731,
+                "title": "Filter label must not become a capability",
+                "action": "open",
+            },
+            "labels": [{"title": "hermes-factory"}],
+        }
+        resp = await client.post("/api/v1/intake/gitlab/webhook", json=payload)
+        assert resp.status_code == 200
+        requires = resp.json()["task"]["requires"]
+        assert requires == ["tooling"], (
+            f"requires={requires!r} -- the filter label leaked into the capability "
+            "requirement; no worker advertises it, so the task is unclaimable"
+        )
+
+
+@pytest.mark.asyncio
+async def test_requires_override_is_honoured(monkeypatch):
+    """GITLAB_INTAKE_REQUIRES sets the capability, comma-separated."""
+    monkeypatch.setenv("GITLAB_INTAKE_LABEL", "hermes-factory")
+    monkeypatch.setenv("GITLAB_INTAKE_REQUIRES", "review, native-win")
+    monkeypatch.delenv("GITLAB_INTAKE_TOKEN", raising=False)
+    monkeypatch.delenv("GITLAB_INTAKE_WEBHOOK_SECRET", raising=False)
+    app = create_app(cluster_id="test", node_id="test-node", node_role="main")
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        payload = {
+            "object_kind": "issue",
+            "object_attributes": {"iid": 8732, "title": "Override", "action": "open"},
+            "labels": [{"title": "hermes-factory"}],
+        }
+        resp = await client.post("/api/v1/intake/gitlab/webhook", json=payload)
+        assert resp.json()["task"]["requires"] == ["review", "native-win"]

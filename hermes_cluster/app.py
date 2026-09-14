@@ -63,6 +63,10 @@ def create_app(
     fed_token: str = "",
     cluster_endpoint: str = "",
     node_capabilities: Optional[list] = None,
+    node_capability_probes: Optional[dict] = None,
+    # #892: node.min_free_disk_gb from cluster YAML (None -> default 5.0 GB,
+    # 0 -> rule disabled). Owner ruling: YAML only, NEVER an env var.
+    node_min_free_disk_gb: Optional[float] = None,
     agent_executor_config: Optional[dict] = None,
     static_dir: Optional[str] = None,
     db_path: str = "",
@@ -164,7 +168,7 @@ def create_app(
     from .recovery.manager import RecoveryManager
 
     # Create managers (ClusterState implements the same API as ClusterStore)
-    _node_manager = NodeManager(state)
+    _node_manager = NodeManager(state, min_free_disk_gb=node_min_free_disk_gb)
     _lease_manager = LeaseManager(state)
     _recovery_manager = RecoveryManager(state)
 
@@ -195,10 +199,17 @@ def create_app(
     # store and the main never sees it.
     if node_role == "worker" and cluster_endpoint:
         from .core.worker_connector import start_worker_connector
+        from .core.disk_preflight import effective_min_free_gb
         # Declare the worker's concurrency ceiling at /join so the main's
         # scheduler never assigns more tasks than this node can run (#833).
         _worker_max_concurrent = int(
             (agent_executor_config or {}).get("max_concurrent", 1)
+        )
+        # #892: report free disk of the volume holding the lanes dir (the
+        # executor's working_dir when set, else HERMES_HOME) in every
+        # join/heartbeat so the main can degrade this node below the floor.
+        _disk_probe_path = str(
+            (agent_executor_config or {}).get("working_dir", "") or ""
         )
         start_worker_connector(
             node_id=state.node_id,
@@ -206,6 +217,8 @@ def create_app(
             capabilities=node_capabilities or [],
             peer_token=fed_token,
             max_concurrent=_worker_max_concurrent,
+            capability_probes=node_capability_probes or None,
+            disk_probe_path=_disk_probe_path,
         )
 
     # Agent executor: when role=worker and agent_executor is configured+enabled,
@@ -228,6 +241,10 @@ def create_app(
                 hermes_profile=ae_cfg_dict.get("hermes_profile", "default"),
                 hermes_bin=ae_cfg_dict.get("hermes_bin", ""),
                 hermes_reviewer_model=ae_cfg_dict.get("hermes_reviewer_model", "qwen3.7-plus"),
+                retry_limit=int(ae_cfg_dict.get("retry_limit", 3)),
+                # #892: worker-side claim guard uses the SAME YAML floor the
+                # main degrades on (None -> default, 0 -> disabled).
+                min_free_disk_gb=effective_min_free_gb(node_min_free_disk_gb),
             )
             _agent_executor = AgentExecutor(
                 config=ae_cfg,
@@ -303,6 +320,54 @@ def create_app(
             content="# No metrics collected yet\n",
             media_type="text/plain",
         )
+
+    # Startup handler — re-schedule anything left `ready` by the previous process
+    @app.on_event("startup")
+    async def reschedule_orphaned_ready_tasks():
+        """#878: a restart used to silently strand the entire queue.
+
+        Scheduling is driven purely by task-lifecycle events — task created,
+        capabilities updated, task completed. Each of those calls
+        ``trigger_pending_tasks()`` exactly once. A task that is still `ready`
+        when the process dies has therefore already spent its only trigger:
+        the new process loads it from the store, and nothing ever asks the
+        scheduler to look at it again. Node re-registration does NOT help —
+        the trigger in routers/nodes.py sits in ``update_capabilities``, not
+        in join or heartbeat.
+
+        Measured on the hosted main 2026-09-12: a task with
+        ``requires: ["tooling"]`` sat `ready` for over three minutes after a
+        pod restart with three workers online and idle at ``load 0.0``, with
+        zero rows written to ``scheduling_decisions``. One
+        ``POST /api/v1/schedule/trigger`` dispatched it in under 15 seconds.
+
+        This is worse in Kubernetes than it ever was on a desktop: a pod
+        restarts on any node drain, image bump or eviction, unattended, and
+        the failure is silent — no error, no `fail_reason`, `failed_schedules`
+        stays 0. The queue simply goes inert.
+
+        Workers do not schedule, so this runs on the main only.
+        """
+        if node_role != "main":
+            return
+        # Sync store calls inside an async handler: acceptable HERE because
+        # startup runs before the server accepts any request, so there is no
+        # concurrency to block. Moving this to a different lifecycle point
+        # (a periodic sweep, a request hook) would need a thread or an async
+        # store path instead.
+        try:
+            promoted = state.trigger_pending_tasks()
+            assignments = state.schedule_pending_detailed()
+            if promoted or assignments:
+                logger.info(
+                    "startup reschedule: promoted=%s assigned=%s",
+                    promoted, len(assignments),
+                )
+        except Exception:
+            # A scheduling hiccup must never prevent the server from starting —
+            # an unscheduled queue is recoverable, a main that refuses to boot
+            # is not.
+            logger.exception("startup reschedule failed (continuing)")
 
     # Shutdown handler — stop all background threads
     @app.on_event("shutdown")

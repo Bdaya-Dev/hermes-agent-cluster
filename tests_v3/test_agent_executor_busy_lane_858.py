@@ -233,6 +233,45 @@ class TestFifoReleaseOnReap:
             "lane still busy — nothing may release from its FIFO")
         assert [t["id"] for t in executor._lane_queue["L"]] == ["tB"]
 
+    def test_leftover_reinsertion_preserves_arrival_order(self, tmp_path):
+        """#858 review blocker (PR #23): when the spawn budget runs out
+        mid-drain, un-spawned released tasks go back at the FRONT of their
+        lane queues in ARRIVAL order. The original loop inserted each
+        leftover at index 0 front-to-back, reversing every lane that had 2+
+        tasks left over — breaking the headline FIFO guarantee on this path.
+
+        RED against the pre-fix shape: lane L comes back [tD, tB] and the
+        next sweep releases tD ahead of tB."""
+        store = _store()
+        executor = _executor(store, working_dir=str(tmp_path))
+        # Drain order is X then L (released dict order): tX takes the one
+        # slot, leaving tB and tD — TWO tasks of lane L — as leftover.
+        executor._lane_released = {
+            "X": [_lane_task("tX", lane_key="X")],
+            "L": [_lane_task("tB"), _lane_task("tD")],
+        }
+        popen_cmds = []
+
+        def fake_popen(cmd, **kw):
+            popen_cmds.append(cmd)
+            return _AliveProc()
+
+        with patch("hermes_cluster.core.agent_executor.subprocess.Popen",
+                   side_effect=fake_popen):
+            with patch("hermes_cluster.core.agent_executor._signed_request",
+                       return_value=[]):
+                executor._claim_and_spawn(max_spawns=1)  # only tX spawns
+
+        assert len(popen_cmds) == 1 and "tB" not in executor._active_spawns
+        order = [t["id"] for t in executor._lane_queue.get("L", [])]
+        assert order == ["tB", "tD"], (
+            f"leftover re-insertion reversed lane L FIFO (got {order}) — "
+            "arriving-earlier tB must sit ahead of tD")
+        # The next sweep (lane L free) must release tB first, then tD.
+        executor._sweep_lane_queues()
+        assert [t["id"] for t in executor._lane_released.get("L", [])] == ["tB"]
+        assert [t["id"] for t in executor._lane_queue["L"]] == ["tD"]
+
 
 # ---------------------------------------------------------------------------
 # 3/4. Residual refusal: re-queue with bounded backoff; exhaustion carries

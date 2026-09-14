@@ -361,7 +361,13 @@ class TestReapFinishedSpawnsLaneTracking:
                     with patch.object(executor, "_report_failure") as mock_fail:
                         executor._reap_finished_spawns()
 
-                        mock_complete.assert_called_once_with("t1", detail=mock_complete.call_args[1]["detail"])
+                        # #874: the call now carries the deliverable too.
+                        mock_complete.assert_called_once_with(
+                            "t1",
+                            detail=mock_complete.call_args[1]["detail"],
+                            result=mock_complete.call_args[1]["result"],
+                        )
+                        assert "result" in mock_complete.call_args[1]
 
                         fail_task_ids = {call[0][0] for call in mock_fail.call_args_list}
                         assert fail_task_ids == {"t4", "t5"}

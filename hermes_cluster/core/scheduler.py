@@ -22,6 +22,16 @@ Scheduling rule:
 A node's active count = tasks in ``running``/``assigned`` status whose
 ``assigned_to`` is that node.
 
+LFP-1 lane serialization (#762 cardinality guard, #833 note 133037 rule #1):
+a task carrying a ``lane_key`` is never assigned while ANOTHER task with the
+same ``lane_key`` is ACTIVE (running/assigned) — exactly one live author
+session per lane key, matching the bdaya-enforcement ``lane_key_guard`` DENY
+at spawn time so intake can never schedule a lane onto a second node behind
+the plugin's back. Queued sibling bundles on one lane therefore execute in
+band order, one sitting at a time (the scheduler sort is priority, then
+created_at — a band-0 bundle overtakes a queued band-3 sibling but still
+waits for the ACTIVE sitting).
+
 The planner is pure: it returns assignments and the stores apply them
 under their own lock/transaction. The only mutable state is the
 round-robin tiebreak cursor, which each store owns per-instance.
@@ -29,7 +39,7 @@ round-robin tiebreak cursor, which each store owns per-instance.
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterable, List, Optional
 
 from ..models import Node, TaskStatus
 
@@ -37,6 +47,44 @@ from ..models import Node, TaskStatus
 # sets on assignment; ``assigned`` exists in the Go enum and would count
 # the same way if a store ever uses it.
 ACTIVE_TASK_STATUSES = frozenset({TaskStatus.running, TaskStatus.assigned})
+
+
+def lane_blocked_ready_ids(tasks: Iterable[Any]) -> set:
+    """READY task ids whose lane key already has an ACTIVE task (or an
+    earlier-created ready sibling on the same lane).
+
+    One pass: for each lane key, every ready task except the
+    (priority, created_at)-first one is blocked, plus ALL ready tasks when an
+    active sitting exists. Returning ready siblings as well keeps two bundle
+    tasks of one lane from being handed to two nodes in the SAME schedule
+    tick — the first assign flips it to running and the next tick continues,
+    but within this tick we serialize up-front.
+    """
+    materialized = []
+    for t in tasks:
+        if isinstance(t, dict):
+            lane = t.get("lane_key") or ""
+            status = t.get("status")
+            status = getattr(status, "value", status)
+            materialized.append((t.get("id"), lane, str(status),
+                                 t.get("priority", 3), t.get("created_at")))
+        else:
+            materialized.append((t.id, getattr(t, "lane_key", "") or "",
+                                 t.status.value, t.priority, t.created_at))
+    active_lanes = {lane for _, lane, status, _, _ in materialized
+                    if lane and status in {s.value for s in ACTIVE_TASK_STATUSES}}
+    by_lane: Dict[str, List] = {}
+    for tid, lane, status, prio, created in materialized:
+        if lane and status == TaskStatus.ready.value:
+            by_lane.setdefault(lane, []).append((prio, created, tid))
+    blocked = set()
+    for lane, entries in by_lane.items():
+        if lane in active_lanes:
+            blocked.update(tid for _, _, tid in entries)
+        else:
+            entries.sort(key=lambda e: (e[0], e[1] or ""))
+            blocked.update(tid for _, _, tid in entries[1:])
+    return blocked
 
 # Terminal states — a task in one of these must never be unassigned/revived.
 TERMINAL_TASK_STATUSES = frozenset({

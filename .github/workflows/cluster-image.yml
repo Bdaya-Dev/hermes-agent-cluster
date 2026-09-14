@@ -1,0 +1,93 @@
+# =============================================================================
+# Hermes cluster main — container image build + push to Artifact Registry
+# =============================================================================
+# Builds the Dockerfile at repo root and pushes to:
+#   europe-west1-docker.pkg.dev/bdaya-website/bdaya-docker/hermes-cluster-main
+# tagged with the commit SHA. A release = bumping that SHA tag in the ArgoCD
+# source tree (infra-github cluster-config/hermes-main/kustomization.yaml
+# `images:` block) — nothing else changes.
+#
+# Auth is Workload Identity Federation (OIDC) only. NEVER a long-lived
+# service-account key file: there is no GCP credentials JSON secret in this
+# repo or this workflow. The WIF pool/provider
+# (projects/625305569514/.../workloadIdentityPools/github-actions/providers/github)
+# already exists (terraform-managed by Bdaya-Dev/bdaya-website-infra, used by
+# the terraform + valueexport-controller workflows). The dedicated SA
+# `github-hermes-cluster-image@bdaya-website` with roles scoped to the
+# bdaya-docker GAR repo is created, WIF-bound to this repo's exact
+# `attribute.repository`, by the paired infra MR
+# (infrastructure/hermes-cluster-image.tf) — until that applies, pushes from
+# this workflow 403, which is the intended fail-closed state while the MR is
+# open.
+#
+# This repo is a fork (ahmednfwela/hermes-agent-cluster); the workflow only
+# runs on pushes to the fork's own `main` or manual dispatch, so a PR cannot
+# publish an image.
+# =============================================================================
+name: Cluster Image
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'Dockerfile'
+      - '.dockerignore'
+      - 'hermes_cluster/**'
+      - 'pyproject.toml'
+      - '.github/workflows/cluster-image.yml'
+  workflow_dispatch: {}
+
+# id-token: write = the OIDC token this job exchanges for GCP credentials
+# (Workload Identity Federation). Nothing else here needs a write scope.
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  PROJECT_ID: bdaya-website
+  REGION: europe-west1
+  REPO: bdaya-docker
+  IMAGE: hermes-cluster-main
+  WORKLOAD_IDENTITY_PROVIDER: 'projects/625305569514/locations/global/workloadIdentityPools/github-actions/providers/github'
+  SERVICE_ACCOUNT: 'github-hermes-cluster-image@bdaya-website.iam.gserviceaccount.com'
+
+jobs:
+  build-and-push:
+    name: Build and push image (tag = commit SHA)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Same WIF flow the estate's other GitHub workflows use
+      # (terraform.yml, valueexport-controller.yml): OIDC -> short-lived
+      # ADC credentials -> gcloud docker credential helper. No key file
+      # anywhere, no secret in repo settings.
+      - name: Authenticate to GCP (Workload Identity Federation)
+        uses: google-github-actions/auth@v3
+        with:
+          workload_identity_provider: ${{ env.WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ env.SERVICE_ACCOUNT }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Configure Docker for Artifact Registry
+        run: gcloud auth configure-docker ${{ env.REGION }}-docker.pkg.dev --quiet
+
+      - name: Build image
+        run: |
+          docker build \
+            -t ${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.REPO }}/${{ env.IMAGE }}:${{ github.sha }} \
+            -f Dockerfile .
+
+      - name: Push image
+        run: |
+          docker push ${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.REPO }}/${{ env.IMAGE }}:${{ github.sha }}
+
+      - name: Summary
+        run: |
+          echo "### Image pushed" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "\`${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.REPO }}/${{ env.IMAGE }}:${{ github.sha }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "Release = bump the \`images:\` tag in infra-github \`cluster-config/hermes-main/kustomization.yaml\` (GitOps only; the Deployment is never touched by hand)." >> "$GITHUB_STEP_SUMMARY"

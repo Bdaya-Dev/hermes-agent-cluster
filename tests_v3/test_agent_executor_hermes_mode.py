@@ -325,6 +325,16 @@ class TestHermesReap:
             with patch.object(executor, "_report_completion") as mock_done:
                 executor._reap_finished_spawns()
                 mock_query.assert_not_called()
-                mock_done.assert_called_once_with("t_h5", detail=mock_done.call_args[1]["detail"])
+                # #874: _report_completion now also carries the deliverable.
+                # Same strength as before -- exactly one call for this task, with
+                # its detail -- plus the new result kwarg the executor must pass.
+                mock_done.assert_called_once_with(
+                    "t_h5",
+                    detail=mock_done.call_args[1]["detail"],
+                    result=mock_done.call_args[1]["result"],
+                )
+                assert "result" in mock_done.call_args[1], (
+                    "the executor must pass a result, even when it is None"
+                )
 
         assert "t_h5" not in executor._active_spawns

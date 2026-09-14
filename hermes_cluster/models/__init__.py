@@ -105,11 +105,25 @@ class Node(BaseModel):
     last_heartbeat: datetime = Field(default_factory=datetime.utcnow)
     load: float = 0.0  # 0.0 - 1.0
     max_concurrent: int = 0  # max simultaneously-assigned tasks; 0 = unlimited
+    # #892 factory resilience: free GB on the volume holding the worker's
+    # lanes/HERMES_HOME, reported in every join/heartbeat. None = the worker
+    # did not report it (older worker) — the main's disk rules never fire on
+    # an absent field, so behaviour is byte-for-byte the pre-#892 one.
+    disk_free_gb: Optional[float] = None
+    # Why a node is not schedulable (status != online): the watchdog's
+    # staleness reason, or the disk-floor reason ("disk below floor...").
+    # Surfaced by GET /api/v1/nodes so the lead sees WHY without log-diving.
+    status_reason: str = ""
 
 
 # ===========================================================================
 # 3. Task (internal/scheduler/taskstore.go)
 # ===========================================================================
+
+# Documented default band when a submitter says nothing (#866): the sort is
+# ascending (ORDER BY priority, created_at), bands run 0 (top) .. 5.
+DEFAULT_PRIORITY = 3
+
 
 class Task(BaseModel):
     """Go struct: scheduler.Task"""
@@ -117,15 +131,36 @@ class Task(BaseModel):
     title: str
     requires: List[str] = []
     depends_on: List[str] = Field(default_factory=list, alias="depends_on")
-    priority: int = 3  # 1=highest, 5=lowest, default 3
+    priority: int = DEFAULT_PRIORITY  # 0=top band, 1..5 documented, default 3
     status: TaskStatus = TaskStatus.pending
     assigned_to: Optional[str] = None
     created_at: datetime = Field(default_factory=datetime.utcnow)
     updated_at: datetime = Field(default_factory=datetime.utcnow)
     version: int = 0
     fail_reason: Optional[str] = None
+    # #870: deliveries re-queued back to this node after a non-deliverable
+    # result (provider error / echoed brief). The retry cap lives HERE — on
+    # main, the scheduler's source of truth — so an executor restart or a
+    # node handoff cannot reset it. Bumped on every requeue=true /fail.
+    attempts: int = 0
     lane_key: str = ""  # stateful lane identity; empty = per-task session
     role: str = "author"  # "author" (profile default model) | "reviewer" (opus tier)
+    # #874: the lane's DELIVERABLE, carried on the task row so it survives the
+    # node that produced it. Before this, a result was written to
+    # <that node's working_dir>/hermes-results/<id>.result.md and `/complete`
+    # posted an empty {} -- so a verdict produced on one machine was
+    # unreadable from every other, and "produced nothing" was
+    # indistinguishable from "produced something unreachable".
+    result: Optional[str] = None
+    # #762 grouped intake: the lane's FULL brief (a bundle task's description
+    # carries every issue id + the sitting discipline; the title stays a
+    # one-line summary). Empty for legacy per-issue tasks.
+    description: str = ""
+    # #762 grouped intake: bundle membership as "<project/path>#<iid>" issue
+    # ids (empty for legacy tasks). Restart-safe: intake's DEDUP FIRST + the
+    # cardinality guard read live issues from the STORE, never from a
+    # process-local map alone.
+    issues: List[str] = Field(default_factory=list)
 
     model_config = {"populate_by_name": True}
 
@@ -500,6 +535,11 @@ class NodeConfig(BaseModel):
     id: str = "node_main"
     name: str = "main-node"
     capabilities: List[str] = []
+    # #892: floor (GB) of free disk on the volume holding HERMES_HOME / the
+    # lanes dir. Below it the worker refuses to claim AND the main marks the
+    # node degraded (excluded from scheduling) until it recovers. YAML only —
+    # owner ruling: never an env var. 0 disables the rule entirely.
+    min_free_disk_gb: float = 5.0
 
 
 class ServerConfig(BaseModel):
@@ -635,7 +675,15 @@ class TelemetryConfigJSON(BaseModel):
 
 
 class ConfigJSON(BaseModel):
-    """Go struct: api.configJSON — JSON API config representation."""
+    """Go struct: api.configJSON — JSON API config representation.
+
+    extra="allow" (hermes-factory-intake): unknown top-level sections — e.g.
+    the runtime ``intake.gitlab`` policy — must SURVIVE a PUT /api/v1/config
+    round-trip. With the default (drop-unknown), the dashboard's "save config"
+    would silently wipe any runtime section the Go-shaped model doesn't know.
+    """
+    model_config = {"extra": "allow"}
+
     cluster: ClusterConfigJSON = ClusterConfigJSON()
     node: NodeConfigJSON = NodeConfigJSON()
     server: ServerConfigJSON = ServerConfigJSON()
@@ -667,20 +715,26 @@ class NodeInfo(BaseModel):
 # 16. API requests/responses (internal/api/api.go)
 # ===========================================================================
 
+class HeartbeatRequest(BaseModel):
+    node_id: str
+    # #892: optional free-disk reading on the volume holding the worker's
+    # HERMES_HOME / lanes dir (GB). Absent (None) from an older worker's
+    # payload means "no disk info" — the main keeps its exact pre-#892
+    # heartbeat semantics (unconditionally online) for those.
+    disk_free_gb: Optional[float] = None
+
+
 class JoinRequest(BaseModel):
     node_name: str
     capabilities: List[str] = []
     endpoint: str = ""
     max_concurrent: int = 0  # 0 = unlimited; scheduler honours this ceiling
+    disk_free_gb: Optional[float] = None  # #892, same absent-means-unknown rule
 
 
 class JoinResponse(BaseModel):
     node_id: str
     status: str = "registered"
-
-
-class HeartbeatRequest(BaseModel):
-    node_id: str
 
 
 class UpdateCapabilitiesRequest(BaseModel):
@@ -690,9 +744,26 @@ class UpdateCapabilitiesRequest(BaseModel):
 class SubmitTaskRequest(BaseModel):
     title: str
     requires: List[str] = []
-    priority: int = 0  # 1=highest, 5=lowest, default 3
+    # Bands for the ascending scheduler sort (ORDER BY priority, created_at):
+    # 0=top band (most urgent), 1..5 documented bands, unset -> default 3.
+    # None is the not-supplied sentinel (#866): 0 used to double as it, so a
+    # caller sending 0 "to mean what the sort says" was silently rewritten
+    # to 3 — two bands in the wrong direction. Out-of-band values are
+    # rejected with a 422 here rather than coerced in the router: a loud
+    # failure beats a silent substitution.
+    priority: Optional[int] = Field(default=None, ge=0, le=5)
     lane_key: str = ""  # stateful lane identity (e.g. "shared/claude-plugins#feat/x")
     role: str = "author"  # "author" | "reviewer"
+
+
+class CompleteTaskRequest(BaseModel):
+    """Body for POST /tasks/{id}/complete (#874).
+
+    Optional so existing callers that post no body keep working; when present
+    the deliverable is persisted on the task row and becomes readable from any
+    node, not just the one that ran the lane.
+    """
+    result: Optional[str] = None
 
 
 class FailTaskRequest(BaseModel):
@@ -703,6 +774,12 @@ class FailTaskRequest(BaseModel):
     # nothing to say must say something ("no reason captured"), never
     # nothing.
     reason: str
+    # #870: set by a worker reporting a NON-DELIVERABLE result body (provider
+    # error / echoed brief — see agent_executor.deliverable_guard). Under
+    # main's retry cap the task goes back to ready (attempts bumped) instead
+    # of being consumed as failed; at/over the cap main falls back to the
+    # consuming failure. Never set by plain failure callers.
+    requeue: bool = False
 
 
 class CancelTaskRequest(BaseModel):

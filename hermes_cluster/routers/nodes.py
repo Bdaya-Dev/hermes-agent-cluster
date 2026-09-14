@@ -11,6 +11,10 @@ from ..models import (
     TaskStatus,
 )
 from ..state import ClusterState
+from ..core.disk_preflight import (
+    DEFAULT_MIN_FREE_DISK_GB,
+    disk_reason,
+)
 
 router = APIRouter(prefix="/api/v1/nodes", tags=["nodes"])
 
@@ -33,6 +37,7 @@ async def join(req: JoinRequest):
             name=req.node_name,
             capabilities=req.capabilities,
             max_concurrent=req.max_concurrent,
+            disk_free_gb=req.disk_free_gb,
         )
     else:
         # Fallback to direct state
@@ -42,6 +47,7 @@ async def join(req: JoinRequest):
             name=req.node_name,
             capabilities=req.capabilities,
             max_concurrent=req.max_concurrent,
+            disk_free_gb=req.disk_free_gb,
         )
         _state.register_node(node)
     return JoinResponse(node_id=node.id, status="registered")
@@ -50,10 +56,22 @@ async def join(req: JoinRequest):
 @router.post("/heartbeat")
 async def heartbeat(req: HeartbeatRequest):
     if _node_manager:
-        _node_manager.send_heartbeat(req.node_id)
+        _node_manager.send_heartbeat(req.node_id, disk_free_gb=req.disk_free_gb)
     else:
-        _state.update_heartbeat(req.node_id)
+        reason = disk_reason(req.disk_free_gb, _min_free_disk_gb())
+        _state.update_heartbeat(req.node_id, disk_free_gb=req.disk_free_gb,
+                                status_reason=reason)
     return {"status": "ok"}
+
+
+def _min_free_disk_gb() -> float:
+    """The floor the fallback (no-node-manager) heartbeat path consults:
+    the NodeManager's configured value when present, otherwise the #892
+    default (5.0 GB) — same resolution rule as everywhere else."""
+    if _node_manager is not None:
+        return float(getattr(_node_manager, "_min_free_disk_gb",
+                             DEFAULT_MIN_FREE_DISK_GB))
+    return DEFAULT_MIN_FREE_DISK_GB
 
 
 @router.get("")
