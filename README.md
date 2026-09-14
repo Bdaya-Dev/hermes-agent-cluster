@@ -241,6 +241,31 @@ the fork itself on `main`) to match each client repo's integration branch;
 survives: business-team issues get their own queued bundle instantly.
 Disabling grouping restores the per-issue wiring byte-for-byte.
 
+### 💳 Alibaba Token Plan metering (`/api/v1/metering/alibaba`)
+
+The main node can poll the ModelStudio OpenAPI (ROA, host
+`modelstudio.ap-southeast-1.aliyuncs.com`, API version `2026-02-10`,
+ACS3-HMAC-SHA256 V3 signature re-derived from the official spec) for the
+Token Plan seats' per-cycle credits. Configuration is the cluster YAML
+`metering` section (defaults: `enabled: false`, `interval_s: 900`,
+`alert_below: 25000`, `fail_threshold: 3`) seeded once into the runtime
+store — afterwards PUT `/api/v1/config` is authoritative, no redeploy.
+The read-only RAM user's AK/SK are fetched from GCP Secret Manager
+(`bdaya-website/alibaba-ram-metering-access-key-id` + `…-secret`) via
+Workload Identity — never env vars, never printed.
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `GET` | `/metering/alibaba` | Last sample: per-seat total/surplus/cycle_end, fetched_at, last_error, alert state |
+| `POST` | `/metering/alibaba/poll` | Force one cycle now (operator path, mirrors intake poll) |
+
+Alerts ride the EXISTING webhook fan-out (`/api/v1/hooks`): a TASK_FAILED
+event with `payload.data.source = "metering"` — the Telegram bot registers
+a hook like any third party. `kanban_cluster_status` embeds the same
+summary so any lane can answer "how many credits are left".
+Tests: `tests_v3/test_metering_alibaba.py` (official-spec signer vector,
+recorded-and-scrubbed live fixtures, alert suppression, seed semantics).
+
 ### 📡 API Reference
 
 All endpoints prefixed: `/api/v1`

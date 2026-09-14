@@ -35,6 +35,7 @@ from .routers import (
     setup_router,
     cluster_router,
     intake_router,
+    metering_router,
 )
 from .routers import nodes as nodes_mod
 from .routers import tasks as tasks_mod
@@ -51,6 +52,7 @@ from .routers import visualization as visualization_mod
 from .routers import setup as setup_mod
 from .routers import cluster as cluster_mod
 from .routers import intake as intake_mod
+from .routers import metering as metering_mod
 import logging
 logger = logging.getLogger(__name__)
 
@@ -290,6 +292,28 @@ def create_app(
     cluster_mod.init(state)
     intake_mod.init(state)
 
+    # --- Alibaba Token Plan metering poller (main-side, same process as the
+    # intake poller). Gated: the thread only exists while metering.enabled is
+    # true in the runtime store (boot seed or a runtime PUT — the intake
+    # poller is gated the same way on its token env). A default-off node
+    # starts NO thread, no network, no SM read (and keeps test/CI processes
+    # clean — CI run 34828677799 exited 139 with an always-on idle daemon).
+    _metering_poller = None
+    if node_role == "main":
+        from .core.metering import MeteringPoller, _seed_metering_from_config_file
+        _seed_metering_from_config_file(state)
+        _metering_poller = MeteringPoller(state=state, hook_manager=hook_manager)
+        state._metering_poller = _metering_poller
+        if _metering_poller.ensure_started():
+            logger.info("Alibaba metering poller started "
+                        "(metering.enabled: true in runtime config)")
+    metering_mod.set_poller(_metering_poller)
+    # Turning metering on/off at runtime: PUT /api/v1/config carries the
+    # `metering` section (ConfigJSON extra=allow) -> post-save hook arms or
+    # disarms the loop without a redeploy.
+    config_mod.set_post_save_callback(
+        (lambda: _metering_poller.ensure_started()) if _metering_poller else None)
+
     # Register routers
     app.include_router(nodes_router)
     app.include_router(tasks_router)
@@ -306,6 +330,7 @@ def create_app(
     app.include_router(setup_router)
     app.include_router(cluster_router)
     app.include_router(intake_router)
+    app.include_router(metering_router)
 
     # Health endpoint (outside /api/v1)
     @app.get("/health")

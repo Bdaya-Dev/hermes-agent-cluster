@@ -1,0 +1,56 @@
+{
+  "Data": {
+    "Items": [
+      {
+        "AccountEmail": "",
+        "AccountId": "acc_0b7684c0b7cd11af52c6af5d",
+        "AccountName": "fixture-seat-1@example.invalid",
+        "AssignedStatus": "ASSIGNED",
+        "EndTime": 1791450000000,
+        "EquityList": [
+          {
+            "CycleEndTime": 1791450000000,
+            "CycleInstanceId": "11315028",
+            "CycleStartTime": 1789290000000,
+            "CycleSurplusValue": 191307.22449352,
+            "CycleTotalValue": 208334.0,
+            "CycleVersion": 4279,
+            "EquityType": "CREDITS"
+          }
+        ],
+        "InstanceCode": "subs-86987f43165cfba4a0724f26",
+        "SeatId": "seat_25c216d82b5ff4db766cf58b",
+        "SpecType": "max",
+        "StartTime": 1789290000000,
+        "Status": "NORMAL"
+      },
+      {
+        "AccountEmail": "",
+        "AccountId": "acc_9c13fe786bdfd6d813ec0d26",
+        "AccountName": "fixture-seat-2@example.invalid",
+        "AssignedStatus": "ASSIGNED",
+        "EndTime": 1791450000000,
+        "EquityList": [
+          {
+            "CycleEndTime": 1791450000000,
+            "CycleInstanceId": "11264001",
+            "CycleStartTime": 1788858000000,
+            "CycleSurplusValue": 0.0,
+            "CycleTotalValue": 250000.0,
+            "CycleVersion": 36366,
+            "EquityType": "CREDITS"
+          }
+        ],
+        "InstanceCode": "subs-fb0e76875727234fbe408c44",
+        "SeatId": "seat_cbb94cdcde7ee24d3ad5078b",
+        "SpecType": "max",
+        "StartTime": 1788858000000,
+        "Status": "NORMAL"
+      }
+    ],
+    "PageNo": 1,
+    "PageSize": 10,
+    "Total": 2
+  },
+  "Success": true
+}

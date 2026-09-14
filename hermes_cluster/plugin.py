@@ -460,8 +460,25 @@ def handle_cluster_complete(args: dict, **kwargs) -> str:
 
 
 def handle_cluster_status(args: dict, **kwargs) -> str:
-    """Get cluster status."""
+    """Get cluster status.
+
+    Includes the Alibaba Token Plan metering summary (per-seat credits,
+    surplus, cycle end) so a lane or the Telegram bot can answer "how many
+    credits are left" from one call. Best-effort: an older main without
+    /api/v1/metering/alibaba, or a metering-disabled main, never breaks the
+    status surface — the key is simply absent or carries the error.
+    """
     result = _api_call("GET", "/api/v1/summary")
+    metering = _api_call("GET", "/api/v1/metering/alibaba")
+    if isinstance(metering, dict) and "error" not in metering:
+        # Trim to the answer lanes need: seats + totals + freshness, not the
+        # full last_errors instrument map.
+        result["metering"] = {
+            k: metering.get(k)
+            for k in ("enabled", "credits_available", "credits_remaining_total",
+                      "alert_below", "seats", "fetched_at", "last_error",
+                      "alert_active")
+        }
     return json.dumps(result, indent=2)
 
 
@@ -562,7 +579,10 @@ SCHEMAS = {
     },
     "kanban_cluster_status": {
         "name": "kanban_cluster_status",
-        "description": "Get cluster status summary.",
+        "description": ("Get cluster status summary, including the Alibaba "
+                        "Token Plan metering block (per-seat credits "
+                        "total/surplus/cycle_end + alert state) when the main "
+                        "exposes it — answers 'how many credits are left'."),
         "parameters": {"type": "object", "properties": {}},
     },
     "kanban_cluster_config": {

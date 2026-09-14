@@ -11,6 +11,7 @@ Endpoints:
 from __future__ import annotations
 
 import copy
+import logging
 import os
 import signal
 import sys
@@ -30,6 +31,15 @@ router = APIRouter(prefix="/api/v1/config", tags=["config"])
 _store = None  # ClusterStore or ClusterState
 _config_path: str = ""
 _restart_callback = None  # Optional callable invoked on restart request
+# Optional callable invoked AFTER a successful config save (same lifecycle
+# hook shape as restart): the metering poller uses it to arm/disarm without
+# a redeploy (PUT config -> ensure_started reads metering.enabled).
+_post_save_callback = None
+
+
+def set_post_save_callback(callback) -> None:
+    global _post_save_callback
+    _post_save_callback = callback
 
 
 def init(store, config_path: str = "", restart_callback=None):
@@ -163,6 +173,14 @@ async def update_config(cfg: ConfigJSON):
                 status_code=500,
                 detail=f"failed to save config to {path}: {e}",
             )
+
+    # Lifecycle hook after a successful save (metering arm/disarm without a
+    # redeploy). Best-effort: a poller failure must never mask a saved config.
+    if _post_save_callback:
+        try:
+            _post_save_callback()
+        except Exception:
+            logging.getLogger(__name__).exception("post-save config callback failed")
 
     return {"status": "saved", "config": config_dict}
 
