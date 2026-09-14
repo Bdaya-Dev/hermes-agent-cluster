@@ -63,6 +63,7 @@ def create_app(
     fed_token: str = "",
     cluster_endpoint: str = "",
     node_capabilities: Optional[list] = None,
+    node_capability_probes: Optional[dict] = None,
     agent_executor_config: Optional[dict] = None,
     static_dir: Optional[str] = None,
     db_path: str = "",
@@ -206,6 +207,7 @@ def create_app(
             capabilities=node_capabilities or [],
             peer_token=fed_token,
             max_concurrent=_worker_max_concurrent,
+            capability_probes=node_capability_probes or None,
         )
 
     # Agent executor: when role=worker and agent_executor is configured+enabled,

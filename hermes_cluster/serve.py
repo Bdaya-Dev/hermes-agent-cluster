@@ -40,6 +40,7 @@ def main():
             if "node" in cfg:
                 args.node_id = cfg["node"].get("id", args.node_id)
                 args.node_capabilities = cfg["node"].get("capabilities", [])
+                args.node_capability_probes = cfg["node"].get("capability_probes", {})
             if "server" in cfg:
                 args.port = cfg["server"].get("port", args.port)
                 args.host = cfg["server"].get("bind", args.host)
@@ -87,6 +88,7 @@ def main():
         fed_token=args.fed_token,
         cluster_endpoint=args.cluster_endpoint,
         node_capabilities=getattr(args, "node_capabilities", []),
+        node_capability_probes=getattr(args, "node_capability_probes", {}) or None,
         agent_executor_config=getattr(args, "agent_executor_config", None),
         static_dir=static_dir if static_dir else None,
         db_path=getattr(args, "db_path", "") or "",

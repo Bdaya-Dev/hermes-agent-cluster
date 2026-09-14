@@ -25,6 +25,7 @@ import hashlib
 import hmac
 import json
 import logging
+import subprocess
 import threading
 import time
 from pathlib import Path
@@ -99,6 +100,34 @@ _connector_started = False
 _connector_lock = threading.Lock()
 
 
+def run_probe(name: str, spec: dict) -> bool:
+    """Execute one capability probe command; True iff it exits 0 (#867)."""
+    cmd = spec.get("command") or []
+    if not cmd:
+        return False
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True,
+                              timeout=int(spec.get("timeout_s", 120)))
+        ok = proc.returncode == 0
+        if not ok:
+            logger.warning("capability probe %s failed (rc=%d): %s",
+                           name, proc.returncode, (proc.stdout or "").strip()[-160:])
+        return ok
+    except Exception as e:
+        logger.warning("capability probe %s errored: %s", name, e)
+        return False
+
+
+def declared_capabilities(static_caps: List[str], probes: Dict[str, dict],
+                          states: Dict[str, bool]) -> List[str]:
+    """Static caps + only the probed caps currently passing. A capability
+    named by BOTH config and a probe is treated as probe-gated (#867): the
+    node declares it only while its probe succeeds."""
+    gated = set(probes.keys())
+    return sorted({c for c in static_caps if c not in gated}
+                  | {c for c, ok in states.items() if ok})
+
+
 def start_worker_connector(
     node_id: str,
     cluster_endpoint: str,
@@ -106,6 +135,7 @@ def start_worker_connector(
     peer_token: str = "",
     heartbeat_interval: float = 10.0,
     max_concurrent: int = 0,
+    capability_probes: Optional[Dict[str, dict]] = None,
 ) -> None:
     """Start the outbound worker connector thread.
 
@@ -121,6 +151,14 @@ def start_worker_connector(
         max_concurrent: maximum simultaneously-assigned tasks this worker can
             run; declared at /join so the main scheduler honours the ceiling
             when assigning tasks (#833). 0 = unlimited.
+        capability_probes: optional {capability: {"command": [...],
+            "interval_s": int}} — a capability is DECLARED ONLY while its probe
+            command exits 0 (#867). Proves per-node reachability mechanically
+            (e.g. the bdaya-lane-agent App key is provisioned here and can
+            mint), so a task `requires: [github-write]` can never be dispatched
+            to a node whose credential is missing — the #867 silent mid-lane
+            failure becomes a loud dispatch-time miss. Re-run on
+            interval_s (default 300); a capability lost mid-run is PATCHed off.
     """
     global _connector_started
     with _connector_lock:
@@ -136,7 +174,16 @@ def start_worker_connector(
             "will be unsigned and likely rejected by main's auth middleware"
         )
 
-    # Strip trailing slash from endpoint
+    # --- #867 capability probes ------------------------------------------------
+    probes = capability_probes or {}
+
+    def _probe_states() -> Dict[str, bool]:
+        return {name: run_probe(name, spec) for name, spec in probes.items()}
+
+    def _declared_caps(states: Dict[str, bool]) -> List[str]:
+        return declared_capabilities(capabilities, probes, states)
+
+    # strip trailing slash from endpoint
     cluster_endpoint = cluster_endpoint.rstrip("/")
 
     def _loop():
@@ -148,6 +195,10 @@ def start_worker_connector(
         # Join + heartbeat loop. Join is retried on every cycle until the
         # main accepts it (returns node_id). This handles boot-order races
         # (worker starts before main).
+        probe_states = _probe_states() if probes else {}
+        declared = _declared_caps(probe_states)
+        last_probe_at = time.time()
+        probe_interval = min([int(s.get("interval_s", 300)) for s in probes.values()] or [300])
         #
         # NOTE: Post-registration main restarts are NOT handled. The main's
         # ClusterState is in-memory; after a restart, the worker's heartbeat
@@ -159,11 +210,32 @@ def start_worker_connector(
         registered_id = None
 
         while True:
+            # Re-probe on its own cadence (#867); push a capability change.
+            if probes and time.time() - last_probe_at >= probe_interval:
+                last_probe_at = time.time()
+                new_states = _probe_states()
+                new_declared = _declared_caps(new_states)
+                if new_declared != declared and registered_id is not None:
+                    path = f"/api/v1/nodes/{registered_id}/capabilities"
+                    body = json.dumps({"capabilities": new_declared}).encode()
+                    req = Request(f"{cluster_endpoint}{path}", data=body, method="PATCH")
+                    req.add_header("Content-Type", "application/json")
+                    for k, v in _sign_request(token, node_id, "PATCH", path, body).items():
+                        req.add_header(k, v)
+                    try:
+                        with urlopen(req, timeout=10) as resp:
+                            json.loads(resp.read().decode())
+                        logger.info("capabilities updated: %s", new_declared)
+                        declared = new_declared
+                        probe_states = new_states
+                    except Exception as e:
+                        logger.warning("capabilities PATCH failed: %s", e)
+
             # Try join if not yet registered
             if registered_id is None:
                 join_data = {
                     "node_name": node_id,
-                    "capabilities": capabilities,
+                    "capabilities": declared,
                     "endpoint": f"http://{node_id}:0",
                     "max_concurrent": max_concurrent,
                 }

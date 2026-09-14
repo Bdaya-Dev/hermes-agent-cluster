@@ -10,6 +10,16 @@ node:
   capabilities:
     - tooling
     - planning
+  # #867: probe-gated capability — declared ONLY while this node can mint a
+  # bdaya-lane-agent App installation token (key hydrated to
+  # ~/.config/bdaya/lane-agent-app.pem via lane_gh_token.py hydrate-key).
+  # A task `requires: [github-write]` will not dispatch here until the probe
+  # exits 0, so a missing credential is loud at dispatch, not silent mid-lane.
+  capability_probes:
+    github-write:
+      command: ["C:/Users/ahmed/hermes-cluster/.venv/Scripts/python.exe",
+                "C:/Users/ahmed/hermes-cluster/scripts/gh-write-doctor.py", "--no-post"]
+      interval_s: 300
 
 server:
   bind: "0.0.0.0"
