@@ -1,6 +1,6 @@
 name: hermes-agent-cluster
-version: 3.2.0
-description: "Distributed Kanban cluster extension — multi-node task coordination via Python FastAPI server. #893: the Hermes plugin resolves the cluster-main endpoint from cluster config (remote-capable), so a worker lane can dispatch its own reviewer."
+version: 3.3.0
+description: "Distributed Kanban cluster extension — multi-node task coordination via Python FastAPI server. #893: this directory is a THIN SHIM re-exporting hermes_cluster.plugin (one implementation; PR#42's config-resolved remote endpoint actually reaches worker sessions), with provides_tools/provides_hooks mirroring register() exactly."
 author: "Heventure Group"
 provides_tools:
   - kanban_cluster_init
