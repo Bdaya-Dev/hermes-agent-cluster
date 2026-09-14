@@ -833,6 +833,10 @@ async def status():
         "issues_seen": _poller.issues_seen,
         "tasks_created": _poller.tasks_created,
         "last_errors": dict(_poller.last_errors),
+        # #903: last_errors is now the LAST CYCLE's view; the two new fields
+        # make that contract explicit and keep the accumulated trail visible.
+        "last_poll_ok": bool(_poller.last_poll_ok and not _poller.last_errors),
+        "error_history": list(_poller.error_history),
     }
 
 
@@ -899,6 +903,9 @@ def _create_task_from_issue(
 # Background poller
 # ---------------------------------------------------------------------------
 
+_ERROR_HISTORY_MAX = 50  # #903 bounded accumulated error trail
+
+
 class _GitLabPoller:
     """Background thread running one intake cycle per interval.
 
@@ -919,7 +926,21 @@ class _GitLabPoller:
         self.last_poll: Optional[datetime] = None
         self.issues_seen = 0
         self.tasks_created = 0
+        # #903: last_errors is the LAST CYCLE's errors, not a lifetime
+        # accumulator. Before the fix, `self.last_errors[key] = ...` never
+        # cleared, so a scope 404 fixed hours ago kept screaming in status —
+        # both the lead and a landing lane misread the stale entries as live
+        # failures. The cycle now builds `cycle_errors` and swaps it in at
+        # every return path (last_errors is a view onto the last completed
+        # cycle). error_history keeps the accumulated view, bounded.
         self.last_errors: Dict[str, Any] = {}
+        self.last_poll_ok: bool = False
+        self.error_history: List[Dict[str, Any]] = []
+        # #903 vs #43's repeat-count contract: count = HOW MANY CONSECUTIVE
+        # CYCLES a stage has been alarming, carried in a separate dict so the
+        # per-cycle status view can reset while the count survives (and a
+        # recovered stage's count resets too, in _run's success path).
+        self._error_counts: Dict[str, int] = {}
         self._seen_keys: set = set()
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
@@ -933,14 +954,35 @@ class _GitLabPoller:
         able to scream): the 097d7ea7 pod raised every 60s while status said
         ``last_errors:{}``. Records type, message, failing stage, ISO
         timestamp, and a per-stage repeat count."""
-        prev = self.last_errors.get(stage)
-        count = (prev.get("count", 0) + 1) if isinstance(prev, dict) else 1
-        self.last_errors[stage] = {
+        count = self._error_counts.get(stage, 0) + 1
+        self._error_counts[stage] = count
+        entry = {
             "type": type(exc).__name__,
             "message": str(exc)[:500],
             "count": count,
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
+        self.last_errors[stage] = entry
+        self._alarm_history(stage, entry)
+
+    def _alarm_history(self, stage: str, entry: Dict[str, Any]) -> None:
+        """Bounded accumulated view (#903): the cycle-clearing of
+        last_errors must not LOSE the alarm trail — history is append-only,
+        capped, and surfaced separately in status."""
+        self.error_history.append({
+            "stage": stage,
+            "type": entry.get("type"),
+            "message": (entry.get("message") or "")[:200],
+            "timestamp": entry.get("timestamp"),
+        })
+        if len(self.error_history) > _ERROR_HISTORY_MAX:
+            del self.error_history[:-_ERROR_HISTORY_MAX]
+
+    def _note_scope_error(self, base: str, detail: str) -> None:
+        """Per-cycle scope error: written into last_errors AND history."""
+        self.last_errors[base] = detail
+        self._alarm_history(base, {"message": detail,
+                                   "timestamp": datetime.now(timezone.utc).isoformat()})
 
     def start(self):
         self._thread = threading.Thread(target=self._run, daemon=True, name="gitlab-intake-poller")
@@ -958,6 +1000,7 @@ class _GitLabPoller:
                 interval = cycle.get("interval_seconds", self.interval)
                 loop.close()
                 self.last_errors.pop("poll_cycle", None)
+                self._error_counts.pop("poll_cycle", None)
             except Exception as e:
                 self._record_error("poll_cycle", e)
                 logger.exception("GitLab intake poll cycle failed")
@@ -1273,8 +1316,17 @@ class _GitLabPoller:
                              default_interval=defaults["interval"])
         result: Dict[str, Any] = {"created": [], "interval_seconds": policy.interval_seconds}
 
+        # #903: the accumulator was the bug. last_errors is REBUILT every
+        # cycle — an entry that no failing scope wrote THIS cycle cannot
+        # survive into status. Repeat-COUNTS live in _error_counts so #43's
+        # "count tracks repeat cycles" contract holds while the view resets.
+        # The crash-into-_run path still records afterwards, so the
+        # instrument's scream is preserved for one cycle.
+        self.last_errors = {}
+
         if policy.enabled is False:
             self.last_poll = datetime.now(timezone.utc)
+            self.last_poll_ok = not self.last_errors
             return result
 
         # load_policy() has already allowlist-sanitized this: a foreign host
@@ -1290,7 +1342,10 @@ class _GitLabPoller:
             logger.error("intake: refusing cycle — endpoint %r is outside the "
                          "allowlist; GITLAB_INTAKE_TOKEN was NOT sent", endpoint)
             self.last_errors["endpoint"] = "endpoint outside allowlist; cycle refused"
+            self._alarm_history("endpoint", {"message": self.last_errors["endpoint"],
+                                             "timestamp": datetime.now(timezone.utc).isoformat()})
             self.last_poll = datetime.now(timezone.utc)
+            self.last_poll_ok = not self.last_errors
             return result
         # (fetch base path, label, project path, scope) tuples to walk.
         work: List[Tuple[str, str, str, Optional[IntakeScope]]] = []
@@ -1318,11 +1373,11 @@ class _GitLabPoller:
                     try:
                         issues = await self._fetch_issues(client, base, endpoint, label)
                     except httpx.HTTPStatusError as e:
-                        self.last_errors[base] = f"HTTP {e.response.status_code}"
+                        self._note_scope_error(base, f"HTTP {e.response.status_code}")
                         logger.error("intake: scope %s failed: HTTP %s", base, e.response.status_code)
                         continue
                     except httpx.RequestError as e:
-                        self.last_errors[base] = str(e)
+                        self._note_scope_error(base, str(e))
                         logger.error("intake: scope %s failed: %s", base, e)
                         continue
                     self.last_errors.pop(base, None)
@@ -1331,6 +1386,7 @@ class _GitLabPoller:
                     await self._grouped_cycle(client, endpoint, policy, scoped,
                                               created_ids)
                     self.last_errors.pop("grouped_cycle", None)
+                    self._error_counts.pop("grouped_cycle", None)
                 except Exception as e:
                     # THE INSTRUMENT MUST SCREAM: a raising grouped cycle
                     # used to vanish into _run's blanket except while status
@@ -1338,6 +1394,7 @@ class _GitLabPoller:
                     self._record_error("grouped_cycle", e)
                     logger.exception("intake: grouped cycle failed")
                 self.last_poll = datetime.now(timezone.utc)
+                self.last_poll_ok = not self.last_errors
                 result["created"] = created_ids
                 return result
 
@@ -1346,11 +1403,11 @@ class _GitLabPoller:
                     issues = await self._fetch_issues(client, base, endpoint, label)
                 except httpx.HTTPStatusError as e:
                     # A broken scope must not starve the others.
-                    self.last_errors[base] = f"HTTP {e.response.status_code}"
+                    self._note_scope_error(base, f"HTTP {e.response.status_code}")
                     logger.error("intake: scope %s failed: HTTP %s", base, e.response.status_code)
                     continue
                 except httpx.RequestError as e:
-                    self.last_errors[base] = str(e)
+                    self._note_scope_error(base, str(e))
                     logger.error("intake: scope %s failed: %s", base, e)
                     continue
                 self.last_errors.pop(base, None)
@@ -1403,5 +1460,6 @@ class _GitLabPoller:
                         created_ids.append(task.id)
 
         self.last_poll = datetime.now(timezone.utc)
+        self.last_poll_ok = not self.last_errors
         result["created"] = created_ids
         return result
