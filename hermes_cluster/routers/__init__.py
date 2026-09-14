@@ -16,6 +16,7 @@ from .setup import router as setup_router
 
 from .cluster import router as cluster_router
 from .intake import router as intake_router
+from .metering import router as metering_router
 
 __all__ = [
     "nodes_router",

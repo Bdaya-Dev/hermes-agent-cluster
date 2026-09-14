@@ -35,6 +35,7 @@ from .routers import (
     setup_router,
     cluster_router,
     intake_router,
+    metering_router,
 )
 from .routers import nodes as nodes_mod
 from .routers import tasks as tasks_mod
@@ -51,6 +52,7 @@ from .routers import visualization as visualization_mod
 from .routers import setup as setup_mod
 from .routers import cluster as cluster_mod
 from .routers import intake as intake_mod
+from .routers import metering as metering_mod
 import logging
 logger = logging.getLogger(__name__)
 
@@ -282,6 +284,23 @@ def create_app(
     cluster_mod.init(state)
     intake_mod.init(state)
 
+    # --- Alibaba Token Plan metering poller (main-side, same process as the
+    # intake poller). The thread runs only on role=main; the `metering`
+    # section — enabled/interval/alert_below — is re-read EVERY cycle from
+    # the runtime store (YAML file seeds an empty store once, the intake
+    # precedent), so enabling/disabling needs no redeploy. With the section
+    # absent the cycle is a cheap no-op (default enabled: false).
+    _metering_poller = None
+    if node_role == "main":
+        from .core.metering import MeteringPoller, _seed_metering_from_config_file
+        _seed_metering_from_config_file(state)
+        _metering_poller = MeteringPoller(state=state, hook_manager=hook_manager)
+        _metering_poller.start()
+        state._metering_poller = _metering_poller
+        logger.info("Alibaba metering poller thread started "
+                    "(armed per-cycle by metering.enabled in runtime config)")
+    metering_mod.set_poller(_metering_poller)
+
     # Register routers
     app.include_router(nodes_router)
     app.include_router(tasks_router)
@@ -298,6 +317,7 @@ def create_app(
     app.include_router(setup_router)
     app.include_router(cluster_router)
     app.include_router(intake_router)
+    app.include_router(metering_router)
 
     # Health endpoint (outside /api/v1)
     @app.get("/health")

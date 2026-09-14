@@ -49,3 +49,17 @@ federation:
 #     dsn_env: HERMES_CLUSTER_PG_DSN   # env var holding the asyncpg DSN
 # One-shot migration from an existing SQLite cluster.db:
 #   python -m hermes_cluster.tools.import_sqlite --db path/to/cluster.db
+
+# Alibaba Token Plan metering (main node). This file seeds an EMPTY runtime
+# store once (intake precedent); afterwards the runtime config is
+# authoritative and changes go through PUT /api/v1/config without a redeploy.
+# The AK/SK are NEVER here and NEVER in env vars — the poller reads
+# bdaya-website/alibaba-ram-metering-access-key-id(+secret) from GCP Secret
+# Manager at startup via Workload Identity. Credentials/endpoint host may be
+# overridden here only for non-default deployments.
+metering:
+  enabled: false        # arm the poller (fetch every interval_s, alert)
+  interval_s: 900       # poll cadence (seconds)
+  alert_below: 25000    # total surplus credits -> hook alert (TASK_FAILED,
+                        # payload source="metering" -> Telegram bot)
+  fail_threshold: 3     # consecutive fetch failures before an alert
