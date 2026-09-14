@@ -81,6 +81,32 @@ def main():
         if go_dashboard.exists():
             static_dir = str(go_dashboard)
 
+    # #899: worker role = single-instance lock per node id, taken BEFORE
+    # anything binds or starts polling. Measured 2026-09-14: a :loop wrapper
+    # relaunch + a scheduled-task start produced two workers under one node
+    # id and every lane ran twice. The second instance exits non-zero (code
+    # 3) with a message naming the live twin; the wrapper backs off like any
+    # crash. Main role is exempt (hosted main is single-replica by k8s).
+    if args.node_role == "worker":
+        from .instance_lock import guard_singleton_or_exit
+        _lock_dir = ""
+        if config_path and Path(config_path).exists():
+            try:
+                import yaml
+                with open(config_path) as f:
+                    _cfg = yaml.safe_load(f) or {}
+                _lock_dir = str((_cfg.get("agent_executor") or {}).get(
+                    "lock_dir", "") or "")
+            except Exception:
+                _lock_dir = ""
+        guard_singleton_or_exit(
+            args.node_id, data_dir=_lock_dir or None)
+        # A graceful exit releases the lock; a hard kill leaves a stale file
+        # whose dead-pid holder acquire() steals on the next start.
+        import atexit
+        from . import instance_lock as _il
+        atexit.register(lambda: _il._HELD and _il._HELD.release())
+
     # Create and run app
     from .app import create_app
 

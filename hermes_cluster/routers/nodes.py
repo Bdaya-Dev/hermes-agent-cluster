@@ -38,29 +38,50 @@ async def join(req: JoinRequest):
             capabilities=req.capabilities,
             max_concurrent=req.max_concurrent,
             disk_free_gb=req.disk_free_gb,
+            instance_id=req.instance_id,
         )
     else:
         # Fallback to direct state
         node_id = "node_" + req.node_name
-        node = Node(
-            id=node_id,
-            name=req.node_name,
-            capabilities=req.capabilities,
-            max_concurrent=req.max_concurrent,
-            disk_free_gb=req.disk_free_gb,
-        )
-        _state.register_node(node)
+        existing = _state.get_node(node_id)
+        if existing is not None:
+            if req.instance_id \
+                    and getattr(existing, "instance_id", "") != req.instance_id:
+                # #899 re-join replaces the owning instance (same rule as the
+                # NodeManager branch).
+                _state.update_instance(node_id, req.instance_id)
+            node = existing
+        else:
+            node = Node(
+                id=node_id,
+                name=req.node_name,
+                capabilities=req.capabilities,
+                max_concurrent=req.max_concurrent,
+                disk_free_gb=req.disk_free_gb,
+                instance_id=req.instance_id,
+            )
+            _state.register_node(node)
     return JoinResponse(node_id=node.id, status="registered")
 
 
 @router.post("/heartbeat")
 async def heartbeat(req: HeartbeatRequest):
     if _node_manager:
-        _node_manager.send_heartbeat(req.node_id, disk_free_gb=req.disk_free_gb)
-    else:
-        reason = disk_reason(req.disk_free_gb, _min_free_disk_gb())
-        _state.update_heartbeat(req.node_id, disk_free_gb=req.disk_free_gb,
-                                status_reason=reason)
+        accepted = _node_manager.send_heartbeat(
+            req.node_id, disk_free_gb=req.disk_free_gb,
+            instance_id=req.instance_id or None,
+        )
+        # #899: answer "replaced" (still 200 — the answer is in the status
+        # field, matching the older-worker contract that only reads .status)
+        # so the stale twin's connector can stop itself.
+        return {"status": "ok" if accepted else "replaced"}
+    node = _state.get_node(req.node_id)
+    stored = getattr(node, "instance_id", "") if node else ""
+    if stored and req.instance_id and req.instance_id != stored:
+        return {"status": "replaced"}
+    reason = disk_reason(req.disk_free_gb, _min_free_disk_gb())
+    _state.update_heartbeat(req.node_id, disk_free_gb=req.disk_free_gb,
+                            status_reason=reason)
     return {"status": "ok"}
 
 

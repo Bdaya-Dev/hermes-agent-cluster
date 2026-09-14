@@ -114,6 +114,15 @@ class Node(BaseModel):
     # staleness reason, or the disk-floor reason ("disk below floor...").
     # Surfaced by GET /api/v1/nodes so the lead sees WHY without log-diving.
     status_reason: str = ""
+    # #899: token identifying the PROCESS instance that last joined this
+    # node id (per-process random uuid). Two executors sharing one node id —
+    # the windows_desktop_worker incident (:loop wrapper relaunched +
+    # scheduled task started a second) — became invisible to the main. With
+    # this set: a re-join force-replaces the token, and a heartbeat from a
+    # NON-current token is refused with status "replaced". "" = an older
+    # worker that never sent one; the replace/refuse rules only bite once a
+    # token is known.
+    instance_id: str = ""
 
 
 # ===========================================================================
@@ -722,6 +731,9 @@ class HeartbeatRequest(BaseModel):
     # payload means "no disk info" — the main keeps its exact pre-#892
     # heartbeat semantics (unconditionally online) for those.
     disk_free_gb: Optional[float] = None
+    # #899: the worker's per-process instance token (absent/"" = older
+    # worker — never refused on the instance rule).
+    instance_id: str = ""
 
 
 class JoinRequest(BaseModel):
@@ -730,6 +742,7 @@ class JoinRequest(BaseModel):
     endpoint: str = ""
     max_concurrent: int = 0  # 0 = unlimited; scheduler honours this ceiling
     disk_free_gb: Optional[float] = None  # #892, same absent-means-unknown rule
+    instance_id: str = ""  # #899: per-process token; a join force-replaces it
 
 
 class JoinResponse(BaseModel):

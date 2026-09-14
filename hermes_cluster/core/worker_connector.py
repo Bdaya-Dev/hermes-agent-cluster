@@ -25,9 +25,11 @@ import hashlib
 import hmac
 import json
 import logging
+import os
 import subprocess
 import threading
 import time
+import uuid
 from pathlib import Path
 from typing import Dict, List, Optional
 from urllib.request import Request, urlopen
@@ -36,6 +38,25 @@ from urllib.error import URLError
 from .disk_preflight import disk_free_gb
 
 logger = logging.getLogger(__name__)
+
+# #899: the process instance token for THIS worker serve. One per process
+# (module import == process start for serve; uvicorn is single-process),
+# stamped on every join/heartbeat so the main can tell a live executor from
+# a zombie twin sharing the node id, and answered "replaced" when this
+# process is no longer the owner. Exit code 4: distinct from a clean exit (0)
+# and the generic crash (1), so the :loop wrapper's log names the cause.
+INSTANCE_ID = uuid.uuid4().hex
+INSTANCE_REPLACED_EXIT = 4
+
+
+def _replaced_exit_code(hb_response) -> Optional[int]:
+    """Pure decision: non-zero exit code when main says this instance was
+    REPLACED, None to keep running. An older main answers {"status":"ok"} or
+    nothing decodable — never fatal; a transport failure (None) is a retry,
+    not a replacement."""
+    if isinstance(hb_response, dict) and hb_response.get("status") == "replaced":
+        return INSTANCE_REPLACED_EXIT
+    return None
 
 
 def _resolve_peer_token(explicit: str = "") -> str:
@@ -261,6 +282,8 @@ def start_worker_connector(
                     "capabilities": declared,
                     "endpoint": f"http://{node_id}:0",
                     "max_concurrent": max_concurrent,
+                    # #899: stamp the owning process instance on the join.
+                    "instance_id": INSTANCE_ID,
                 }
                 # #892: report free disk at join too (omit when unreadable —
                 # an absent field is the older-worker contract the main honours).
@@ -284,7 +307,10 @@ def start_worker_connector(
 
             # Send heartbeat if registered
             if registered_id is not None:
-                hb_data = {"node_id": registered_id}
+                hb_data = {"node_id": registered_id,
+                           # #899: same token on every beat — a mismatch is
+                           # how the main spots the zombie twin.
+                           "instance_id": INSTANCE_ID}
                 # #892: every heartbeat carries disk_free_gb of the volume
                 # holding HERMES_HOME / the lanes dir — the main's watchdog
                 # degrades the node while the report sits below the floor and
@@ -292,9 +318,29 @@ def start_worker_connector(
                 disk_gb = _disk_report()
                 if disk_gb is not None:
                     hb_data["disk_free_gb"] = disk_gb
-                _signed_post(
+                hb = _signed_post(
                     cluster_endpoint, "/api/v1/nodes/heartbeat", hb_data, token, node_id
                 )
+                # #899: main says a NEWER instance owns this node id — this
+                # process is the zombie twin (polling, spawning lanes behind
+                # the winner's back: the 81-lane-process incident). It must
+                # DIE, not just stop beating: the executor thread lives in
+                # the same process, so a thread exit leaves exactly the
+                # orphan half the issue describes. os._exit skips atexit (the
+                # lock release) — deliberate: a stale instance must not touch
+                # a lock the live owner now holds. The :loop wrapper
+                # relaunches within 5 s, and the new instance's join re-
+                # confirms ownership; if the live owner is actually gone the
+                # lock's pid probe steals it (the crash path, test_lock_
+                # steals_a_stale_holder).
+                rc = _replaced_exit_code(hb)
+                if rc is not None:
+                    logger.error(
+                        "worker connector: instance %s was REPLACED for node "
+                        "%s — terminating this stale instance (#899)",
+                        INSTANCE_ID[:8], node_id,
+                    )
+                    os._exit(rc)
 
             time.sleep(heartbeat_interval)
 

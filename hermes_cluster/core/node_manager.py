@@ -166,6 +166,7 @@ class NodeManager:
         load: float = 0.0,
         max_concurrent: int = 0,
         disk_free_gb: Optional[float] = None,
+        instance_id: str = "",
     ) -> Node:
         """Register a new node in the cluster.
 
@@ -182,6 +183,15 @@ class NodeManager:
                 so an overloaded worker receives no new assignments (#833).
             disk_free_gb: #892 — free disk the worker reports at join time;
                 None (older worker) never affects status.
+            instance_id: #899 — the joining PROCESS's instance token. A
+                re-join force-REPLACES the stored token: the newest joiner
+                owns the node id, and the replaced twin's heartbeats are
+                then refused with status "replaced" (the windows_desktop
+                incident: :loop wrapper relaunch + scheduled-task start put
+                two executors behind one node id and the main could not see
+                it). Replace, not refuse, is the documented choice: a
+                restart legitimately re-joins, and refusing the new one
+                would keep the (possibly dead) old token authoritative.
 
         Returns:
             The registered Node object.
@@ -204,6 +214,18 @@ class NodeManager:
                 self._store.update_capabilities(node_id, caps)
             if max_concurrent:
                 self._store.update_max_concurrent(node_id, max_concurrent)
+            # #899: a re-join force-REPLACES the owning instance token (the
+            # documented choice over refusing: a restart legitimately re-
+            # joins). The replaced twin keeps polling until its next
+            # heartbeat reads "replaced" — send_heartbeat below is where the
+            # main tells it.
+            if instance_id and getattr(existing, "instance_id", "") != instance_id:
+                if getattr(existing, "instance_id", ""):
+                    logger.warning(
+                        "node %s re-joined by instance %s, REPLACING live "
+                        "instance %s (#899 two-executors-on-one-node-id)",
+                        node_id, instance_id, existing.instance_id)
+                self._store.update_instance(node_id, instance_id)
             node = self._store.get_node(node_id)
             logger.info("node re-joined: %s", node_id)
             self._emit(NodeEvent(node_id, "joined", f"re-join, caps={caps}"))
@@ -220,6 +242,7 @@ class NodeManager:
             load=load,
             max_concurrent=max(0, int(max_concurrent)),
             disk_free_gb=disk_free_gb,
+            instance_id=instance_id,
         )
         self._store.register_node(node)
         self._cap_cache[node_id] = list(caps)
@@ -271,12 +294,20 @@ class NodeManager:
     # ------------------------------------------------------------------
 
     def send_heartbeat(self, node_id: str, load: float = 0.0,
-                       disk_free_gb: Optional[float] = None) -> None:
+                       disk_free_gb: Optional[float] = None,
+                       instance_id: Optional[str] = None) -> bool:
         """Send a single heartbeat for a node.
 
         Updates the last_heartbeat timestamp and optionally the load.
         This is the core heartbeat primitive — both manual and periodic
         heartbeats use this.
+
+        Returns True when accepted. #899: a heartbeat whose ``instance_id``
+        disagrees with the node's CURRENT owning instance is REFUSED (False)
+        and does NOT refresh the heartbeat clock — the replaced twin must go
+        stale and visible, not keep the node "online" from a zombie process.
+        An empty stored instance (older worker that never stamped one) never
+        refuses: the rule bites only once the main has a token to compare.
 
         Args:
             node_id: the node sending the heartbeat
@@ -286,14 +317,30 @@ class NodeManager:
                 When the reading sits below the configured floor the store
                 still records it, refreshes the timestamp, but marks the node
                 degraded with a reason instead of forcing it online.
+            instance_id: #899 — the heartbeat's process instance token
+                (None/"" = older worker, exempt from the replace rule).
         """
         node = self._store.get_node(node_id)
         if node is None:
             logger.warning("heartbeat for unknown node: %s", node_id)
-            return
+            return True
 
         # Clamp load
         load = max(0.0, min(1.0, load))
+
+        # #899: a beat from a NON-current instance is refused and does NOT
+        # refresh the clock — the replaced twin must go stale and visible
+        # (and its connector must die on this answer), not keep the node
+        # "online" from a zombie executor. Comparison only bites when the
+        # main has a stored token to compare against.
+        stored = getattr(node, "instance_id", "")
+        if stored and instance_id is not None and instance_id != stored:
+            logger.warning(
+                "heartbeat from instance %s REFUSED: node %s is owned by "
+                "instance %s (#899 replaced instance)",
+                instance_id or "?", node_id, stored,
+            )
+            return False
 
         reason = disk_reason(disk_free_gb, self._min_free_disk_gb)
         self._store.update_heartbeat(node_id, load=load,
@@ -306,6 +353,7 @@ class NodeManager:
             f"load={load:.2f}" + (f" disk_free_gb={disk_free_gb:.2f}"
                                   if disk_free_gb is not None else ""),
         ))
+        return True
 
     def start_heartbeat_sender(
         self,

@@ -119,7 +119,8 @@ CREATE TABLE IF NOT EXISTS nodes (
     load DOUBLE PRECISION DEFAULT 0.0,
     max_concurrent INTEGER DEFAULT 0,
     disk_free_gb DOUBLE PRECISION,
-    status_reason TEXT DEFAULT ''
+    status_reason TEXT DEFAULT '',
+    instance_id TEXT DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS tasks (
@@ -357,6 +358,8 @@ class PostgresClusterStore:
             await conn.execute(
                 "ALTER TABLE nodes ADD COLUMN IF NOT EXISTS status_reason TEXT DEFAULT ''")
             await conn.execute(
+                "ALTER TABLE nodes ADD COLUMN IF NOT EXISTS instance_id TEXT DEFAULT ''")
+            await conn.execute(
                 "ALTER TABLE tasks ADD COLUMN IF NOT EXISTS attempts INTEGER DEFAULT 0")
             # #874: the lane deliverable, so a result outlives the node that made it.
             await conn.execute(
@@ -470,8 +473,8 @@ class PostgresClusterStore:
     async def register_node(self, node: Node) -> None:
         await self._fetch(
             """INSERT INTO nodes (id, name, capabilities, status, last_heartbeat, load, max_concurrent,
-                 disk_free_gb, status_reason)
-               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                 disk_free_gb, status_reason, instance_id)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
                ON CONFLICT (id) DO UPDATE SET
                  name = EXCLUDED.name,
                  capabilities = EXCLUDED.capabilities,
@@ -480,11 +483,13 @@ class PostgresClusterStore:
                  load = EXCLUDED.load,
                  max_concurrent = EXCLUDED.max_concurrent,
                  disk_free_gb = EXCLUDED.disk_free_gb,
-                 status_reason = EXCLUDED.status_reason""",
+                 status_reason = EXCLUDED.status_reason,
+                 instance_id = EXCLUDED.instance_id""",
             node.id, node.name, _json_dumps(node.capabilities),
             node.status.value, _aware(node.last_heartbeat), float(node.load),
             int(node.max_concurrent),
             node.disk_free_gb, getattr(node, "status_reason", ""),
+            getattr(node, "instance_id", ""),
         )
         if self._on_node_online:
             try:
@@ -583,6 +588,13 @@ class PostgresClusterStore:
             max(0, int(max_concurrent)), node_id,
         )
 
+    async def update_instance(self, node_id: str, instance_id: str) -> None:
+        # #899: re-stamp the owning process instance on a re-join.
+        await self._fetch(
+            "UPDATE nodes SET instance_id = $1 WHERE id = $2",
+            instance_id, node_id,
+        )
+
     async def node_count(self) -> int:
         row = await self._row("SELECT COUNT(*) AS c FROM nodes")
         return row["c"]
@@ -619,6 +631,7 @@ class PostgresClusterStore:
             # worker that never sends disk_free_gb).
             disk_free_gb=row["disk_free_gb"] if "disk_free_gb" in keys else None,
             status_reason=row["status_reason"] if "status_reason" in keys else "",
+            instance_id=row["instance_id"] if "instance_id" in keys else "",
         )
 
     # -------------------------------------------------------------------

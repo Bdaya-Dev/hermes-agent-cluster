@@ -157,6 +157,12 @@ class ClusterState:
                     n.disk_free_gb = disk_free_gb
                 n.load = load
 
+    def update_instance(self, node_id: str, instance_id: str) -> None:
+        """#899: (re-)stamp the owning process instance token on re-join."""
+        with self._nodes_lock:
+            if node_id in self._nodes:
+                self._nodes[node_id].instance_id = instance_id
+
     def update_capabilities(self, node_id: str, caps: List[str]) -> None:
         with self._nodes_lock:
             if node_id in self._nodes:
