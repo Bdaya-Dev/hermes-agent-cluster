@@ -96,6 +96,7 @@ from ..core.scheduler import (
     FairScheduler,
     lane_blocked_ready_ids,
 )
+from ..core.lane_affinity import AffinityScheduler
 
 logger = logging.getLogger(__name__)
 
@@ -331,7 +332,7 @@ class PostgresClusterStore:
 
         self._max_decisions: int = 200
         self._max_deliveries: int = 1000
-        self._fair_scheduler = FairScheduler()
+        self._fair_scheduler = AffinityScheduler()
 
     # -------------------------------------------------------------------
     # Lifecycle / plumbing
@@ -1243,11 +1244,26 @@ class PostgresClusterStore:
                         if r["id"] not in leased and r["id"] not in lane_blocked
                     ]
 
+                    # Lane-to-node affinity (#858 defect 2): lane placements
+                    # read in the SAME advisory-locked transaction, so the
+                    # pin cannot interleave with a lane re-home.
+                    lane_nodes = {
+                        r["lane_key"]: (r["node"] or "")
+                        for r in await conn.fetch(
+                            "SELECT lane_key, node FROM lanes"
+                        )
+                    }
+
                     for task in ready_tasks:
-                        node = self._fair_scheduler.choose(
+                        node, pinned = self._fair_scheduler.choose_pinned(
                             task.requires, online_nodes, active_counts,
+                            pinned_node_id=lane_nodes.get(task.lane_key, "")
+                            if task.lane_key else "",
                         )
                         if node is None:
+                            # Pinned lane whose node is offline/degraded/at
+                            # capacity: PARK (stays ready) — never re-home a
+                            # lane to a different machine (#858).
                             continue
 
                         # Status-guarded write (round-2 audit): the snapshot
@@ -1278,7 +1294,9 @@ class PostgresClusterStore:
                                (task_id, task_title, priority, node_id, score, reason, timestamp)
                                VALUES ($1, $2, $3, $4, $5, $6, $7)""",
                             task.id, task.title, task.priority, node.id,
-                            1.0, "least_loaded_capability_match", _utcnow(),
+                            1.0, ("lane_affinity_pinned" if pinned
+                                  else "least_loaded_capability_match"),
+                            _utcnow(),
                         )
                         new_assignments.append({
                             "task_id": task.id,

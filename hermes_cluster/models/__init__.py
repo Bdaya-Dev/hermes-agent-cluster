@@ -767,7 +767,13 @@ class CompleteTaskRequest(BaseModel):
 
 
 class FailTaskRequest(BaseModel):
-    reason: str = "failed"
+    # #858: reason is REQUIRED (was defaulted to "failed"). A failure
+    # recorded without a real reason is indistinguishable from the
+    # busy-lane incident — failed task, error None, zero-byte result —
+    # i.e. a failure the operator cannot investigate. Callers that have
+    # nothing to say must say something ("no reason captured"), never
+    # nothing.
+    reason: str
     # #870: set by a worker reporting a NON-DELIVERABLE result body (provider
     # error / echoed brief — see agent_executor.deliverable_guard). Under
     # main's retry cap the task goes back to ready (attempts bumped) instead

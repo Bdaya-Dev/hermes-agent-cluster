@@ -256,7 +256,19 @@ async def fail_task(task_id: str, req: FailTaskRequest = None):
     task = _state.get_task(task_id)
     if not task:
         raise HTTPException(status_code=404, detail="task not found")
-    reason = req.reason if req else "failed"
+    # #858: a failure must carry a real reason. No body / missing field /
+    # blank reason is a 422 — the busy-lane incident reached operators as
+    # `failed` with `error: None`, and an unexplained failure is a failure
+    # that goes unnoticed. (The `= None` default stays so a bodyless call
+    # gets a clear 422 here instead of FastAPI's schema error; the model
+    # already rejects a body that omits `reason`.)
+    reason = (req.reason if req and req.reason else "").strip()
+    if not reason:
+        raise HTTPException(
+            status_code=422,
+            detail="fail requires a non-empty reason: a failed task with "
+                   "no reason attached is un-investigable (#858)",
+        )
 
     # B2 fix: terminal states (completed/failed/cancelled) → 409
     # cancel_requested is allowed through (worker ack path)

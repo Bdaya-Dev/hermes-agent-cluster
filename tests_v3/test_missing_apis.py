@@ -99,7 +99,10 @@ class TestClaimTask:
         # Instead, test with a task that's in a non-ready state (blocked)
         # Create a scenario: submit t3, fail t1, set t3 depends on t1
         # Simpler: just manually set a task to blocked state via fail endpoint
-        client.post(f"/api/v1/tasks/{t1['id']}/fail")
+        # (#858: /fail now requires a reason — a reasonless fail is the very
+        #  defect this guards; carry one.)
+        client.post(f"/api/v1/tasks/{t1['id']}/fail",
+                    json={"reason": "test: parent failed"})
         # Now t2 is still ready (auto-promoted before deps were set).
         # Test with a truly non-ready task: the completed t1
         resp = client.post(f"/api/v1/tasks/{t1['id']}/claim", json={

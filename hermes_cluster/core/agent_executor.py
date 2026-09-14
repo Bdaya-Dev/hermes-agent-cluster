@@ -40,10 +40,21 @@ created_at, last_task_id) and is re-attached on worker restart by lane_key.
 Reviewer lanes (``role="reviewer"``) spawn with ``-m <hermes_reviewer_model>``
 (default qwen3.7-plus, the opus tier) so the merge gate accepts their verdicts.
 
+Busy lanes queue (shared/claude-plugins#858, defect 1): a second task for a
+lane with an in-flight delivery is NEVER spawned as a concurrent ``--resume``
+(hermes refuses: ``SESSION_NOT_OWNED``) — it waits in a per-lane FIFO and is
+released, in arrival order, when the running delivery reaps. A residual
+refusal that still races through re-queues with bounded backoff; when the
+budget is spent the failure carries hermes' own refusal text verbatim —
+never ``error: None``. Lane affinity (defect 2): a lane whose ``lanes`` row
+names another node must not spawn here either; the task is released to the
+board for the affinity-aware scheduler to re-home.
+
 Design:
   - Worker-mode aware spawn + reap, one active spawn per lease at a time
   - Honours lease TTL — renews while the spawn is running
   - Crashed/hung spawn → /fail with reason, never a silent hang
+  - Busy lane → per-lane FIFO queue, never a failing concurrent resume
   - Config-driven (worker, profile, model, hermes_profile, hermes_bin)
   - Uses the same peer-token signing as worker_connector.py
 """
@@ -164,6 +175,12 @@ class ActiveSpawn:
     miss_count: int = 0  # consecutive polls where lane was absent from status
     spawn_exit_rc: Optional[int] = None  # set once spawn process exits
     spawn_exit_stderr: str = ""  # captured stderr tail on nonzero exit
+    # #858 defect 1: verbatim task dict this delivery was spawned from, kept
+    # so a busy-lane refusal can RE-QUEUE the same delivery (with backoff)
+    # instead of failing it. Not persisted (the spawn record is for restart
+    # tracking, and a refused delivery never started).
+    task_payload: Optional[dict] = None
+    busy_attempts: int = 0  # refusal-retries already spent by the LANE on this task
     # #870: count of PRIOR deliveries of this task observed at spawn time
     # (from the persisted record; main's task.attempts is the authority).
     # Rides through persistence so an executor restart cannot reset it.
@@ -298,6 +315,32 @@ class AgentExecutor:
         3. Call stop() for clean shutdown
     """
 
+    # Stateful-lane BUSY queue (shared/claude-plugins#858 defect 1): a task
+    # arriving for a lane that already has an in-flight delivery must NOT be
+    # spawned as a concurrent ``--resume`` (hermes refuses: SESSION_NOT_OWNED).
+    # It waits here — FIFO per lane — and is released the moment the running
+    # delivery reaps. ``_lane_queue_order`` keeps insertion order per lane so
+    # the release is first-in-first-out (priority ordering across a lane is
+    # the scheduler's job, before the task reaches the executor).
+    _LANE_QUEUE_LIMIT = 64  # per-lane FIFO bound (executor capacity, not state)
+
+    # Bounded backoff for a residual hermes refusal (the race where a lane
+    # looked free at claim time and hermes still owns it): retries happen
+    # INSIDE this delivery — the task is never failed for a busy-lane
+    # refusal. Tunables are class attributes so tests can shrink the waits.
+    _LANE_BUSY_MAX_RETRIES = 5
+    _LANE_BUSY_BACKOFF_BASE = 2.0
+
+    # Markers for hermes' refusal contract (cli.py -Q prints
+    # ``hermes-refusal-reason: <REASON>\n<message>`` to stderr —
+    # hermes_cli/active_sessions.py::format_refusal_stderr — and exits 1).
+    _REFUSION_REASON_PREFIX = "hermes-refusal-reason:"
+    _LANE_BUSY_REFUSALS = frozenset({
+        "SESSION_NOT_OWNED",            # a live owner holds the lane session
+        "MAX_CONCURRENT_SESSIONS",      # node-level session limit, transient
+        "SESSION_COORDINATION_UNAVAILABLE",  # registry unreadable, transient
+    })
+
     def __init__(
         self,
         config: AgentExecutorConfig,
@@ -325,6 +368,18 @@ class AgentExecutor:
         # maintained in-memory by _persist_spawn/_drop_persisted_spawn so the
         # poll loop never re-reads SQLite. Reseeded by reconcile on start.
         self._persisted_ids: set = set()
+        # Per-lane FIFO of task dicts waiting for the lane's in-flight
+        # delivery to reap (#858 defect 1). Guarded by self._lock.
+        self._lane_queue: Dict[str, List[dict]] = {}
+        # Tasks released from _lane_queue when their lane's delivery reaped;
+        # drained by the next _claim_and_spawn in FIFO order. Separate dict
+        # (not popping straight into spawns) so release stays cheap and
+        # lock-holding under _reap_finished_spawns is bounded.
+        self._lane_released: Dict[str, List[dict]] = {}
+        # task_id -> (busy_refusal_attempts, retry_not_before_epoch): the
+        # backoff state a re-queued refusal carries (#858 defect 1). Entries
+        # are pruned when the task leaves the queue system (spawn / fail).
+        self._lane_queue_meta: Dict[str, tuple] = {}
 
         # Resolve working directory
         if not self._config.working_dir:
@@ -430,6 +485,11 @@ class AgentExecutor:
         # next task with that lane_key starts fresh (session left on disk).
         self._reap_idle_lanes()
 
+        # 1c. #858 defect 1: release per-lane FIFO heads whose lane is now
+        # idle (in-flight delivery reaped above) and whose backoff has
+        # expired, so this cycle's claim pass spawns them.
+        self._sweep_lane_queues()
+
         # 2. Renew leases for active spawns
         self._renew_leases()
 
@@ -464,6 +524,32 @@ class AgentExecutor:
         if disk_gate_blocks(self._config.working_dir or "",
                             getattr(self._config, "min_free_disk_gb", None)):
             return
+        # Drain lane FIFOs the reap just released: head-of-queue tasks for
+        # now-idle lanes spawn first, in arrival order (FIFO), consuming the
+        # cycle's spawn budget before any newly-claimed task does.
+        ready = self._drain_released_lanes()
+        budget = max_spawns
+        leftover = []
+        for i, task in enumerate(ready):
+            if budget <= 0:
+                leftover = ready[i:]
+                break
+            self._spawn_worker(task)
+            budget -= 1
+        if leftover:
+            # Out of executor slots this cycle: put the heads back at the
+            # FRONT of their lane queues in arrival order (FIFO preserved;
+            # the queued-id filter keeps the board from double-handling
+            # them). Insert in REVERSE so each front-to-back pass lands the
+            # earlier task ahead of the later one — inserting forward at
+            # index 0 reversed each lane's order (#858 review, PR #23).
+            with self._lock:
+                for task in reversed(leftover):
+                    lane_key = task.get("lane_key", "") or ""
+                    self._lane_queue.setdefault(lane_key, []).insert(0, task)
+        if budget <= 0:
+            return
+
         # GET /api/v1/tasks from main node
         tasks = _signed_request(
             self._cluster_endpoint,
@@ -480,6 +566,13 @@ class AgentExecutor:
         # Filter: status=running, assigned_to=this node, not already spawning
         with self._lock:
             active_task_ids = set(self._active_spawns.keys())
+            queued_task_ids = {
+                t.get("id", "")
+                for q in self._lane_queue.values() for t in q
+            } | {
+                t.get("id", "")
+                for q in self._lane_released.values() for t in q
+            }
         active_task_ids |= self._persisted_spawn_task_ids()
 
         candidates = []
@@ -491,15 +584,30 @@ class AgentExecutor:
                 status == "running"
                 and self._is_assigned_to_me(assigned_to)
                 and task_id not in active_task_ids
+                and task_id not in queued_task_ids
             ):
                 candidates.append(task)
 
         # Sort by priority (lower number = higher priority)
         candidates.sort(key=lambda t: t.get("priority", 3))
 
-        # Spawn up to max_spawns
-        for task in candidates[:max_spawns]:
+        # Spawn up to remaining budget; a candidate whose lane already has an
+        # in-flight delivery is QUEUED per lane FIFO instead of being spawned
+        # into the busy lane (#858 defect 1: a concurrent ``--resume`` is
+        # refused by hermes — SESSION_NOT_OWNED — and the task used to land
+        # in `failed` with `error: None`).
+        for task in candidates:
+            lane_key = task.get("lane_key", "") or ""
+            if lane_key and self._lane_has_active_delivery(lane_key):
+                self._queue_for_lane(lane_key, task)
+                continue
+            if budget <= 0:
+                # Lane is free but the executor has no slot: leave the task
+                # running/assigned on the board — the next cycle picks it up
+                # (it is neither active nor queued, so the filter re-sees it).
+                continue
             self._spawn_worker(task)
+            budget -= 1
 
     def _write_brief(
         self,
@@ -605,12 +713,72 @@ class AgentExecutor:
 
     def _spawn_worker(self, task: dict) -> None:
         """Spawn a worker for the given task, dispatching by ``worker`` mode."""
+        # #858 defect 2, executor-side guard: a task assigned to THIS node
+        # whose lane row names a DIFFERENT node must not spawn here at all —
+        # spawning would build the second session + second clone on the
+        # wrong machine (the measured stray-lane incident). The scheduler's
+        # affinity keeps assignments honest; this guard catches the delayed
+        # case (row written after the assignment raced, or manual override).
+        # The task is released back to the board with a reason so the
+        # affinity-aware scheduler re-homes it to the lane's node.
+        lane_key = task.get("lane_key", "") or ""
+        if lane_key and self._lane_placed_elsewhere(lane_key):
+            self._release_misplaced_lane_task(task, lane_key)
+            return
         # getattr guards the spawn_env unit tests which construct a bare _Cfg
         # (no worker attr) → default to the legacy bdaya-dispatch mode.
         if getattr(self._config, "worker", "bdaya-dispatch") == "hermes":
             self._spawn_hermes_worker(task)
         else:
             self._spawn_bdaya_worker(task)
+
+    def _node_ids_match(self, a: str, b: str) -> bool:
+        """Nodes register as ``node_<name>`` while the executor runs with the
+        bare ``<name>`` (see _is_assigned_to_me); lane rows store whichever
+        spelling the recording node used. Compare both."""
+        if not a or not b:
+            return False
+        return (a == b or a.removeprefix("node_") == b
+                or b.removeprefix("node_") == a)
+
+    def _lane_placed_elsewhere(self, lane_key: str) -> bool:
+        """True when the lanes table places this lane on another node."""
+        if getattr(self, "_store", None) is None:
+            return False
+        try:
+            lane = self._store.get_lane(lane_key)
+        except Exception:
+            logger.exception("failed to read lane %s placement", lane_key)
+            return False
+        if not lane:
+            return False  # unplaced lane: this node may claim it
+        placed = (lane.get("node") or "").strip()
+        if not placed:
+            return False  # row without a node: unplaced, free to run here
+        return not self._node_ids_match(placed, self._node_id)
+
+    def _release_misplaced_lane_task(self, task: dict, lane_key: str) -> None:
+        """Hand a misplaced lane task back to the board (release → ready),
+        with a reason the operator can read — never spawn it here (#858)."""
+        task_id = task.get("id", "")
+        assigned_to = task.get("assigned_to") or self._node_id
+        lane = None
+        try:
+            lane = self._store.get_lane(lane_key) if self._store else None
+        except Exception:
+            pass
+        placed = (lane or {}).get("node") or "?"
+        reason = (
+            f"lane {lane_key} is placed on node {placed}, not {self._node_id} "
+            f"— released for affinity re-home (#858)"
+        )
+        logger.warning("refusing spawn: %s", reason)
+        _signed_request(
+            self._cluster_endpoint, "POST",
+            f"/api/v1/tasks/{task_id}/release",
+            {"node_id": assigned_to, "reason": reason},
+            self._token, self._node_id,
+        )
 
     def _spawn_bdaya_worker(self, task: dict) -> None:
         """Spawn a bdaya-dispatch worker for the given task."""
@@ -1017,6 +1185,14 @@ class AgentExecutor:
         # else this is the lane's first delivery (fresh titled session).
         resume_session_id = ""
         if lane_key:
+            # Belt and braces (#858 defect 1): never resume a lane with a
+            # delivery in flight on this node — hermes would refuse the
+            # second writer (SESSION_NOT_OWNED). Queue it FIFO instead,
+            # carrying any refusal-attempt count already spent on this task.
+            if self._lane_has_active_delivery(lane_key):
+                attempts = self._lane_queue_meta.get(task_id, (0, 0.0))[0]
+                self._queue_for_lane(lane_key, task, attempts=attempts)
+                return
             lane = self._store.get_lane(lane_key) if self._store else None
             if lane and lane.get("session_id"):
                 resume_session_id = lane["session_id"]
@@ -1113,6 +1289,8 @@ class AgentExecutor:
             role=role,
             session_id=resume_session_id,
             resumed=bool(resume_session_id),
+            task_payload=dict(task),  # #858: re-queue source on busy refusal
+            busy_attempts=self._lane_queue_meta.get(task_id, (0, 0.0))[0],
             attempt=self._prior_attempt(task_id, task),
             # #929: snapshot the session's cumulative usage NOW (a resumed
             # lane's earlier rows belong to earlier deliveries and must not be
@@ -1396,6 +1574,27 @@ class AgentExecutor:
         for task_id, spawn, outcome, detail in resolved:
             with self._lock:
                 self._active_spawns.pop(task_id, None)
+            # A terminal spawn leaves the queue system entirely — drop any
+            # backoff meta it carried (fresh deliveries start at attempts 0).
+            self._lane_queue_meta.pop(task_id, None)
+            # #858 defect 1: a residual busy-lane refusal is re-queued with
+            # bounded backoff (outside the reap lock; it mutates the queue
+            # state) and must not fall through to the failure report.
+            # _queue_for_lane re-seeds the meta with attempts+1.
+            if outcome == "lane_busy_refused":
+                if self._requeue_busy_refusal(spawn, task_id, detail):
+                    continue
+                # Retry budget spent: fail — but carry HERMES' OWN refusal
+                # text verbatim, never a bare None (the #858 diagnosis: a
+                # failure the operator cannot explain is a failure missed).
+                self._drop_persisted_spawn(task_id)
+                self._lane_queue_meta.pop(task_id, None)
+                self._report_failure(task_id, (
+                    f"lane {spawn.lane_key} busy after "
+                    f"{self._LANE_BUSY_MAX_RETRIES} retries — "
+                    f"hermes said: {detail}"
+                ))
+                continue
             # Stateful lane: capture the hermes session id from this delivery's
             # stderr into the lanes table BEFORE the record is dropped, so the
             # next task with the same lane_key resumes that session. A
@@ -1419,6 +1618,7 @@ class AgentExecutor:
             # the same task may spawn again; an active lane's record survives
             # restarts and blocks a duplicate spawn.
             self._drop_persisted_spawn(task_id)
+            self._lane_queue_meta.pop(task_id, None)  # done with queue state
 
             if outcome in ("done", "transcript_promoted"):
                 # A promoted transcript COMPLETES the task — that is the #871
@@ -1663,6 +1863,25 @@ class AgentExecutor:
 
         if rc is not None and rc != 0:
             detail = f"hermes exited rc={rc} after {elapsed:.0f}s"
+            # #858 defect 1: a residual busy-lane refusal (the lane looked
+            # free at spawn time; hermes still owns the session) must NOT
+            # fail the task — mark it for re-queue with bounded backoff.
+            # Detection is the refusal REASON contract on stderr
+            # (``hermes-refusal-reason: SESSION_NOT_OWNED…``), not an rc
+            # guess. The actual re-queue runs in _reap_finished_spawns after
+            # the spawn-table lock is released (non-reentrant).
+            if spawn.lane_key:
+                try:
+                    stderr_now = self._read_spawn_stderr(spawn)
+                except Exception:
+                    stderr_now = ""
+                reason = self._refusal_reason(stderr_now)
+                if reason in self._LANE_BUSY_REFUSALS:
+                    resolved.append((
+                        task_id, spawn, "lane_busy_refused",
+                        self._refusal_text(stderr_now) or detail,
+                    ))
+                    return
             if spawn.spawn_exit_stderr:
                 detail += f": {spawn.spawn_exit_stderr[:300]}"
             # #892: a crashed lane leaves the FIRST-LINE diagnostic in its
@@ -1940,11 +2159,14 @@ class AgentExecutor:
             logger.exception("failed to list lanes during idle reap")
             return 0
 
-        # A lane with an in-flight delivery is NOT idle — keep it.
+        # A lane with an in-flight delivery is NOT idle — keep it. Neither is
+        # a lane with deliveries queued behind that delivery (#858: clearing
+        # the row mid-queue would drop the session the queued briefs are
+        # meant to resume).
         with self._lock:
             busy_lane_keys = {
                 s.lane_key for s in self._active_spawns.values() if s.lane_key
-            }
+            } | set(self._lane_queue.keys()) | set(self._lane_released.keys())
 
         reaped = 0
         now = time.time()
@@ -2056,6 +2278,156 @@ class AgentExecutor:
                     task_id, spawn.lease_id,
                 )
 
+    def _lane_has_active_delivery(self, lane_key: str) -> bool:
+        """True when this node has an in-flight spawn for ``lane_key``."""
+        with self._lock:
+            return any(
+                s.lane_key == lane_key for s in self._active_spawns.values()
+            )
+
+    def _queue_for_lane(self, lane_key: str, task: dict,
+                        attempts: int = 0) -> bool:
+        """Append a task to its lane's FIFO; returns False when the queue is
+        full (the caller then leaves the task alone — the board still shows
+        it running/assigned and a later poll can retry the queueing).
+
+        ``attempts`` carries a busy-refusal retry count through re-queueing
+        (a first queue is attempts=0). Queueing happens purely in the
+        executor: the task's status on the cluster is untouched (#858: "a
+        queued task stays `ready` rather than failing" — nothing here moves
+        it toward `failed`)."""
+        task_id = task.get("id", "")
+        with self._lock:
+            q = self._lane_queue.setdefault(lane_key, [])
+            if len(q) >= self._LANE_QUEUE_LIMIT:
+                return False
+            if any(t.get("id") == task_id for t in q):
+                return True  # already queued (dedupe against poll rescan)
+            q.append(task)
+            self._lane_queue_meta[task_id] = (
+                attempts, time.time() + self._lane_busy_backoff(attempts))
+        logger.info(
+            "lane %s busy — queued task %s (FIFO depth %d) instead of "
+            "spawning into a busy lane (#858)",
+            lane_key, task_id, len(q),
+        )
+        return True
+
+    def _lane_busy_backoff(self, attempts: int) -> float:
+        """Bounded exponential backoff before a re-queued refusal retries.
+
+        attempts=0 (never refused — straight busy-queue) releases as soon as
+        the lane is free; each spent retry doubles the wait from base."""
+        if attempts <= 0:
+            return 0.0
+        return self._LANE_BUSY_BACKOFF_BASE * (2 ** (attempts - 1))
+
+    def _refusal_reason(self, stderr_text: str) -> str:
+        """Parse hermes' machine-readable refusal contract from stderr.
+
+        ``-Q`` mode prints ``hermes-refusal-reason: <REASON>`` then the human
+        message (hermes_cli/active_sessions.py::format_refusal_stderr).
+        Returns the REASON token ('' when stderr carries no refusal) — the
+        reason is the contract; the message is for people."""
+        for line in (stderr_text or "").splitlines():
+            line = line.strip()
+            if line.startswith(self._REFUSION_REASON_PREFIX):
+                return line.split(":", 1)[1].strip()
+        return ""
+
+    def _refusal_text(self, stderr_text: str) -> str:
+        """Verbatim hermes refusal (reason line + message) for the failure
+        report — 'whatever Hermes actually said lands in error' (#858)."""
+        out = []
+        for line in (stderr_text or "").splitlines():
+            s = line.strip()
+            if s.startswith(self._REFUSION_REASON_PREFIX):
+                out = [s]
+            elif out:
+                out.append(s)
+        return "\n".join(out).strip()
+
+    def _sweep_lane_queues(self) -> None:
+        """Release per-lane FIFO heads that may spawn now.
+
+        A head is released when (a) its lane has no in-flight delivery on
+        this node AND (b) its busy-refusal backoff deadline has passed (for
+        freshly queued tasks the deadline is immediate). Released heads go
+        to ``_lane_released`` for the same cycle's claim pass to spawn in
+        FIFO order.
+        """
+        now = time.time()
+        with self._lock:
+            if not self._lane_queue:
+                return
+            busy_lane_keys = {
+                s.lane_key for s in self._active_spawns.values() if s.lane_key
+            }
+            moved = []
+            for lane_key in list(self._lane_queue.keys()):
+                if lane_key in busy_lane_keys:
+                    continue  # lane still has a delivery in flight — wait
+                q = self._lane_queue.get(lane_key) or []
+                if not q:
+                    self._lane_queue.pop(lane_key, None)
+                    continue
+                head = q[0]
+                head_id = head.get("id", "")
+                meta = self._lane_queue_meta.get(head_id)
+                if meta and meta[1] > now:
+                    continue  # backoff not expired for this head
+                q.pop(0)
+                if not q:
+                    self._lane_queue.pop(lane_key, None)
+                self._lane_released.setdefault(lane_key, []).append(head)
+                moved.append(head_id)
+        if moved:
+            logger.info(
+                "lane freed/backoff expired — released queued task(s) %s "
+                "for spawn (#858)", ", ".join(moved),
+            )
+
+    def _requeue_busy_refusal(
+        self, spawn: "ActiveSpawn", task_id: str, refusal: str,
+    ) -> bool:
+        """A residual hermes busy-lane refusal: re-queue (bounded backoff)
+        instead of failing, and surface the verbatim refusal for the failure
+        report if the retry budget is spent. Returns True when re-queued.
+
+        'Residual' = the refusal raced the queue: the lane looked free at
+        spawn time and hermes (or another surface) still owns the session.
+        The retry count rides on the queue meta, so the per-lane FIFO keeps
+        one consistent order even across refusals.
+        """
+        attempts = spawn.busy_attempts + 1
+        if attempts > self._LANE_BUSY_MAX_RETRIES:
+            return False  # exhausted — caller fails with the verbatim text
+        # Re-queue at the TAIL of the lane FIFO with one more attempt spent:
+        # fairness for whatever queued behind this delivery.
+        payload = dict(spawn.task_payload or {"id": task_id})
+        payload.setdefault("id", task_id)
+        lane_key = spawn.lane_key
+        ok = self._queue_for_lane(lane_key, payload, attempts=attempts)
+        if ok:
+            logger.warning(
+                "lane %s refused task %s (%s) — re-queued with bounded "
+                "backoff (attempt %d/%d) instead of failing (#858)",
+                lane_key, task_id, refusal, attempts,
+                self._LANE_BUSY_MAX_RETRIES,
+            )
+            self._drop_persisted_spawn(task_id)
+        return ok
+
+    def _drain_released_lanes(self) -> List[dict]:
+        """Pop every released task in FIFO order (per lane) for spawning."""
+        with self._lock:
+            if not self._lane_released:
+                return []
+            drained: List[dict] = []
+            for lane_key in list(self._lane_released.keys()):
+                drained.extend(self._lane_released.pop(lane_key))
+            return drained
+
     def _find_lease_for_task(self, task_id: str) -> str:
         """Find the active lease ID for a task from the main node."""
         leases = _signed_request(
@@ -2147,8 +2519,24 @@ class AgentExecutor:
         else:
             logger.error('failed to mark task %s completed', task_id)
 
-    def _report_failure(self, task_id: str, reason: str) -> None:
-        """Mark a task as failed on the main node."""
+    def _report_failure(self, task_id: str, reason: str,
+                        fallback: str = "") -> bool:
+        """Mark a task as failed on the main node.
+
+        #858: a failure must carry a real reason — the busy-lane incident
+        reached operators as `failed` with `error: None`. A blank reason is
+        replaced by *fallback* when the caller has one, and the report is
+        REFUSED (returns False, loudly logged) when neither exists: no
+        reasonless failure goes on the wire.
+        """
+        reason = (reason or "").strip() or (fallback or "").strip()
+        if not reason:
+            logger.error(
+                "REFUSING reasonless failure report for task %s (#858): "
+                "the caller supplied no reason and no fallback — fixing "
+                "the caller is required; the task stays un-failed and "
+                "visible as stuck", task_id)
+            return False
         result = _signed_request(
             self._cluster_endpoint,
             "POST",
@@ -2161,3 +2549,4 @@ class AgentExecutor:
             logger.info("task %s marked failed: %s", task_id, reason[:100])
         else:
             logger.error("failed to mark task %s failed", task_id)
+        return bool(result)
