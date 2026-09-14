@@ -591,34 +591,38 @@ class ClusterStore:
         role: str = "author",
         description: str = "",
         issues: Optional[List[str]] = None,
+        depends_on: Optional[List[str]] = None,
     ) -> Task:
         now = datetime.utcnow()
+        deps = list(depends_on or [])
         with self._tx() as conn:
             conn.execute(
                 """INSERT OR IGNORE INTO tasks
                    (id, title, requires, depends_on, priority, status, created_at, updated_at, version, lane_key, role, description, issues)
-                   VALUES (?, ?, ?, '[]', ?, ?, ?, ?, 1, ?, ?, ?, ?)""",
-                (task_id, title, _json_dumps(requires), priority,
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?)""",
+                (task_id, title, _json_dumps(requires), _json_dumps(deps), priority,
                  TaskStatus.pending.value, _dt_to_str(now), _dt_to_str(now),
                  lane_key, role, description, _json_dumps(list(issues or []))),
             )
-        # Promote to ready immediately if no dependencies (matching ClusterState behavior)
-        # The original in-memory store returns by reference so the caller
-        # sees the promotion after trigger_pending_tasks(). SQLite returns
-        # a copy, so we must promote here for API compatibility.
-        # create_task always creates with empty depends_on, so promote immediately
-        with self._tx() as conn:
-            conn.execute(
-                """UPDATE tasks SET status = ?, updated_at = ?
-                   WHERE id = ? AND status = ?""",
-                (TaskStatus.ready.value, _dt_to_str(datetime.utcnow()),
-                 task_id, TaskStatus.pending.value),
-            )
+        # Promote to ready immediately when there are no dependencies (matching
+        # ClusterState behavior). #905: with deps, the row stays pending —
+        # trigger_pending_tasks() is the single gate that promotes it once
+        # every dependency completes. The store returns a copy, so the
+        # dep-free promote happens here for API compatibility.
+        if not deps:
+            with self._tx() as conn:
+                conn.execute(
+                    """UPDATE tasks SET status = ?, updated_at = ?
+                       WHERE id = ? AND status = ?""",
+                    (TaskStatus.ready.value, _dt_to_str(datetime.utcnow()),
+                     task_id, TaskStatus.pending.value),
+                )
         return self.get_task(task_id) or Task(
             id=task_id, title=title, requires=requires, priority=priority,
             status=TaskStatus.pending, created_at=now, updated_at=now, version=1,
             lane_key=lane_key, role=role,
             description=description, issues=list(issues or []),
+            depends_on=deps,
         )
 
     def create_tasks_batch(self, plans: List[Dict[str, Any]]) -> List[Task]:
@@ -642,27 +646,33 @@ class ClusterStore:
                 conn.execute(
                     """INSERT OR IGNORE INTO tasks
                        (id, title, requires, depends_on, priority, status, created_at, updated_at, version, lane_key, role, description, issues)
-                       VALUES (?, ?, ?, '[]', ?, ?, ?, ?, 1, ?, ?, ?, ?)""",
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?)""",
                     (plan["task_id"], plan["title"],
                      _json_dumps(list(plan.get("requires") or [])),
+                     _json_dumps(list(plan.get("depends_on") or [])),
                      plan.get("priority", 3),
                      TaskStatus.pending.value, now_s, now_s,
                      plan.get("lane_key", ""), plan.get("role", "author"),
                      plan.get("description", ""),
                      _json_dumps(list(plan.get("issues") or []))),
                 )
-            # Promote ONLY this batch's rows (no dependencies at creation,
-            # mirroring create_task's per-id guarded UPDATE — a global
+            # Promote ONLY this batch's dependency-free rows (#905: an
+            # unconditional promote of every batch id silently dropped the
+            # pending hold on plans that DO carry depends_on — the in-memory
+            # twin honors them; the persistent stores must not skew).
+            # Mirrors create_task's status-guarded UPDATE — a global
             # status-filter UPDATE would wrongly promote dependency-held
-            # pending tasks created by other callers).
-            ids = [plan["task_id"] for plan in plans]
+            # pending tasks created by other callers.
+            ids = [plan["task_id"] for plan in plans
+                   if not plan.get("depends_on")]
             placeholders = ",".join("?" for _ in ids)
-            conn.execute(
-                f"""UPDATE tasks SET status = ?, updated_at = ?
-                    WHERE id IN ({placeholders}) AND status = ?""",
-                [TaskStatus.ready.value, now_s] + ids
-                + [TaskStatus.pending.value],
-            )
+            if ids:
+                conn.execute(
+                    f"""UPDATE tasks SET status = ?, updated_at = ?
+                        WHERE id IN ({placeholders}) AND status = ?""",
+                    [TaskStatus.ready.value, now_s] + ids
+                    + [TaskStatus.pending.value],
+                )
         out: List[Task] = []
         for plan in plans:
             task = self.get_task(plan["task_id"])

@@ -221,13 +221,17 @@ class ClusterState:
         role: str = "author",
         description: str = "",
         issues: Optional[List[str]] = None,
+        depends_on: Optional[List[str]] = None,
     ) -> Task:
         now = datetime.utcnow()
         task = Task(
             id=task_id,
             title=title,
             requires=requires,
+            depends_on=list(depends_on or []),
             priority=priority,
+            # #905: a dep-held task stays pending — trigger_pending_tasks
+            # (called by the router right after) is the single promotion gate.
             status=TaskStatus.pending,
             created_at=now,
             updated_at=now,
@@ -259,6 +263,7 @@ class ClusterState:
                 id=plan["task_id"],
                 title=plan["title"],
                 requires=list(plan.get("requires") or []),
+                depends_on=list(plan.get("depends_on") or []),
                 priority=plan.get("priority", 3),
                 status=TaskStatus.ready if not plan.get("depends_on")
                 else TaskStatus.pending,

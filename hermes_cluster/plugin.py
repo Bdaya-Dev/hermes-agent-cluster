@@ -417,6 +417,11 @@ def handle_cluster_submit(args: dict, **kwargs) -> str:
     for opt in ("role", "lane_key"):
         if args.get(opt):
             payload[opt] = args[opt]
+    # #905: depends_on rides the same submit — the verdict-gated landing task
+    # (#902) is created by a lane through THIS tool; a server that honors the
+    # field but a client that never forwards it leaves the gate unusable.
+    if args.get("depends_on"):
+        payload["depends_on"] = list(args["depends_on"])
     result = _api_call("POST", "/api/v1/tasks", payload)
     if isinstance(result, dict) and not result.get("error"):
         # #898: a deduped reviewer submit returned an EXISTING live task —
@@ -577,6 +582,7 @@ SCHEMAS = {
                 "priority": {"type": "integer", "description": "Priority band, ascending sort: 0=most urgent, 1..5 documented bands (default 3)", "default": 3},
                 "role": {"type": "string", "enum": ["author", "reviewer"], "description": "Lane role: reviewer lanes spawn fresh-context on the reviewer tier"},
                 "lane_key": {"type": "string", "description": "Stateful lane identity, e.g. '<repo>!<mr_iid>' for a reviewer lane"},
+                "depends_on": {"type": "array", "items": {"type": "string"}, "description": "Task IDs that must COMPLETE before this task may run (#905). The create handler honors it — the task stays pending (not dispatchable) until every dependency completes; unknown ids are a 422."},
             },
             "required": ["title"],
         },
