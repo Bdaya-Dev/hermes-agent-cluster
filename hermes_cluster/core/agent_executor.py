@@ -68,6 +68,7 @@ import logging
 import errno
 import os
 import shutil
+import signal
 import subprocess
 import threading
 import time
@@ -90,6 +91,19 @@ def _npx_bin() -> str:
     Node is on PATH. shutil.which applies PATHEXT and returns the real file.
     """
     return shutil.which("npx") or "npx"
+
+
+def _tree_kill_kwargs() -> dict:
+    """Popen kwargs that make the child killable as a TREE (#898).
+
+    POSIX: ``start_new_session=True`` puts the child in its own process group,
+    so the cancel sweep can ``killpg`` the whole tree — the incident saw the
+    cancelled lane's hermes.exe plus two python children outlive the cancel
+    because plain ``terminate()`` reaches only the direct child.
+    Windows: CREATE_NEW_PROCESS_GROUP is applied at the Popen call site
+    already; ``taskkill /T`` covers the tree in _kill_spawn_process.
+    """
+    return {} if os.name == "nt" else {"start_new_session": True}
 
 
 def _record_attempt(record: dict) -> int:
@@ -671,6 +685,15 @@ class AgentExecutor:
                 "lead to notice. Submit your own reviewer task with `kanban_cluster_submit`: "
                 "`role='reviewer'`, `requires=['review']`, `lane_key='<repo>!<mr_iid>'` (the reviewer "
                 "lane key), and a title that carries the MR/PR URL and the exact head sha.",
+                "- SUBMIT EXACTLY ONE reviewer task, then FINISH your turn (#898). Never cancel "
+                "or resubmit it: a reviewer that has not started is QUEUED, not lost — capacity, "
+                "not your attention, decides when it runs. If your head moves before it starts, "
+                "leave the task as it is (the reviewer reads the LIVE head and pins its verdict "
+                "sha). Measured 2026-09-14: an author lane that cancel-and-resubmitted four times "
+                "while reviewers were queued burned 90 minutes of credits and landed nothing; a "
+                "resubmit on a lane_key with a live reviewer is also refused by the main "
+                "(returns the existing task). The reviewer hands back to you itself on "
+                "NEEDS-CHANGES — waiting for it is never the author's job.",
                 "- Exception: a LANDING task (its brief names an existing reviewer PASS at the "
                 "current head sha) merges — it does NOT dispatch another reviewer. A reviewer "
                 "task only ever comes from an author lane that produced the diff.",
@@ -841,6 +864,11 @@ class AgentExecutor:
                 creationflags=subprocess.CREATE_NEW_PROCESS_GROUP
                 if os.name == "nt"
                 else 0,
+                # #898: on POSIX, make the child its own session/group leader so
+                # a cancel can killpg the WHOLE tree — the cancelled-lane
+                # incident saw hermes.exe plus two python children outlive the
+                # cancel because terminate() reaches only the direct child.
+                **_tree_kill_kwargs(),
             )
         except FileNotFoundError:
             logger.error(
@@ -1244,6 +1272,9 @@ class AgentExecutor:
                 creationflags=subprocess.CREATE_NEW_PROCESS_GROUP
                 if os.name == "nt"
                 else 0,
+                # #898: POSIX tree-kill session (see _tree_kill_kwargs) — the
+                # cancelled-lane incident's orphan was THIS spawn mode.
+                **_tree_kill_kwargs(),
             )
         except FileNotFoundError:
             for f in (stdout_file, stderr_file):
@@ -1464,6 +1495,57 @@ class AgentExecutor:
     _MISS_GRACE_COUNT = 4  # ~60s at default 15s poll_interval
     _MISS_GRACE_SECONDS = 90.0
 
+    def _sweep_cancelled_spawns(self) -> None:
+        """#898: kill the process tree of every spawn whose task main says is cancelled.
+
+        Called first in each reap cycle. For each active spawn, GET
+        ``/api/v1/tasks/<id>``; when the row reads ``cancelled`` or
+        ``cancel_requested`` (the lead or the dedupe path cancelled it while
+        our child still runs — the incident's shape), terminate the tree,
+        drop local state, and ack: a ``cancel_requested`` row needs the
+        worker's ``/fail`` ack to close the two-phase protocol (the existing
+        B2 ack path turns it into ``cancelled``). A read failure keeps the
+        spawn (poll-loop bounded by spawn_timeout); a 404 (task deleted) is
+        treated as gone-for-good and kills too, since no ack endpoint can
+        succeed on it anyway.
+        """
+        with self._lock:
+            items = list(self._active_spawns.items())
+        for task_id, spawn in items:
+            row = _signed_request(
+                self._cluster_endpoint, "GET", f"/api/v1/tasks/{task_id}",
+                None, self._token, self._node_id,
+            )
+            if row is None:
+                continue  # unreadable: leave it to the timeout bound (F1)
+            status = str(row.get("status", ""))
+            if status not in ("cancelled", "cancel_requested"):
+                continue
+            logger.warning(
+                "task %s is %s on main — killing spawn tree pid %s and acking "
+                "cancel (#898: cancel must terminate the lane, not just bookkeep)",
+                task_id, status, getattr(spawn.process, "pid", "?"),
+            )
+            self._kill_spawn_process(spawn)
+            with self._lock:
+                self._active_spawns.pop(task_id, None)
+            self._drop_persisted_spawn(task_id)
+            self._lane_queue_meta.pop(task_id, None)
+            for f in (spawn.stdout_file, spawn.stderr_file):
+                try:
+                    if f is not None:
+                        f.close()
+                except Exception:
+                    pass
+            if status == "cancel_requested":
+                # The two-phase protocol expects the worker ack to close it.
+                _signed_request(
+                    self._cluster_endpoint, "POST",
+                    f"/api/v1/tasks/{task_id}/fail",
+                    {"reason": "worker ack: lane terminated after cancel (task was kill-switched by main, #898)"},
+                    self._token, self._node_id,
+                )
+
     def _reap_finished_spawns(self) -> None:
         """Poll lane status for active spawns and report terminal states.
 
@@ -1479,6 +1561,18 @@ class AgentExecutor:
           - query failure (not just empty result) → keep waiting (bounded by timeout)
           - lane absent from status → grace window before failing
         """
+        if not self._active_spawns:
+            return
+
+        # 0. #898 cancel sweep FIRST: a task cancelled on main must not keep
+        # a live spawn. Measured 2026-09-14: POST /tasks/<id>/cancel flipped
+        # the row to cancelled while the spawned session ran 10+ minutes
+        # longer and submitted ANOTHER reviewer — cancel was bookkeeping
+        # only. Re-read each active spawn's task row; if it is
+        # cancelled/cancel_requested, kill the child process TREE, drop the
+        # local state, and ack the close (a cancel_requested row completes
+        # the two-phase protocol via the /fail ack path).
+        self._sweep_cancelled_spawns()
         if not self._active_spawns:
             return
 
@@ -2001,15 +2095,40 @@ class AgentExecutor:
             ))
 
     def _kill_spawn_process(self, spawn: ActiveSpawn) -> None:
-        """Best-effort terminate of a spawn's child process (tree on Windows)."""
+        """Best-effort terminate of a spawn's child PROCESS TREE (#898).
+
+        POSIX: the child leads its own group (``_tree_kill_kwargs``), so
+        ``killpg`` reaches every descendant — the cancelled lane left
+        hermes.exe plus two python children alive because terminate()
+        touches only the direct child. Group gone or not ours: fall back to
+        the direct terminate/kill pair.
+        Windows: ``taskkill /T /F`` kills the tree of the CREATE_NEW_PROCESS_GROUP
+        root; the direct kill stays as the last resort.
+        """
         proc = spawn.process
         if proc is None or isinstance(proc, _ResumedProcess):
             return  # nothing to kill (reconciled record holds no live handle)
         try:
             if os.name == "nt":
-                proc.kill()
+                pid = getattr(proc, "pid", None)
+                killed_tree = False
+                if pid:
+                    try:
+                        subprocess.Popen(
+                            ["taskkill", "/T", "/F", "/PID", str(pid)],
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL,
+                        ).wait(timeout=10)
+                        killed_tree = True
+                    except Exception:
+                        pass
+                if not killed_tree:
+                    proc.kill()
             else:
-                proc.terminate()
+                try:
+                    os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+                except OSError:
+                    proc.terminate()
         except Exception:
             try:
                 proc.kill()
