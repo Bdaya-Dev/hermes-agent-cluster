@@ -325,6 +325,63 @@ def bundle_title(bundle: BundlePlan) -> str:
     return f"[lane:{bundle.lane_key}][##{bundle.iids[0]}…{bundle.iids[-1]} x{len(bundle.iids)}]"
 
 
+def reviewer_handoff_brief(bundle: BundlePlan, mr_url: str, head_sha: str,
+                           reviewer_lane_key: Optional[str] = None) -> str:
+    """#893 item 5: the ONE place the reviewer-task wording lives. The author
+    lane pastes the rendered text as the TITLE of the reviewer task it
+    submits itself via ``kanban_cluster_submit`` — so the brief the reviewer
+    lane boots on is fully independent: it names the artifact under review
+    (MR URL + pinned head sha), the roster it must check, the rubric, the
+    posting instruction, and CLOSE-THE-LOOP (reviewer lands on PASS —
+    reviewer != author and fresh-context, so RV-1 holds — and hands back to
+    the ORIGINAL author lane on NEEDS-CHANGES). The author NEVER appears on
+    the approve/merge side of this text."""
+    issues = ", ".join(f"#{i}" for i in bundle.iids)
+    rev_key = reviewer_lane_key or f"{bundle.lane_key}-rev"
+    return (
+        f"[lane:{rev_key}][REVIEW {bundle.lane_key} MR !{mr_url.rstrip('/').split('/')[-1]}]\n"
+        f"\n"
+        f"## INDEPENDENT REVIEW (shared/claude-plugins#893) — fresh context, reviewer role\n"
+        f"\n"
+        f"Artifact under review: {mr_url}\n"
+        f"Head sha (verdict pins to this sha ONLY; anything else = stale): {head_sha}\n"
+        f"Author lane: `{bundle.lane_key}`  |  Your lane key: `{rev_key}`\n"
+        f"\n"
+        f"Issues this bundle delivers (every one must be Refs'd by the MR and\n"
+        f"carry its own per-issue disposition note — PROOF IS NOT DILUTED BY\n"
+        f"BUNDLING): {issues}\n"
+        f"(projects: {', '.join(bundle.project_paths)})\n"
+        f"\n"
+        f"Rubric — block ONLY on a CONFIRMED in-diff finding:\n"
+        f"  * correctness bug you can point at in the diff,\n"
+        f"  * acceptance-criteria violation for a listed issue (missing per-issue\n"
+        f"    proof/disposition counts as the finding — name the issue number),\n"
+        f"  * a secret in the diff,\n"
+        f"  * a CLAUDE.md-rule violation. Style opinions are not findings.\n"
+        f"  * If SocratiCode (or any roster tool the review needs) is short or\n"
+        f"    unavailable, verdict is INCOMPLETE-ROSTER — never a PASS you\n"
+        f"    guessed around the gap.\n"
+        f"  * A `needs-human` label anywhere on this bundle is a hard stop:\n"
+        f"    verdict NEEDS-HUMAN, and it is NEVER overridden — not by you,\n"
+        f"    not by the author.\n"
+        f"\n"
+        f"Post your verdict: an MR note pinned to the head sha, via\n"
+        f"`bdaya-glab mr note` (npx -y -p @shared/bdaya-gitlab@latest ...).\n"
+        f"The note is the durable oracle the landing gate reads.\n"
+        f"\n"
+        f"CLOSE THE LOOP (#893) — after posting the note:\n"
+        f"  * On PASS at head: YOU land the MR yourself:\n"
+        f"    `bdaya-glab mr land --project <p> --mr <n> --sha {head_sha}`\n"
+        f"    (sha pinned; the tool refuses a stale head). Reviewer != author\n"
+        f"    and this lane is fresh-context, so RV-1 holds — a `needs-human`\n"
+        f"    label is a hard stop: NEVER land past it.\n"
+        f"  * On NEEDS-CHANGES: do NOT land. Submit a follow-up AUTHOR task on\n"
+        f"    the ORIGINAL lane_key `{bundle.lane_key}` (role='author') via\n"
+        f"    `kanban_cluster_submit`, carrying your findings verbatim — the\n"
+        f"    fix round is a delivery into the author lane session (#833 rule #1).\n"
+    )
+
+
 def bundle_brief(bundle: BundlePlan) -> str:
     """The grouped delivery brief the lane receives. Carries the #762 sitting
     discipline and the non-dilution proof rules explicitly, because a bundle
@@ -361,4 +418,29 @@ def bundle_brief(bundle: BundlePlan) -> str:
         f"    sitting never re-derives a landed fix.\n"
         f"  * Escalate once, in a batch: one AskHumanQuestion with several\n"
         f"    questions beats N separate blocks.\n"
+        f"\n"
+        f"HAND-OFF (#893 — reviewer self-dispatch; no lead in the loop):\n"
+        f"  * Once your ONE Draft MR is pushed with EVERY per-issue disposition\n"
+        f"    note posted, do NOT park for the lead: call the\n"
+        f"    `kanban_cluster_submit` tool to create your OWN reviewer task —\n"
+        f"    `role='reviewer'`, `requires=['review']`,\n"
+        f"    `lane_key='{bundle.lane_key}-rev'`, priority = this task's\n"
+        f"    priority ({bundle.priority}), and the title = the full\n"
+        f"    INDEPENDENT REVIEW brief rendered by\n"
+        f"    `reviewer_handoff_brief(bundle, mr_url, head_sha)` — the single\n"
+        f"    source of that wording: it carries the MR URL, the head sha, the\n"
+        f"    issue list, the rubric (block only on CONFIRMED in-diff\n"
+        f"    correctness/acceptance/secret/CLAUDE.md-rule findings;\n"
+        f"    `INCOMPLETE-ROSTER` if SocratiCode is short; `NEEDS-HUMAN` never\n"
+        f"    overridden), the posting instruction (`bdaya-glab mr note` via\n"
+        f"    `npx -y -p @shared/bdaya-gitlab@latest`), and the CLOSE-THE-LOOP\n"
+        f"    rule: on PASS at head the REVIEWER lane lands the MR itself with\n"
+        f"    `bdaya-glab mr land --project <p> --mr <n> --sha <head>`\n"
+        f"    (reviewer != author, fresh context, so RV-1 holds; a\n"
+        f"    `needs-human` label is a hard stop — never land past it); on\n"
+        f"    NEEDS-CHANGES the reviewer submits a follow-up author task on\n"
+        f"    the ORIGINAL lane key `{bundle.lane_key}` with the findings.\n"
+        f"  * The author lane NEVER approves, merges, or reviews its own MR,\n"
+        f"    and it does not park for the lead — the hand-off above IS the\n"
+        f"    end of the author's duties for this sitting.\n"
     )
