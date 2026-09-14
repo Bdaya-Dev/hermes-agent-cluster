@@ -72,6 +72,12 @@ def create_app(
     db_path: str = "",
     store_backend: str = "",
     store_dsn_env: str = "HERMES_CLUSTER_PG_DSN",
+    # #899: per-process identity of this executor, carried on every /join so
+    # the main can refuse a SECOND executor for the same node id while the
+    # first is still heartbeating. serve() acquires the node-id single-
+    # instance lock and hands its token down; "" = no identity declared
+    # (older/manual launch — pre-#899 idempotent join semantics).
+    instance_token: str = "",
 ) -> FastAPI:
     """Create and configure the FastAPI application.
 
@@ -219,6 +225,8 @@ def create_app(
             max_concurrent=_worker_max_concurrent,
             capability_probes=node_capability_probes or None,
             disk_probe_path=_disk_probe_path,
+            # #899: declare this process's instance identity at /join.
+            instance_token=instance_token,
         )
 
     # Agent executor: when role=worker and agent_executor is configured+enabled,

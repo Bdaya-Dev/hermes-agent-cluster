@@ -93,6 +93,28 @@ def _npx_bin() -> str:
     return shutil.which("npx") or "npx"
 
 
+def _persisted_ids_refresh_interval(default: float = 15.0) -> float:
+    """How often a running executor re-reads the persisted spawn table.
+
+    #899: the single-instance lock and the /join 409 are the primary
+    defences, but a duplicate executor can still slip in beside a live
+    one (an older build without the lock, or a takeover racing the
+    watchdog window). The spawn-suppression set used to be built ONCE at
+    reconcile, so a record persisted by a sibling after our start was
+    invisible and we re-spawned the task. A periodic refresh closes that
+    window to one poll cycle; cheap (one indexed SELECT) and env-tunable
+    for tests. A negative/zero value disables refreshes (pre-#899
+    behaviour).
+    """
+    raw = os.environ.get("HERMES_CLUSTER_PERSISTED_REFRESH_S", "")
+    if raw:
+        try:
+            return float(raw)
+        except ValueError:
+            pass
+    return default
+
+
 def _tree_kill_kwargs() -> dict:
     """Popen kwargs that make the child killable as a TREE (#898).
 
@@ -380,8 +402,12 @@ class AgentExecutor:
         self._reconciled = False
         # Persisted task-id cache (F4): reconciled once from the store, then
         # maintained in-memory by _persist_spawn/_drop_persisted_spawn so the
-        # poll loop never re-reads SQLite. Reseeded by reconcile on start.
+        # poll loop never re-reads SQLite. Reseeded by reconcile on start,
+        # and re-read periodically while running (#899 — see
+        # _refresh_persisted_ids).
         self._persisted_ids: set = set()
+        self._persisted_refresh_s = _persisted_ids_refresh_interval()
+        self._last_persisted_refresh = 0.0
         # #897: terminal reports (complete/fail) that could not be delivered
         # because main was unreachable — retried every poll cycle with
         # exponential backoff. Keyed by (verb, task_id); each value holds
@@ -595,6 +621,11 @@ class AgentExecutor:
                 t.get("id", "")
                 for q in self._lane_released.values() for t in q
             }
+        # #899: re-read the persisted spawn table periodically (not only at
+        # reconcile) so a record written AFTER our start — by a sibling
+        # executor that bypassed the lock, or by ourselves mid-cycle — still
+        # suppresses a second spawn of the same task.
+        self._refresh_persisted_ids()
         active_task_ids |= self._persisted_spawn_task_ids()
 
         candidates = []
@@ -1423,60 +1454,120 @@ class AgentExecutor:
                 task_id = record.get("task_id", "")
                 if not task_id or task_id in self._active_spawns:
                     continue
-                lane_key = record.get("lane_key") or ""
-                role = record.get("role") or "author"
-                session_id = record.get("session_id") or ""
-                # Worker-restart re-attach by lane_key: if the record does not
-                # carry a session id but the lanes table knows the lane's
-                # session, recover it so a resume (not a fresh spawn) follows.
-                if lane_key and not session_id and getattr(self, "_store", None) is not None:
-                    try:
-                        lane = self._store.get_lane(lane_key)
-                        if lane:
-                            session_id = lane.get("session_id") or ""
-                    except Exception:
-                        logger.exception("failed to read lane %s during reconcile", lane_key)
-                spawn = ActiveSpawn(
-                    task_id=task_id,
-                    task_title=record.get("job_id") or task_id,
-                    process=_ResumedProcess(int(record.get("pid") or 0)),
-                    lease_id=record.get("lease_id") or "",
-                    started_at=float(record.get("started_at") or time.time()),
-                    lane_name=record.get("lane_name") or f"hermes-{task_id}",
-                    mode=record.get("mode") or "bdaya-dispatch",
-                    result_path=record.get("result_path") or "",
-                    attempt=_record_attempt(record),
-                    stdout_path=(
-                        str(self._hermes_stdout_path(task_id))
-                        if record.get("mode") == "hermes"
-                        else ""
-                    ),
-                    stderr_path=(
-                        record.get("stderr_path")
-                        or str(self._hermes_stderr_path(task_id))
-                        if record.get("mode") == "hermes"
-                        else record.get("stderr_path") or ""
-                    ),
-                    resumed=True,
-                    lane_key=lane_key,
-                    role=role,
-                    session_id=session_id,
-                )
-                self._active_spawns[task_id] = spawn
-                reconstituted += 1
-                if lane_key:
-                    # Block a duplicate worker for the lane's task (the spawn is
-                    # live-tracked again, not re-delivered to the same lane).
-                    logger.info(
-                        "reattached lane %s (session %s) to task %s after restart",
-                        lane_key, session_id or "?", task_id,
-                    )
+                if self._reattach_record_locked(record):
+                    reconstituted += 1
+        self._last_persisted_refresh = time.time()
         self._reconciled = True
         if reconstituted:
             logger.info(
                 "reconciled %d persisted spawn(s) from store — resuming tracking, "
                 "NOT re-spawning", reconstituted,
             )
+
+    def _reattach_record_locked(self, record: dict) -> bool:
+        """Rehydrate one persisted spawn record into the active-spawn table.
+
+        Caller holds self._lock. Returns True when a spawn was reattached.
+        #899: shared by reconcile-on-start and the periodic
+        _refresh_persisted_ids pass, so a record that appears WHILE the
+        executor runs (written by a sibling that bypassed the lock) is
+        tracked against its live pid exactly like a restart-time record —
+        the task never gets a second session and is reaped normally.
+        """
+        task_id = record.get("task_id", "")
+        if not task_id or task_id in self._active_spawns:
+            return False
+        lane_key = record.get("lane_key") or ""
+        role = record.get("role") or "author"
+        session_id = record.get("session_id") or ""
+        # Worker-restart re-attach by lane_key: if the record does not
+        # carry a session id but the lanes table knows the lane's
+        # session, recover it so a resume (not a fresh spawn) follows.
+        if lane_key and not session_id and getattr(self, "_store", None) is not None:
+            try:
+                lane = self._store.get_lane(lane_key)
+                if lane:
+                    session_id = lane.get("session_id") or ""
+            except Exception:
+                logger.exception("failed to read lane %s during reconcile", lane_key)
+        # #899: the record carries the child's pid — wrap it in the
+        # OS-level liveness stand-in so the reap keeps polling the REAL
+        # process (os.kill probe), not a guess.
+        spawn = ActiveSpawn(
+            task_id=task_id,
+            task_title=record.get("job_id") or task_id,
+            process=_ResumedProcess(int(record.get("pid") or 0)),
+            lease_id=record.get("lease_id") or "",
+            started_at=float(record.get("started_at") or time.time()),
+            lane_name=record.get("lane_name") or f"hermes-{task_id}",
+            mode=record.get("mode") or "bdaya-dispatch",
+            result_path=record.get("result_path") or "",
+            attempt=_record_attempt(record),
+            stdout_path=(
+                str(self._hermes_stdout_path(task_id))
+                if record.get("mode") == "hermes"
+                else ""
+            ),
+            stderr_path=(
+                record.get("stderr_path")
+                or str(self._hermes_stderr_path(task_id))
+                if record.get("mode") == "hermes"
+                else record.get("stderr_path") or ""
+            ),
+            resumed=True,
+            lane_key=lane_key,
+            role=role,
+            session_id=session_id,
+        )
+        self._active_spawns[task_id] = spawn
+        if lane_key:
+            # Block a duplicate worker for the lane's task (the spawn is
+            # live-tracked again, not re-delivered to the same lane).
+            logger.info(
+                "reattached lane %s (session %s) to task %s after restart",
+                lane_key, session_id or "?", task_id,
+            )
+        return True
+
+    def _refresh_persisted_ids(self) -> None:
+        """Re-read the persisted spawn table while running (#899).
+
+        Cheap guard behind the single-instance lock: any record that
+        appeared after reconcile — the fingerprint of a second executor
+        for this node id — is added to the suppression cache AND
+        re-attached live against its pid, so this executor spawns zero
+        sessions for it and the normal reap logic takes over. Throttled
+        to _persisted_refresh_s (env-tunable; <0 disables for pre-#899
+        behaviour).
+        """
+        if getattr(self, "_store", None) is None:
+            return
+        if self._persisted_refresh_s < 0:
+            return
+        now = time.time()
+        if now - self._last_persisted_refresh < self._persisted_refresh_s:
+            return
+        self._last_persisted_refresh = now
+        try:
+            records = self._store.get_all_task_spawns()
+        except Exception:
+            logger.warning("failed to refresh persisted spawn records", exc_info=True)
+            return
+        fresh = {r.get("task_id", "") for r in records} - {""}
+        added = fresh - self._persisted_ids
+        self._persisted_ids = fresh
+        if not added:
+            return
+        logger.warning(
+            "#899: %d spawn record(s) appeared after this executor started "
+            "(%s) — a second executor for node '%s' is writing them; "
+            "re-attaching instead of spawning",
+            len(added), sorted(added), self._node_id,
+        )
+        with self._lock:
+            for record in records:
+                if record.get("task_id", "") in added:
+                    self._reattach_record_locked(record)
 
     def _drop_persisted_spawn(self, task_id: str) -> None:
         """Remove a terminal spawn's record so a future run may spawn again."""

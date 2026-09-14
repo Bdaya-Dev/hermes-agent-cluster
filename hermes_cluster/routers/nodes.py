@@ -11,6 +11,7 @@ from ..models import (
     TaskStatus,
 )
 from ..state import ClusterState
+from ..core.node_manager import DuplicateInstanceJoin
 from ..core.disk_preflight import (
     DEFAULT_MIN_FREE_DISK_GB,
     disk_reason,
@@ -32,13 +33,21 @@ def init(state: ClusterState, node_manager=None):
 @router.post("/join", response_model=JoinResponse)
 async def join(req: JoinRequest):
     if _node_manager:
-        node = _node_manager.join(
-            node_id="node_" + req.node_name,
-            name=req.node_name,
-            capabilities=req.capabilities,
-            max_concurrent=req.max_concurrent,
-            disk_free_gb=req.disk_free_gb,
-        )
+        try:
+            node = _node_manager.join(
+                node_id="node_" + req.node_name,
+                name=req.node_name,
+                capabilities=req.capabilities,
+                max_concurrent=req.max_concurrent,
+                disk_free_gb=req.disk_free_gb,
+                # #899: refuse a SECOND executor for one node id while the
+                # first instance is still heartbeating (policy + rationale in
+                # NodeManager.join; older tokenless workers keep the
+                # idempotent pre-#899 re-join behaviour).
+                instance_token=req.instance_token,
+            )
+        except DuplicateInstanceJoin as exc:
+            raise HTTPException(status_code=409, detail=str(exc))
     else:
         # Fallback to direct state
         node_id = "node_" + req.node_name
@@ -48,6 +57,7 @@ async def join(req: JoinRequest):
             capabilities=req.capabilities,
             max_concurrent=req.max_concurrent,
             disk_free_gb=req.disk_free_gb,
+            instance_token=req.instance_token,
         )
         _state.register_node(node)
     return JoinResponse(node_id=node.id, status="registered")

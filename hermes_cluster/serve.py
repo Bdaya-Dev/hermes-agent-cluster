@@ -22,6 +22,10 @@ def main():
     parser.add_argument("--fed-token", default="", help="Federation auth token")
     parser.add_argument("--cluster-endpoint", default="", help="Main node endpoint (worker only)")
     parser.add_argument("--db-path", default="", help="SQLite path for a persistent cluster store (default: in-memory)")
+    # #899: per-process identity carried to /join so the main can tell two
+    # executors for the same node id apart. Hidden: set by the wrapper or a
+    # restart script, never by hand.
+    parser.add_argument("--instance-token", default="", help=argparse.SUPPRESS)
     args = parser.parse_args()
 
     # Load config from YAML if provided
@@ -81,6 +85,39 @@ def main():
         if go_dashboard.exists():
             static_dir = str(go_dashboard)
 
+    # --- #899: per-node-id single-instance lock (worker role) -------------
+    # Two live executors for one node id spawn every lane twice (measured
+    # 2026-09-14 on windows_desktop: :loop wrapper relaunch + Start-
+    # ScheduledTask = 4 executors, 81 orphan lane processes). The lock is
+    # taken BEFORE anything starts; refusal exits non-zero with a fixed,
+    # machine-detectable token (ALREADY RUNNING) the .cmd wrappers back off
+    # on. The OS releases the lock (a bound loopback socket) on exit, so a
+    # crash never wedges the restart. The main role keeps the pre-#899
+    # contract (uvicorn's --port bind is its own single-instance arbiter);
+    # the worker binds a local API port too, but that port is per-host-
+    # config, while the node id is what the fleet dedups on.
+    instance_token = args.instance_token or ""
+    _worker_lock = None
+    if args.node_role == "worker":
+        from .core import single_instance as _si
+        _lock_dir = None
+        if args.db_path and args.db_path != ":memory:":
+            _lock_dir = Path(args.db_path).expanduser().parent
+        elif config_path:
+            _lock_dir = Path(config_path).expanduser().parent
+        try:
+            _worker_lock = _si.acquire(args.node_id, data_dir=_lock_dir,
+                                       token=instance_token or None)
+        except _si.LockHeldByLiveInstance as exc:
+            print(f"single-instance lock held for node '{exc.node_id}': "
+                  f"ALREADY RUNNING (pid {exc.holder_pid})", file=sys.stderr)
+            print(str(exc), file=sys.stderr)
+            sys.exit(3)
+        except RuntimeError as exc:
+            print(f"single-instance lock error: {exc}", file=sys.stderr)
+            sys.exit(4)
+        instance_token = _worker_lock.token
+
     # Create and run app
     from .app import create_app
 
@@ -99,6 +136,9 @@ def main():
         db_path=getattr(args, "db_path", "") or "",
         store_backend=getattr(args, "store_backend", "") or "",
         store_dsn_env=getattr(args, "store_dsn_env", "") or "HERMES_CLUSTER_PG_DSN",
+        # #899: the worker lock's instance token rides to /join; main role
+        # passes whatever --instance-token carried (normally '').
+        instance_token=instance_token,
     )
 
     print(f"Starting hermes-cluster (Python) on {args.host}:{args.port}")
@@ -109,7 +149,14 @@ def main():
     print(f"Health:    http://{args.host}:{args.port}/health")
 
     import uvicorn
-    uvicorn.run(app, host=args.host, port=args.port)
+    try:
+        uvicorn.run(app, host=args.host, port=args.port)
+    finally:
+        # #899: release the node-id lock on graceful shutdown (the OS frees
+        # it on any exit anyway; this keeps the lock file tidy for the
+        # documented restart path).
+        if _worker_lock is not None:
+            _worker_lock.release()
 
 
 if __name__ == "__main__":

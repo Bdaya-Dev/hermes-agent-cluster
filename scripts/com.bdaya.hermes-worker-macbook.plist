@@ -1,0 +1,66 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  com.bdaya.hermes-worker-macbook.plist — canonical #899 LaunchAgent
+  template (macOS members, e.g. macbook_worker).
+
+  WHY KeepAlive STAYS TRUE here (the .cmd wrappers' :loop equivalent): the
+  worker process dying for an unexpected reason must relaunch — but the
+  double-executor class of bug is broken LOUDER than the wrapper: serve's
+  per-node-id single-instance lock exits 3 ("ALREADY RUNNING") before a
+  second instance can poll anything, and launchd's throttle below backs the
+  relaunch off.
+
+  RESTART PATH (documented in README "Restarting a worker" — the ONLY
+  sanctioned way; kill-the-python-child is the #899 incident shape):
+
+    launchctl bootout gui/$(id -u)/com.bdaya.hermes-worker-macbook || true
+    # wait for zero serve processes (the bootout is async; KeepAlive would
+    # otherwise respawn before the SIGTERM lands):
+    while pgrep -f 'hermes_cluster.serve' >/dev/null; do sleep 0.5; done
+    launchctl bootstrap gui/$(id -u) \
+      ~/Library/LaunchAgents/com.bdaya.hermes-worker-macbook.plist
+
+  ThrottleInterval 30s >= lock refusal backoff keeps a wedged sibling
+  from becoming a log-spam loop.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.bdaya.hermes-worker-macbook</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/ahmed/hermes-cluster/.venv/bin/python</string>
+    <string>-m</string>
+    <string>hermes_cluster.serve</string>
+    <string>--config</string>
+    <string>/Users/ahmed/hermes-cluster/cluster-worker-macbook.yaml</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/ahmed/hermes-cluster</string>
+
+  <key>RunAtLoad</key>
+  <true/>
+
+  <key>KeepAlive</key>
+  <dict>
+    <!-- Relaunch on crash; exit code 3 (ALREADY RUNNING: lock held by a
+         live sibling) must NOT thrash — launchd still throttles via
+         ThrottleInterval below, and serve's refusal is a clean, loud,
+         zero-side-effect exit. -->
+    <key>SuccessfulExit</key>
+    <false/>
+  </dict>
+
+  <key>ThrottleInterval</key>
+  <integer>30</integer>
+
+  <key>StandardOutPath</key>
+  <string>/Users/ahmed/hermes-lanes/worker-macbook.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/ahmed/hermes-lanes/worker-macbook.err.log</string>
+</dict>
+</plist>

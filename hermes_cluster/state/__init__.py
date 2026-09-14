@@ -174,6 +174,13 @@ class ClusterState:
             if node_id in self._nodes:
                 self._nodes[node_id].max_concurrent = max(0, int(max_concurrent))
 
+    def update_instance_token(self, node_id: str, instance_token: str) -> None:
+        """#899: record which executor instance currently owns this node id
+        (a re-join re-declares it; the /join gate reads it)."""
+        with self._nodes_lock:
+            if node_id in self._nodes:
+                self._nodes[node_id].instance_token = instance_token or ""
+
     def node_count(self) -> int:
         with self._nodes_lock:
             return len(self._nodes)
