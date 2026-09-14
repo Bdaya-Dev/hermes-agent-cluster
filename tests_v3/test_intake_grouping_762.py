@@ -162,7 +162,7 @@ def _two_repo_routes():
             _issue_json(201, "backend gap", "invora/invora-backend", 276),
         ],
         "/merge_requests": lambda req: [],
-        "/links": lambda req: {"closed": [], "open": []},
+        "/links": lambda req: [],
     }
 
 
@@ -200,7 +200,7 @@ def test_lane_branch_map_overrides_default(clean_env, monkeypatch):
             _issue_json(762, "tooling thing", "shared/claude-plugins", 339,
                         labels=["hermes-factory"])],
         "/merge_requests": lambda req: [],
-        "/links": lambda req: {"closed": [], "open": []},
+        "/links": lambda req: [],
     }
     poller = _poller(st, routes, _cfg(
         [{"type": "project", "path": "shared/claude-plugins",
@@ -242,7 +242,7 @@ def test_next_sitting_after_current_terminal(clean_env, monkeypatch):
             _issue_json(302, "two", "invora/invora-flutter", 275),
         ],
         "/merge_requests": lambda req: [],
-        "/links": lambda req: {"closed": [], "open": []},
+        "/links": lambda req: [],
     }
     cfg = _cfg([{"type": "group", "path": "invora", "enabled": True}],
                grouping=_grouping_policy(max_bundle_size=1))
@@ -283,7 +283,7 @@ def test_skip_labels_never_bundled(clean_env, monkeypatch):
                         labels=["epic"]),
         ],
         "/merge_requests": lambda req: [],
-        "/links": lambda req: {"closed": [], "open": []},
+        "/links": lambda req: [],
     }
     poller = _poller(st, routes, _cfg(
         [{"type": "group", "path": "invora", "enabled": True}],
@@ -306,7 +306,7 @@ def test_dspawn1_artifact_carrying_issue_not_grouped(clean_env, monkeypatch):
         ],
         "/merge_requests": [_mr_json(900, "fix 502", "invora/invora-flutter",
                                      desc="Refs #502")],
-        "/links": lambda req: {"closed": [], "open": []},
+        "/links": lambda req: [],
     }
     poller = _poller(st, routes, _cfg(
         [{"type": "group", "path": "invora", "enabled": True}],
@@ -324,13 +324,17 @@ def test_dag_open_blocker_outside_bundle_held(clean_env, monkeypatch):
     st = ClusterState()
 
     def links(request):
-        path = request.url.path
-        iid = path.rstrip("/").split("/")[-2]
+        # REAL GitLab shape: a JSON ARRAY of linked-issue objects with a
+        # SCALAR `link_type` (captured from gitlab.bdaya-dev.com for
+        # invora/invora-flutter#465; see fixtures/gitlab_links_real_shape.py
+        # — the old {"closed":..,"open":..} mock shape does not exist and let
+        # the 097d7ea7 crash ship).
+        iid = request.url.path.rstrip("/").split("/")[-2]
         if iid == "602":
-            return {"closed": [], "open": [
-                {"iid": 601, "state": "opened", "link_types": ["is_blocked_by"],
-                 "references": {"full": "invora/invora-flutter#601"}}]}
-        return {"closed": [], "open": []}
+            return [{"iid": 601, "project_id": 275, "state": "opened",
+                     "link_type": "is_blocked_by",
+                     "references": {"full": "invora/invora-flutter#601"}}]
+        return []
 
     routes = {
         "/groups/invora/issues": [
@@ -362,10 +366,11 @@ def test_dag_blocker_inside_batch_not_held(clean_env, monkeypatch):
     def links(request):
         iid = request.url.path.rstrip("/").split("/")[-2]
         if iid == "612":
-            return {"closed": [], "open": [
-                {"iid": 611, "state": "opened", "link_types": ["is_blocked_by"],
-                 "references": {"full": "invora/invora-flutter#611"}}]}
-        return {"closed": [], "open": []}
+            # REAL array shape — see test_dag_open_blocker_outside_bundle_held.
+            return [{"iid": 611, "project_id": 275, "state": "opened",
+                     "link_type": "is_blocked_by",
+                     "references": {"full": "invora/invora-flutter#611"}}]
+        return []
 
     routes = {
         "/groups/invora/issues": [
@@ -399,7 +404,7 @@ def test_bundle_size_cap_and_next_sitting_queue(clean_env, monkeypatch):
     routes = {
         "/groups/invora/issues": issues,
         "/merge_requests": lambda req: [],
-        "/links": lambda req: {"closed": [], "open": []},
+        "/links": lambda req: [],
     }
     poller = _poller(st, routes, _cfg(
         [{"type": "group", "path": "invora", "enabled": True}],
@@ -505,7 +510,7 @@ def test_band0_bundle_bypasses_queued_band3_bundle(clean_env, monkeypatch):
     routes = {
         "/groups/invora/issues": issues_v1,
         "/merge_requests": lambda req: [],
-        "/links": lambda req: {"closed": [], "open": []},
+        "/links": lambda req: [],
     }
     poller = _poller(st, routes, cfg)
     res1 = asyncio.run(poller.poll_once())
@@ -541,7 +546,7 @@ def test_band0_packs_ahead_within_a_cycle(clean_env, monkeypatch):
             _issue_json(813, "b2", "invora/invora-flutter", 275),
         ],
         "/merge_requests": lambda req: [],
-        "/links": lambda req: {"closed": [], "open": []},
+        "/links": lambda req: [],
     }
     poller = _poller(st, routes, _cfg(
         [{"type": "group", "path": "invora", "enabled": True}],
@@ -615,7 +620,7 @@ def test_inflight_legacy_task_blocks_its_issue(clean_env, monkeypatch):
             _issue_json(484, "fresh", "invora/invora-backend", 276),
         ],
         "/merge_requests": lambda req: [],
-        "/links": lambda req: {"closed": [], "open": []},
+        "/links": lambda req: [],
     }
     poller = _poller(st, routes, _cfg(
         [{"type": "group", "path": "invora", "enabled": True}],
