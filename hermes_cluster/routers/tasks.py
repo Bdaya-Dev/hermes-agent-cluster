@@ -203,6 +203,22 @@ async def submit_task(req: SubmitTaskRequest):
     # the top one — and must survive to the store untouched (#866). Range
     # 0..5 is validated by SubmitTaskRequest, so out-of-band is already 422.
     priority = DEFAULT_PRIORITY if req.priority is None else req.priority
+    # #905: honor depends_on at create. The ids must exist — a dependency on
+    # a nonexistent task is unsatisfiable forever (trigger_pending_tasks
+    # demotes nothing, _trigger_downstream never fires), so fail loud at the
+    # boundary instead of quietly storing a task that can never run. Self-
+    # dependency is impossible here (task_id is brand new and uninserted).
+    deps = [d for d in (req.depends_on or []) if d]
+    missing = [d for d in deps if _state.get_task(d) is None]
+    if missing:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"depends_on names unknown task(s): {', '.join(missing)} — "
+                "a task waiting on a dependency that does not exist can "
+                "never be promoted (#905)"
+            ),
+        )
     task = _state.create_task(
         task_id,
         req.title,
@@ -210,11 +226,14 @@ async def submit_task(req: SubmitTaskRequest):
         priority,
         lane_key=req.lane_key,
         role=req.role,
+        depends_on=deps,
     )
-    # Promote pending → ready (tasks with no deps go to ready immediately)
+    # Promote pending → ready (tasks with no deps go to ready immediately;
+    # #905: a task WITH deps stays pending until they all complete — the
+    # promotion engine in trigger_pending_tasks is the single gate).
     # But do NOT auto-assign to nodes — use /schedule/trigger for that
     _state.trigger_pending_tasks()
-    return task
+    return _state.get_task(task_id) or task
 
 
 @router.get("")

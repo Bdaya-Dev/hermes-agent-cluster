@@ -777,6 +777,14 @@ class SubmitTaskRequest(BaseModel):
     priority: Optional[int] = Field(default=None, ge=0, le=5)
     lane_key: str = ""  # stateful lane identity (e.g. "shared/claude-plugins#feat/x")
     role: str = "author"  # "author" | "reviewer"
+    # #905: task IDs that must reach a terminal-completed state before this
+    # task may run — the verdict-gated landing contract (#902). Until now the
+    # field existed on the Task model and every GET payload, but NOT here, so
+    # Pydantic silently dropped it from POST /api/v1/tasks and a landing task
+    # "waiting on the reviewer" went straight to ready and stranded the PR.
+    # Validation of the ids (they must exist) lives in the create handler:
+    # a 422 on a dangling dep beats a task that can never be promoted.
+    depends_on: List[str] = []
 
 
 class CompleteTaskRequest(BaseModel):

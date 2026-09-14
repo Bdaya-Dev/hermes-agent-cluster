@@ -662,30 +662,37 @@ class PostgresClusterStore:
         role: str = "author",
         description: str = "",
         issues: Optional[List[str]] = None,
+        depends_on: Optional[List[str]] = None,
     ) -> Task:
         now = _utcnow()
-        # One transaction: insert-if-absent then promote pending->ready
-        # (no dependencies at creation, mirroring the SQLite store). These
-        # MUST be sequential statements — sibling data-modifying CTEs in one
-        # query do not see each other's rows on Postgres. The status-guarded
-        # UPDATE keeps concurrent create/demote writers correct.
+        deps = list(depends_on or [])
+        # One transaction: insert-if-absent then promote pending->ready —
+        # but ONLY when the row has no dependencies (#905: the hosted main is
+        # the Postgres store; a landing task created with depends_on=[reviewer]
+        # must stay pending until the reviewer completes, and
+        # trigger_pending_tasks is the single promotion gate). These MUST be
+        # sequential statements — sibling data-modifying CTEs in one query do
+        # not see each other's rows on Postgres. The status-guarded UPDATE
+        # keeps concurrent create/demote writers correct.
         async with self._txn() as conn:
             await conn.execute(
                 """INSERT INTO tasks
                    (id, title, requires, depends_on, priority, status,
                     created_at, updated_at, version, lane_key, role,
                     description, issues)
-                   VALUES ($1, $2, $3, '[]', $4, $5, $6, $6, 1, $7, $8, $9, $10)
+                   VALUES ($1, $2, $3, $4, $5, $6, $7, $7, 1, $8, $9, $10, $11)
                    ON CONFLICT (id) DO NOTHING""",
-                task_id, title, _json_dumps(requires), priority,
+                task_id, title, _json_dumps(requires), _json_dumps(deps),
+                priority,
                 TaskStatus.pending.value, now, lane_key, role,
                 description, _json_dumps(list(issues or [])),
             )
-            await conn.execute(
-                """UPDATE tasks SET status = $1, updated_at = $2
-                   WHERE id = $3 AND status = $4""",
-                TaskStatus.ready.value, now, task_id, TaskStatus.pending.value,
-            )
+            if not deps:
+                await conn.execute(
+                    """UPDATE tasks SET status = $1, updated_at = $2
+                       WHERE id = $3 AND status = $4""",
+                    TaskStatus.ready.value, now, task_id, TaskStatus.pending.value,
+                )
             row = await conn.fetchrow("SELECT * FROM tasks WHERE id = $1", task_id)
         return self._row_to_task(row)
 
@@ -711,19 +718,24 @@ class PostgresClusterStore:
                        (id, title, requires, depends_on, priority, status,
                         created_at, updated_at, version, lane_key, role,
                         description, issues)
-                       VALUES ($1, $2, $3, '[]', $4, $5, $6, $6, 1, $7, $8, $9, $10)
+                       VALUES ($1, $2, $3, $4, $5, $6, $7, $7, 1, $8, $9, $10, $11)
                        ON CONFLICT (id) DO NOTHING""",
                     plan["task_id"], plan["title"],
                     _json_dumps(list(plan.get("requires") or [])),
+                    _json_dumps(list(plan.get("depends_on") or [])),
                     plan.get("priority", 3),
                     TaskStatus.pending.value, now,
                     plan.get("lane_key", ""), plan.get("role", "author"),
                     plan.get("description", ""),
                     _json_dumps(list(plan.get("issues") or [])),
                 )
-            # Promote ONLY this batch's rows (no dependencies at creation,
-            # mirroring create_task's status-guarded UPDATE).
-            ids = [plan["task_id"] for plan in plans]
+            # Promote ONLY this batch's dependency-free rows (see the SQLite
+            # twin: an unconditional promote of every batch id dropped the
+            # pending hold on plans that DO carry depends_on, #905).
+            # Mirrors create_task's status-guarded UPDATE.
+            ids = [plan["task_id"] for plan in plans
+                   if not plan.get("depends_on")]
+            all_ids = [plan["task_id"] for plan in plans]
             if ids:
                 await conn.execute(
                     f"""UPDATE tasks SET status = $1, updated_at = $2
@@ -732,7 +744,7 @@ class PostgresClusterStore:
                     TaskStatus.pending.value,
                 )
             rows = await conn.fetch(
-                "SELECT * FROM tasks WHERE id = ANY($1::text[])", ids)
+                "SELECT * FROM tasks WHERE id = ANY($1::text[])", all_ids)
         return [self._row_to_task(r) for r in rows]
 
     async def get_task(self, task_id: str) -> Optional[Task]:
