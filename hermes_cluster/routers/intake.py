@@ -919,7 +919,7 @@ class _GitLabPoller:
         self.last_poll: Optional[datetime] = None
         self.issues_seen = 0
         self.tasks_created = 0
-        self.last_errors: Dict[str, str] = {}
+        self.last_errors: Dict[str, Any] = {}
         self._seen_keys: set = set()
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
@@ -927,6 +927,20 @@ class _GitLabPoller:
     @property
     def interval(self) -> int:
         return int(self.defaults["interval"])
+
+    def _record_error(self, stage: str, exc: BaseException) -> None:
+        """Alarm a cycle failure in ``last_errors`` (the instrument must be
+        able to scream): the 097d7ea7 pod raised every 60s while status said
+        ``last_errors:{}``. Records type, message, failing stage, ISO
+        timestamp, and a per-stage repeat count."""
+        prev = self.last_errors.get(stage)
+        count = (prev.get("count", 0) + 1) if isinstance(prev, dict) else 1
+        self.last_errors[stage] = {
+            "type": type(exc).__name__,
+            "message": str(exc)[:500],
+            "count": count,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
 
     def start(self):
         self._thread = threading.Thread(target=self._run, daemon=True, name="gitlab-intake-poller")
@@ -943,7 +957,9 @@ class _GitLabPoller:
                 cycle = loop.run_until_complete(self.poll_once())
                 interval = cycle.get("interval_seconds", self.interval)
                 loop.close()
-            except Exception:
+                self.last_errors.pop("poll_cycle", None)
+            except Exception as e:
+                self._record_error("poll_cycle", e)
                 logger.exception("GitLab intake poll cycle failed")
             # Clamp so a pathological policy value cannot spin or stall the
             # loop; bounds are operational safety, not configuration.
@@ -1020,12 +1036,16 @@ class _GitLabPoller:
 
     async def _held_by_open_blockers(self, client: httpx.AsyncClient,
                                      endpoint: str, issue_id: str,
-                                     batch_ids: set) -> set:
+                                     batch_ids: set,
+                                     blocker_types: frozenset = frozenset(
+                                         ("is_blocked_by", "blocked_by"))) -> set:
         """GitLab DAG authority (AB-1): issue ids in ``batch_ids``
         ('<path>#<iid>') with an is_blocked_by blocker OUTSIDE the batch that
         is still open. Returns the held set (fail-closed: a failed links
         lookup holds the issue for this cycle rather than bundling an
-        unordered fix)."""
+        unordered fix). ``blocker_types`` comes from the grouping policy's
+        ``blocker_link_types`` (previously a defined-but-never-read config
+        surface)."""
         path, iid = issue_id.rsplit("#", 1)
         quoted = urllib.parse.quote(path, safe="")
         held: set = set()
@@ -1040,9 +1060,19 @@ class _GitLabPoller:
             logger.warning("intake: blocker links failed for %s (%s); held",
                            issue_id, e)
             return {issue_id}
-        for dep in (links.get("closed") or []) + (links.get("open") or []):
-            link_types = dep.get("link_types") or []
-            if not any(t in ("is_blocked_by", "blocked_by") for t in link_types):
+        # GitLab's links endpoint returns a JSON ARRAY of linked-issue
+        # objects, each carrying a SCALAR `link_type` plus `state` — NOT an
+        # {"open": [...], "closed": [...]} object with `link_types` lists.
+        # (The 097d7ea7 crash: `.get()` on that list killed every grouped
+        # poll; shared/claude-plugins#895.)
+        if not isinstance(links, list):
+            logger.warning("intake: unexpected links shape for %s (%s); held",
+                           issue_id, type(links).__name__)
+            return {issue_id}
+        for dep in links:
+            if not isinstance(dep, dict):
+                continue
+            if dep.get("link_type") not in blocker_types:
                 continue
             dep_refs = dep.get("references") or {}
             dep_full = dep_refs.get("full", "")
@@ -1058,7 +1088,7 @@ class _GitLabPoller:
 
     async def _grouped_cycle(self, client: httpx.AsyncClient, endpoint: str,
                              policy: GitLabIntakePolicy,
-                             scoped: List[Tuple[List[Dict[str, Any]], IntakeScope]],
+                             scoped: List[Tuple[List[Dict[str, Any]], Optional[IntakeScope]]],
                              created_ids: List[str]) -> None:
         """LFP-1 grouped intake (#762): one lane-bundle task per client×repo
         batch instead of one task per issue.
@@ -1103,6 +1133,21 @@ class _GitLabPoller:
         view, blocked_ids, legacy_iids = _grouping_view(self.state)
         requires = policy.requires
 
+        # ALL-OR-NOTHING (crash-mid-cycle must not leave half-published
+        # bundles): PHASE 1 — run every fallible GitLab I/O and build the
+        # plans; PHASE 2 — only then create the tasks, in ONE store
+        # transaction via create_tasks_batch (any exception rolls back every
+        # row — the per-task create_task loop that lived here committed one
+        # transaction PER task, so a crash between two PHASE-2 writes stranded
+        # a partial batch on the SQLite/Postgres stores; PR#43 review finding
+        # 3). The store has no delete_task, so rollback is impossible AFTER
+        # a commit — the guarantee is: nothing fallible remains between the
+        # plans and the single commit. (097d7ea7 pod: the links-shape crash
+        # fired per-repo INSIDE the old loop, so any earlier repo's bundle
+        # had already been created and sat 'ready' with a crashed cycle
+        # behind it.)
+        pending_plans: List[BundlePlan] = []
+
         for proj_path, pairs in by_repo.items():
             lane_key = lane_key_for(proj_path, cfg)
             # Candidates still WAITING: exclude issues already held by a
@@ -1146,8 +1191,10 @@ class _GitLabPoller:
             # DAG: hold any batch issue whose out-of-batch blocker is open.
             batch_ids = set(plan.issue_ids)
             held: set = set()
+            blocker_types = frozenset(cfg.blocker_link_types)
             for pid in plan.issue_ids:
-                held |= await self._held_by_open_blockers(client, endpoint, pid, batch_ids)
+                held |= await self._held_by_open_blockers(
+                    client, endpoint, pid, batch_ids, blocker_types)
             if held:
                 keep = [c for c in plans if c[0] not in held]
                 if not keep:
@@ -1156,7 +1203,48 @@ class _GitLabPoller:
                                             project_of=lambda pid: pid.rsplit("#", 1)[0])
                 if plan is None:
                     continue
-            task = _create_bundle_task(self.state, plan, requires)
+            pending_plans.append(plan)
+
+        # PHASE 2 — ONE atomic batch write. Every fallible step already
+        # survived in phase 1, and the store publishes the whole set in a
+        # single transaction (create_tasks_batch: one _tx/_txn for all rows;
+        # any exception rolls back every task — see
+        # tests_v3/test_intake_batch_create_txn_43r.py), so a crash between
+        # two bundle writes cannot strand a partial batch. The old per-task
+        # create_task loop left exactly that residue on the SQLite/Postgres
+        # stores (PR#43 review finding 3; the hosted main runs Postgres).
+        plans_payload: List[Dict[str, Any]] = []
+        for plan in pending_plans:
+            task_id = "task_" + secrets.token_hex(8)
+            plans_payload.append(dict(
+                task_id=task_id,
+                title=bundle_title(plan),
+                requires=list(requires),
+                priority=plan.priority,
+                lane_key=plan.lane_key,
+                role="author",
+                description=bundle_brief(plan),
+                issues=list(plan.issue_ids),
+            ))
+        if not plans_payload:
+            return
+        # The batch primitive exists on all three stores (ClusterState,
+        # ClusterStore, PostgresClusterStore + the SyncPostgres bridge via
+        # __getattr__). Anything older fails LOUD — a silent fallback to
+        # per-task writes would reintroduce the partial-batch window.
+        tasks = self.state.create_tasks_batch(plans_payload)
+        # Bookkeeping runs ONLY after the commit: a rolled-back batch must
+        # not leave dedup entries pointing at tasks that don't exist (the
+        # issue would be intake-invisible forever) nor consume _seen_keys.
+        # Matched by id, not position: an INSERT-IGNORE'd duplicate would
+        # otherwise misattribute a task id to the wrong bundle.
+        by_id = {t.id: t for t in tasks}
+        for plan, payload in zip(pending_plans, plans_payload):
+            task = by_id.get(payload["task_id"])
+            if task is None:  # id collided with an existing row: dedup to it
+                task = self.state.get_task(payload["task_id"])
+                if task is None:
+                    continue
             for pid in plan.issue_ids:
                 _issue_dedup_to_task_id[pid] = task.id
                 self._seen_keys.add(pid)
@@ -1164,6 +1252,13 @@ class _GitLabPoller:
             created_ids.append(task.id)
             logger.info("intake: grouped lane task %s lane=%s bundle=%s (%s)",
                         task.id, plan.lane_key, plan.issue_ids, plan.reason)
+        # Same 'queue it now' kick as the per-issue path, ONCE for the batch.
+        # The lane-block guard inside the scheduler keeps one sitting per lane
+        # key — band-0 bundles still jump the QUEUE (priority sort), they only
+        # wait for an ACTIVE sitting on the same lane, exactly as a per-issue
+        # task did when the lane plugin denied a second session (#833 rule #1).
+        self.state.trigger_pending_tasks()
+        self.state.schedule_pending()
 
     async def poll_once(self) -> Dict[str, Any]:
         """One intake cycle: policy scopes when configured, else legacy env.
@@ -1232,7 +1327,16 @@ class _GitLabPoller:
                         continue
                     self.last_errors.pop(base, None)
                     scoped.append((issues, scope))
-                await self._grouped_cycle(client, endpoint, policy, scoped, created_ids)
+                try:
+                    await self._grouped_cycle(client, endpoint, policy, scoped,
+                                              created_ids)
+                    self.last_errors.pop("grouped_cycle", None)
+                except Exception as e:
+                    # THE INSTRUMENT MUST SCREAM: a raising grouped cycle
+                    # used to vanish into _run's blanket except while status
+                    # reported last_errors:{} every 60s (097d7ea7 pod).
+                    self._record_error("grouped_cycle", e)
+                    logger.exception("intake: grouped cycle failed")
                 self.last_poll = datetime.now(timezone.utc)
                 result["created"] = created_ids
                 return result

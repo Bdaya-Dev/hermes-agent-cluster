@@ -218,6 +218,40 @@ class ClusterState:
             self._tasks[task_id] = task
         return task
 
+    def create_tasks_batch(self, plans: List[Dict[str, Any]]) -> List[Task]:
+        """Create MANY tasks atomically — one bundle per grouped-intake PHASE-2
+        plan, all published or none (PR#43 review finding 3).
+
+        ``plans``: dicts of ``create_task`` kwargs (task_id, title, requires,
+        priority, lane_key, role, description, issues). Every Task is built
+        BEFORE any state mutation, so an exception raised while assembling a
+        later row leaves the store untouched; publishing is one update under
+        the lock. Depends-on-free rows are promoted to ready inline, matching
+        ``create_task``-followed-by-``trigger_pending_tasks``.
+        """
+        now = datetime.utcnow()
+        tasks: List[Task] = []
+        for plan in plans:
+            tasks.append(Task(
+                id=plan["task_id"],
+                title=plan["title"],
+                requires=list(plan.get("requires") or []),
+                priority=plan.get("priority", 3),
+                status=TaskStatus.ready if not plan.get("depends_on")
+                else TaskStatus.pending,
+                created_at=now,
+                updated_at=now,
+                version=1,
+                lane_key=plan.get("lane_key", ""),
+                role=plan.get("role", "author"),
+                description=plan.get("description", ""),
+                issues=list(plan.get("issues") or []),
+            ))
+        with self._tasks_lock:
+            for task in tasks:
+                self._tasks[task.id] = task
+        return tasks
+
     def get_task(self, task_id: str) -> Optional[Task]:
         with self._tasks_lock:
             return self._tasks.get(task_id)

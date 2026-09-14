@@ -555,6 +555,56 @@ class ClusterStore:
             description=description, issues=list(issues or []),
         )
 
+    def create_tasks_batch(self, plans: List[Dict[str, Any]]) -> List[Task]:
+        """Create MANY tasks atomically — one bundle per grouped-intake
+        PHASE-2 plan, all published or none (PR#43 review finding 3).
+
+        ``ClusterStore.create_task`` opens one transaction PER task, so a
+        crash between two PHASE-2 writes stranded a partial batch on disk
+        (the hosted main runs this class). Here every insert+promote runs
+        inside ONE ``_tx``: the context manager's except-branch rolls back
+        the whole batch on any exception, and the single commit publishes
+        all rows together. Same per-row semantics as ``create_task``
+        (INSERT OR IGNORE + status-guarded pending->ready promotion); the
+        kick (trigger/schedule) stays in the caller so the batch is pure
+        persistence.
+        """
+        now = datetime.utcnow()
+        now_s = _dt_to_str(now)
+        with self._tx() as conn:
+            for plan in plans:
+                conn.execute(
+                    """INSERT OR IGNORE INTO tasks
+                       (id, title, requires, depends_on, priority, status, created_at, updated_at, version, lane_key, role, description, issues)
+                       VALUES (?, ?, ?, '[]', ?, ?, ?, ?, 1, ?, ?, ?, ?)""",
+                    (plan["task_id"], plan["title"],
+                     _json_dumps(list(plan.get("requires") or [])),
+                     plan.get("priority", 3),
+                     TaskStatus.pending.value, now_s, now_s,
+                     plan.get("lane_key", ""), plan.get("role", "author"),
+                     plan.get("description", ""),
+                     _json_dumps(list(plan.get("issues") or []))),
+                )
+            # Promote ONLY this batch's rows (no dependencies at creation,
+            # mirroring create_task's per-id guarded UPDATE — a global
+            # status-filter UPDATE would wrongly promote dependency-held
+            # pending tasks created by other callers).
+            ids = [plan["task_id"] for plan in plans]
+            placeholders = ",".join("?" for _ in ids)
+            conn.execute(
+                f"""UPDATE tasks SET status = ?, updated_at = ?
+                    WHERE id IN ({placeholders}) AND status = ?""",
+                [TaskStatus.ready.value, now_s] + ids
+                + [TaskStatus.pending.value],
+            )
+        out: List[Task] = []
+        for plan in plans:
+            task = self.get_task(plan["task_id"])
+            if task is None:  # INSERT OR IGNORE hit an existing id
+                continue
+            out.append(task)
+        return out
+
     def get_task(self, task_id: str) -> Optional[Task]:
         with self._lock:
             row = self._conn.execute(
