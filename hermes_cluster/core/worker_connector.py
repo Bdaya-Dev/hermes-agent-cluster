@@ -25,12 +25,15 @@ import hashlib
 import hmac
 import json
 import logging
+import subprocess
 import threading
 import time
 from pathlib import Path
 from typing import Dict, List, Optional
 from urllib.request import Request, urlopen
 from urllib.error import URLError
+
+from .disk_preflight import disk_free_gb
 
 logger = logging.getLogger(__name__)
 
@@ -99,6 +102,34 @@ _connector_started = False
 _connector_lock = threading.Lock()
 
 
+def run_probe(name: str, spec: dict) -> bool:
+    """Execute one capability probe command; True iff it exits 0 (#867)."""
+    cmd = spec.get("command") or []
+    if not cmd:
+        return False
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True,
+                              timeout=int(spec.get("timeout_s", 120)))
+        ok = proc.returncode == 0
+        if not ok:
+            logger.warning("capability probe %s failed (rc=%d): %s",
+                           name, proc.returncode, (proc.stdout or "").strip()[-160:])
+        return ok
+    except Exception as e:
+        logger.warning("capability probe %s errored: %s", name, e)
+        return False
+
+
+def declared_capabilities(static_caps: List[str], probes: Dict[str, dict],
+                          states: Dict[str, bool]) -> List[str]:
+    """Static caps + only the probed caps currently passing. A capability
+    named by BOTH config and a probe is treated as probe-gated (#867): the
+    node declares it only while its probe succeeds."""
+    gated = set(probes.keys())
+    return sorted({c for c in static_caps if c not in gated}
+                  | {c for c, ok in states.items() if ok})
+
+
 def start_worker_connector(
     node_id: str,
     cluster_endpoint: str,
@@ -106,6 +137,9 @@ def start_worker_connector(
     peer_token: str = "",
     heartbeat_interval: float = 10.0,
     max_concurrent: int = 0,
+    capability_probes: Optional[Dict[str, dict]] = None,
+    disk_probe_path: str = "",
+    instance_token: str = "",
 ) -> None:
     """Start the outbound worker connector thread.
 
@@ -121,6 +155,28 @@ def start_worker_connector(
         max_concurrent: maximum simultaneously-assigned tasks this worker can
             run; declared at /join so the main scheduler honours the ceiling
             when assigning tasks (#833). 0 = unlimited.
+        capability_probes: optional {capability: {"command": [...],
+            "interval_s": int}} — a capability is DECLARED ONLY while its probe
+            command exits 0 (#867). Proves per-node reachability mechanically
+            (e.g. the bdaya-lane-agent App key is provisioned here and can
+            mint), so a task `requires: [github-write]` can never be dispatched
+            to a node whose credential is missing — the #867 silent mid-lane
+            failure becomes a loud dispatch-time miss. Re-run on
+            interval_s (default 300); a capability lost mid-run is PATCHed off.
+        disk_probe_path: #892 — volume/path whose free space is reported as
+            ``disk_free_gb`` in EVERY join and heartbeat payload (the main
+            degrades the node while the report is below node.min_free_disk_gb).
+            Empty resolves to HERMES_HOME, then the lanes default dir, then cwd;
+            an unreadable volume reports nothing (field omitted — the main then
+            keeps the pre-#892 semantics for this worker).
+        instance_token: #899 — this process's single-instance identity,
+            carried in the /join payload so the main can REFUSE a second
+            executor for the same node id while the first instance is still
+            heartbeating (409, retried loudly like any failed join — a 409
+            means a duplicate exists somewhere and an operator must stop
+            one; the survivor keeps heartbeating regardless). Empty (older
+            launch path) omits the field — pre-#899 tokenless join
+            semantics are preserved.
     """
     global _connector_started
     with _connector_lock:
@@ -129,6 +185,20 @@ def start_worker_connector(
             return
         _connector_started = True
 
+    # #892: resolve the disk-probe target ONCE per path value (per-call reads
+    # are cheap; keep a callable for tests / explicit wiring).
+    def _disk_probe_target() -> str:
+        if disk_probe_path:
+            return disk_probe_path
+        import os
+        home = os.environ.get("HERMES_HOME", "")
+        if home:
+            return home
+        return str(Path.cwd())
+
+    def _disk_report() -> Optional[float]:
+        return disk_free_gb(_disk_probe_target())
+
     token = _resolve_peer_token(peer_token)
     if not token:
         logger.warning(
@@ -136,7 +206,16 @@ def start_worker_connector(
             "will be unsigned and likely rejected by main's auth middleware"
         )
 
-    # Strip trailing slash from endpoint
+    # --- #867 capability probes ------------------------------------------------
+    probes = capability_probes or {}
+
+    def _probe_states() -> Dict[str, bool]:
+        return {name: run_probe(name, spec) for name, spec in probes.items()}
+
+    def _declared_caps(states: Dict[str, bool]) -> List[str]:
+        return declared_capabilities(capabilities, probes, states)
+
+    # strip trailing slash from endpoint
     cluster_endpoint = cluster_endpoint.rstrip("/")
 
     def _loop():
@@ -148,25 +227,59 @@ def start_worker_connector(
         # Join + heartbeat loop. Join is retried on every cycle until the
         # main accepts it (returns node_id). This handles boot-order races
         # (worker starts before main).
+        probe_states = _probe_states() if probes else {}
+        declared = _declared_caps(probe_states)
+        last_probe_at = time.time()
+        probe_interval = min([int(s.get("interval_s", 300)) for s in probes.values()] or [300])
         #
-        # NOTE: Post-registration main restarts are NOT handled. The main's
-        # ClusterState is in-memory; after a restart, the worker's heartbeat
-        # is rejected as "unknown node" but the response is {"status":"ok"}
-        # so the connector cannot detect it. The worker remains orphaned
-        # until its own process restarts. Fixing this requires the main to
-        # return a distinguishable response (e.g. 404 or {"status":"unknown_node"})
-        # for unknown-node heartbeats, which is a separate change.
+        # #897: post-registration main restarts ARE now handled. The main
+        # answers {"status":"unknown_node"} for a heartbeat whose node it does
+        # not know; the cycle below drops registered_id so the next iteration
+        # re-JOINs (main's join is idempotent — it re-registers and refreshes
+        # the heartbeat). A transport failure (None) deliberately does NOT
+        # touch registered_id: during a real #897 outage the worker keeps
+        # beating toward the endpoint instead of churning joins.
         registered_id = None
 
         while True:
+            # Re-probe on its own cadence (#867); push a capability change.
+            if probes and time.time() - last_probe_at >= probe_interval:
+                last_probe_at = time.time()
+                new_states = _probe_states()
+                new_declared = _declared_caps(new_states)
+                if new_declared != declared and registered_id is not None:
+                    path = f"/api/v1/nodes/{registered_id}/capabilities"
+                    body = json.dumps({"capabilities": new_declared}).encode()
+                    req = Request(f"{cluster_endpoint}{path}", data=body, method="PATCH")
+                    req.add_header("Content-Type", "application/json")
+                    for k, v in _sign_request(token, node_id, "PATCH", path, body).items():
+                        req.add_header(k, v)
+                    try:
+                        with urlopen(req, timeout=10) as resp:
+                            json.loads(resp.read().decode())
+                        logger.info("capabilities updated: %s", new_declared)
+                        declared = new_declared
+                        probe_states = new_states
+                    except Exception as e:
+                        logger.warning("capabilities PATCH failed: %s", e)
+
             # Try join if not yet registered
             if registered_id is None:
                 join_data = {
                     "node_name": node_id,
-                    "capabilities": capabilities,
+                    "capabilities": declared,
                     "endpoint": f"http://{node_id}:0",
                     "max_concurrent": max_concurrent,
                 }
+                # #899: declare the instance identity (omitted when empty —
+                # an absent field is the older-worker join contract).
+                if instance_token:
+                    join_data["instance_token"] = instance_token
+                # #892: report free disk at join too (omit when unreadable —
+                # an absent field is the older-worker contract the main honours).
+                disk_gb = _disk_report()
+                if disk_gb is not None:
+                    join_data["disk_free_gb"] = disk_gb
                 result = _signed_post(
                     cluster_endpoint, "/api/v1/nodes/join", join_data, token, node_id
                 )
@@ -185,9 +298,30 @@ def start_worker_connector(
             # Send heartbeat if registered
             if registered_id is not None:
                 hb_data = {"node_id": registered_id}
-                _signed_post(
+                # #892: every heartbeat carries disk_free_gb of the volume
+                # holding HERMES_HOME / the lanes dir — the main's watchdog
+                # degrades the node while the report sits below the floor and
+                # restores it automatically once the volume recovers.
+                disk_gb = _disk_report()
+                if disk_gb is not None:
+                    hb_data["disk_free_gb"] = disk_gb
+                # #897: act on the beat's ANSWER. A restarted main whose store
+                # lost this node answers {"status":"unknown_node"}; dropping
+                # registered_id sends the loop through the (idempotent) join
+                # above on the NEXT cycle, so the worker self-heals instead of
+                # staying orphaned until its own process restarts — the exact
+                # failure this module's original NOTE documented as unhandled.
+                # A None result (transport failure — main simply unreachable
+                # for the #897 multi-minute windows) keeps registered_id: the
+                # beat is retried next cycle, and a join storm is impossible.
+                hb_result = _signed_post(
                     cluster_endpoint, "/api/v1/nodes/heartbeat", hb_data, token, node_id
                 )
+                if isinstance(hb_result, dict) and hb_result.get("status") == "unknown_node":
+                    logger.warning(
+                        "worker connector: main does not know %s (post-restart?) "
+                        "— re-joining next cycle", registered_id)
+                    registered_id = None
 
             time.sleep(heartbeat_interval)
 

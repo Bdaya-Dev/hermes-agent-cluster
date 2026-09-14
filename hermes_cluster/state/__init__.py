@@ -36,7 +36,9 @@ from ..core.scheduler import (
     ACTIVE_TASK_STATUSES,
     TERMINAL_TASK_STATUSES,
     FairScheduler,
+    lane_blocked_ready_ids,
 )
+from ..core.lane_affinity import AffinityScheduler
 
 
 def _generate_id(prefix: str = "") -> str:
@@ -85,7 +87,8 @@ class ClusterState:
         self._max_decisions: int = 200
 
         # Fair scheduler (least-loaded node, round-robin ties, capacity-aware)
-        self._fair_scheduler = FairScheduler()
+        # + lane-to-node affinity (#858 defect 2).
+        self._fair_scheduler = AffinityScheduler()
 
         # Federation registry
         self._federation_lock = threading.Lock()
@@ -135,12 +138,24 @@ class ClusterState:
         with self._nodes_lock:
             return list(self._nodes.values())
 
-    def update_heartbeat(self, node_id: str, load: float = 0.0) -> None:
+    def update_heartbeat(self, node_id: str, load: float = 0.0,
+                         disk_free_gb: Optional[float] = None,
+                         status_reason: str = "") -> None:
         with self._nodes_lock:
             if node_id in self._nodes:
-                self._nodes[node_id].last_heartbeat = datetime.utcnow()
-                self._nodes[node_id].status = NodeStatus.online
-                self._nodes[node_id].load = load
+                n = self._nodes[node_id]
+                n.last_heartbeat = datetime.utcnow()
+                # #892: a below-floor heartbeat (status_reason set by the
+                # NodeManager) records disk but does NOT force online — that
+                # unconditional force is what kept the full-disk node schedulable
+                # during the 05:32Z incident. disk_free_gb None → stored value
+                # kept (an older worker's beat says nothing about disk).
+                n.status = (NodeStatus.degraded if status_reason
+                            else NodeStatus.online)
+                n.status_reason = status_reason
+                if disk_free_gb is not None:
+                    n.disk_free_gb = disk_free_gb
+                n.load = load
 
     def update_capabilities(self, node_id: str, caps: List[str]) -> None:
         with self._nodes_lock:
@@ -159,6 +174,13 @@ class ClusterState:
             if node_id in self._nodes:
                 self._nodes[node_id].max_concurrent = max(0, int(max_concurrent))
 
+    def update_instance_token(self, node_id: str, instance_token: str) -> None:
+        """#899: record which executor instance currently owns this node id
+        (a re-join re-declares it; the /join gate reads it)."""
+        with self._nodes_lock:
+            if node_id in self._nodes:
+                self._nodes[node_id].instance_token = instance_token or ""
+
     def node_count(self) -> int:
         with self._nodes_lock:
             return len(self._nodes)
@@ -173,11 +195,13 @@ class ClusterState:
     def set_on_capability_change(self, fn: Callable[[str, List[str], List[str]], None]) -> None:
         self._on_capability_change = fn
 
-    def set_node_status(self, node_id: str, status: NodeStatus) -> None:
-        """Set a node's status (online/degraded/offline)."""
+    def set_node_status(self, node_id: str, status: NodeStatus,
+                        reason: str = "") -> None:
+        """Set a node's status (online/degraded/offline) and why (#892)."""
         with self._nodes_lock:
             if node_id in self._nodes:
                 self._nodes[node_id].status = status
+                self._nodes[node_id].status_reason = reason if status != NodeStatus.online else ""
 
     def append_timeline(self, event) -> None:
         """Append a timeline event (non-critical, silently ignored)."""
@@ -196,6 +220,7 @@ class ClusterState:
         lane_key: str = "",
         role: str = "author",
         description: str = "",
+        issues: Optional[List[str]] = None,
     ) -> Task:
         now = datetime.utcnow()
         task = Task(
@@ -210,10 +235,45 @@ class ClusterState:
             lane_key=lane_key,
             role=role,
             description=description,
+            issues=list(issues or []),
         )
         with self._tasks_lock:
             self._tasks[task_id] = task
         return task
+
+    def create_tasks_batch(self, plans: List[Dict[str, Any]]) -> List[Task]:
+        """Create MANY tasks atomically — one bundle per grouped-intake PHASE-2
+        plan, all published or none (PR#43 review finding 3).
+
+        ``plans``: dicts of ``create_task`` kwargs (task_id, title, requires,
+        priority, lane_key, role, description, issues). Every Task is built
+        BEFORE any state mutation, so an exception raised while assembling a
+        later row leaves the store untouched; publishing is one update under
+        the lock. Depends-on-free rows are promoted to ready inline, matching
+        ``create_task``-followed-by-``trigger_pending_tasks``.
+        """
+        now = datetime.utcnow()
+        tasks: List[Task] = []
+        for plan in plans:
+            tasks.append(Task(
+                id=plan["task_id"],
+                title=plan["title"],
+                requires=list(plan.get("requires") or []),
+                priority=plan.get("priority", 3),
+                status=TaskStatus.ready if not plan.get("depends_on")
+                else TaskStatus.pending,
+                created_at=now,
+                updated_at=now,
+                version=1,
+                lane_key=plan.get("lane_key", ""),
+                role=plan.get("role", "author"),
+                description=plan.get("description", ""),
+                issues=list(plan.get("issues") or []),
+            ))
+        with self._tasks_lock:
+            for task in tasks:
+                self._tasks[task.id] = task
+        return tasks
 
     def get_task(self, task_id: str) -> Optional[Task]:
         with self._tasks_lock:
@@ -699,7 +759,20 @@ class ClusterState:
         # Tasks that still hold an active lease must not be re-assigned.
         leased_task_ids = self._active_leased_task_ids()
 
+        # Lane-to-node affinity (#858 defect 2): snapshot lane placements
+        # (lane_key -> owning node) up front; lanes live under their own
+        # lock, so read them BEFORE acquiring _tasks_lock (lock order:
+        # _task_spawns_lock alone, then _tasks_lock — never nested).
+        with self._task_spawns_lock:
+            lane_nodes = {
+                key: (rec.get("node") or "")
+                for key, rec in self._lanes.items()
+            }
+
         with self._tasks_lock:
+            # LFP-1 cardinality guard (#762): ready tasks whose lane already
+            # has an active/earlier sibling are held back for a later tick.
+            lane_blocked = lane_blocked_ready_ids(self._tasks.values())
             # Per-node active load from tasks currently assigned to each node.
             active_counts: Dict[str, int] = {}
             for t in self._tasks.values():
@@ -713,16 +786,21 @@ class ClusterState:
                 [
                     t for t in self._tasks.values()
                     if t.status == TaskStatus.ready and t.id not in leased_task_ids
+                    and t.id not in lane_blocked
                 ],
                 key=lambda t: (t.priority, t.created_at),
             )
 
             for task in ready_tasks:
-                node = self._fair_scheduler.choose(
-                    task.requires, online_nodes, active_counts
+                node, pinned = self._fair_scheduler.choose_pinned(
+                    task.requires, online_nodes, active_counts,
+                    pinned_node_id=lane_nodes.get(task.lane_key, "")
+                    if task.lane_key else "",
                 )
                 if node is None:
-                    # No candidate has spare capacity (or none matches caps):
+                    # Pinned lane whose node is offline/degraded/at capacity
+                    # — PARK (stays ready; never re-home a lane, #858) — or
+                    # no candidate has spare capacity for an unpinned task:
                     # leave the task ready for a later trigger.
                     continue
 
@@ -740,7 +818,8 @@ class ClusterState:
                     priority=task.priority,
                     node_id=node.id,
                     score=1.0,
-                    reason="least_loaded_capability_match",
+                    reason=("lane_affinity_pinned" if pinned
+                            else "least_loaded_capability_match"),
                 )
                 self.record_decision(decision)
 

@@ -143,6 +143,104 @@ telemetry:
 ./kanban-cluster
 ```
 
+#### Restarting a worker (#899 — one executor per node id)
+
+Two live executors for the same node id poll the main's assignments in
+lockstep and spawn EVERY lane twice (measured 2026-09-14 on
+windows_desktop: a config change was applied by killing the worker's
+python process and running Start-ScheduledTask; the wrapper's `:loop`
+relaunched the killed child 5 s later, the task started a second wrapper —
+4 executors, 81 orphan lane processes, 10 tasks failed/cancelled). Three
+layers now make that shape impossible:
+
+1. **serve refuses a second live instance per node id.** Worker role takes
+   a single-instance lock keyed by `node.id` before starting anything: a
+   bound loopback port derived from the node id (OS-released on exit, so
+   a crash never wedges the restart) plus a `<data dir>/locks/<node-id>.lock`
+   file naming the holder pid/token for humans and wrappers. A duplicate
+   exits **3** with `ALREADY RUNNING (pid …)` on stderr; a port collision
+   it cannot explain exits **4**. The `:loop` wrappers back off (60 s) on
+   3 instead of hammering.
+2. **The main refuses a duplicate `/join`.** Each worker connector carries
+   a per-process `instance_token`; a join for a node id whose current
+   token differs while the old instance is still heartbeating is a **409**.
+   Policy: refuse, not force-replace (the main cannot tell a legitimate
+   restart from a second wrapper waking beside the first, and the incident
+   had both pollers live — refusing makes the duplicate loud at the one
+   place both instances can be seen). Once the old instance has missed
+   `offline_after` (watchdog config, default 30 s) the new join takes the
+   node id over, so restarts never wedge. Older tokenless workers keep
+   the pre-#899 idempotent re-join byte-for-byte.
+3. **A restarted executor re-attaches to its still-running children.**
+   Persisted spawn records carry the child pid; on restart (and, since
+   #899, on a periodic refresh while running) the executor tracks the LIVE
+   process instead of spawning a second session for the task, and reaps
+   it normally when it exits.
+
+**The only sanctioned restart paths — never "kill the python child"**
+(the child's wrapper will relaunch it, see above):
+
+```bat
+REM Windows (scheduled-task wrappers, canonical templates in scripts/):
+run-worker-desktop.cmd stop      REM ends the wrapper AND its child tree
+run-worker-desktop.cmd restart   REM stop -> wait for zero serve procs -> Start-ScheduledTask
+run-worker-desktop.cmd status    REM live serve process count (2+ = #899 duplicate)
+```
+
+```bash
+# macOS LaunchAgent (template: scripts/com.bdaya.hermes-worker-macbook.plist)
+launchctl bootout gui/$(id -u)/com.bdaya.hermes-worker-macbook || true
+while pgrep -f 'hermes_cluster.serve' >/dev/null; do sleep 0.5; done   # ZERO first
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.bdaya.hermes-worker-macbook.plist
+```
+
+The invariant both encode: **stop the supervisor first, wait for zero
+`hermes_cluster.serve` processes, then start.** If a stale worker must be
+forced, `taskkill /F` (or `pkill -f hermes_cluster.serve`) *after*
+booting the task/agent out — the lock file's dead pid is then revalidated
+away automatically by the next start.
+
+#### Deployment Requirements: GitLab intake policy surface
+
+The GitLab intake feature (`/api/v1/intake/gitlab/*`, runtime policy store —
+see `hermes_cluster/routers/intake.py`) carries two deployment-side
+requirements that the code documents but does NOT enforce. An operator wiring
+a new main node MUST read both before exposing the surface:
+
+1. **Per-IP rate limiting is only meaningful behind a trusted proxy that
+   rewrites `X-Forwarded-For` — GCLB in the hosted deployment.** The policy
+   write limiter keys on the FIRST `X-Forwarded-For` entry (the pod sits
+   behind GCLB, so the header's first hop is the real client and the LB
+   rewrites it per-hop). If the pod is ever reachable directly — a dev node
+   with no load balancer, a `kubectl port-forward`, a NodePort — a caller
+   can send a fresh spoofed `X-Forwarded-For` per request and bypass the
+   per-IP limit entirely (and choose what the audit log records as
+   `source_ip`). This is defense-in-depth, not primary authentication:
+   peer-HMAC / `GITLAB_INTAKE_POLICY_SECRET` remain the real gate. Keep the
+   pod behind GCLB (or a proxy with equivalent XFF-rewrite semantics); do
+   not expose it directly outside a trusted network.
+
+2. **With NO intake credential configured, the policy-write surface is open
+   by design — dev posture only.** A fresh dev node with
+   `GITLAB_INTAKE_POLICY_SECRET`, `GITLAB_INTAKE_WEBHOOK_SECRET` unset and
+   peer-auth off accepts unsigned policy writes, exactly matching the
+   webhook's long-standing open-with-boot-warning contract; every such write
+   is audited (`credential=none`) and the boot log warns. This is acceptable
+   on a trusted dev network and **NOT acceptable in production**: production
+   MUST set a dedicated `GITLAB_INTAKE_POLICY_SECRET` (never reuse the
+   webhook secret — PR#36 finding 1) and peer-auth, at which point writes
+   fail closed (401 without a signature or the operator token).
+
+**Grouped intake (`intake.gitlab.grouping`, #762 LFP-1).** With
+`grouping.enabled: true` a poll cycle emits ONE stateful-lane bundle task
+per client×repo batch — lane key `<repo>#<branch>`, membership persisted on
+the task row (restart-safe DEDUP FIRST) — instead of one task per issue. Set
+`lane_branch` (default `env/dev`) and `lane_branches` (repo → branch, e.g.
+the fork itself on `main`) to match each client repo's integration branch;
+`max_bundle_size` (default 40) caps a sitting. The band-0 author rule
+survives: business-team issues get their own queued bundle instantly.
+Disabling grouping restores the per-issue wiring byte-for-byte.
+
 ### 📡 API Reference
 
 All endpoints prefixed: `/api/v1`

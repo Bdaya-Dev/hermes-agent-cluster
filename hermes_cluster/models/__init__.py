@@ -105,6 +105,20 @@ class Node(BaseModel):
     last_heartbeat: datetime = Field(default_factory=datetime.utcnow)
     load: float = 0.0  # 0.0 - 1.0
     max_concurrent: int = 0  # max simultaneously-assigned tasks; 0 = unlimited
+    # #892 factory resilience: free GB on the volume holding the worker's
+    # lanes/HERMES_HOME, reported in every join/heartbeat. None = the worker
+    # did not report it (older worker) — the main's disk rules never fire on
+    # an absent field, so behaviour is byte-for-byte the pre-#892 one.
+    disk_free_gb: Optional[float] = None
+    # Why a node is not schedulable (status != online): the watchdog's
+    # staleness reason, or the disk-floor reason ("disk below floor...").
+    # Surfaced by GET /api/v1/nodes so the lead sees WHY without log-diving.
+    status_reason: str = ""
+    # #899: the per-process instance token of the executor currently
+    # registered under this node id ("" = an older worker never declared
+    # one). /join compares it: same token = idempotent re-join, different
+    # token while still heartbeating = a DUPLICATE executor -> refused 409.
+    instance_token: str = ""
 
 
 # ===========================================================================
@@ -151,6 +165,15 @@ class Task(BaseModel):
     # unreadable from every other, and "produced nothing" was
     # indistinguishable from "produced something unreachable".
     result: Optional[str] = None
+    # #762 grouped intake: the lane's FULL brief (a bundle task's description
+    # carries every issue id + the sitting discipline; the title stays a
+    # one-line summary). Empty for legacy per-issue tasks.
+    description: str = ""
+    # #762 grouped intake: bundle membership as "<project/path>#<iid>" issue
+    # ids (empty for legacy tasks). Restart-safe: intake's DEDUP FIRST + the
+    # cardinality guard read live issues from the STORE, never from a
+    # process-local map alone.
+    issues: List[str] = Field(default_factory=list)
 
     model_config = {"populate_by_name": True}
 
@@ -525,6 +548,11 @@ class NodeConfig(BaseModel):
     id: str = "node_main"
     name: str = "main-node"
     capabilities: List[str] = []
+    # #892: floor (GB) of free disk on the volume holding HERMES_HOME / the
+    # lanes dir. Below it the worker refuses to claim AND the main marks the
+    # node degraded (excluded from scheduling) until it recovers. YAML only —
+    # owner ruling: never an env var. 0 disables the rule entirely.
+    min_free_disk_gb: float = 5.0
 
 
 class ServerConfig(BaseModel):
@@ -660,7 +688,15 @@ class TelemetryConfigJSON(BaseModel):
 
 
 class ConfigJSON(BaseModel):
-    """Go struct: api.configJSON — JSON API config representation."""
+    """Go struct: api.configJSON — JSON API config representation.
+
+    extra="allow" (hermes-factory-intake): unknown top-level sections — e.g.
+    the runtime ``intake.gitlab`` policy — must SURVIVE a PUT /api/v1/config
+    round-trip. With the default (drop-unknown), the dashboard's "save config"
+    would silently wipe any runtime section the Go-shaped model doesn't know.
+    """
+    model_config = {"extra": "allow"}
+
     cluster: ClusterConfigJSON = ClusterConfigJSON()
     node: NodeConfigJSON = NodeConfigJSON()
     server: ServerConfigJSON = ServerConfigJSON()
@@ -692,20 +728,36 @@ class NodeInfo(BaseModel):
 # 16. API requests/responses (internal/api/api.go)
 # ===========================================================================
 
+class HeartbeatRequest(BaseModel):
+    node_id: str
+    # #892: optional free-disk reading on the volume holding the worker's
+    # HERMES_HOME / lanes dir (GB). Absent (None) from an older worker's
+    # payload means "no disk info" — the main keeps its exact pre-#892
+    # heartbeat semantics (unconditionally online) for those.
+    disk_free_gb: Optional[float] = None
+
+
 class JoinRequest(BaseModel):
     node_name: str
     capabilities: List[str] = []
     endpoint: str = ""
     max_concurrent: int = 0  # 0 = unlimited; scheduler honours this ceiling
+    disk_free_gb: Optional[float] = None  # #892, same absent-means-unknown rule
+    # #899: per-process identity of the executor that is joining. A second
+    # /join for the same node name carrying a DIFFERENT token while the
+    # previous instance is still heartbeating (< offline_after) is refused
+    # 409 — the duplicate-executor class of bug the 2026-09-14
+    # windows_desktop incident measured (wrapper :loop relaunch + Start-
+    # ScheduledTask = two executors, every lane spawned twice). Absent from
+    # an older worker (empty) = pre-#899 join semantics (idempotent re-join
+    # always allowed). See NodeManager.join for the chosen policy and why
+    # refuse beats force-replace.
+    instance_token: str = ""
 
 
 class JoinResponse(BaseModel):
     node_id: str
     status: str = "registered"
-
-
-class HeartbeatRequest(BaseModel):
-    node_id: str
 
 
 class UpdateCapabilitiesRequest(BaseModel):
@@ -743,7 +795,13 @@ class CompleteTaskRequest(BaseModel):
 
 
 class FailTaskRequest(BaseModel):
-    reason: str = "failed"
+    # #858: reason is REQUIRED (was defaulted to "failed"). A failure
+    # recorded without a real reason is indistinguishable from the
+    # busy-lane incident — failed task, error None, zero-byte result —
+    # i.e. a failure the operator cannot investigate. Callers that have
+    # nothing to say must say something ("no reason captured"), never
+    # nothing.
+    reason: str
     # #870: set by a worker reporting a NON-DELIVERABLE result body (provider
     # error / echoed brief — see agent_executor.deliverable_guard). Under
     # main's retry cap the task goes back to ready (attempts bumped) instead

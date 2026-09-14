@@ -193,6 +193,27 @@ async def submit_task(req: SubmitTaskRequest):
                 ),
             )
 
+    # #898: ONE live reviewer task per lane_key. Measured 2026-09-14: an
+    # author lane submitted its reviewer four times in 36 minutes because
+    # review capacity was saturated and each queued reviewer "had not picked
+    # up" — every resubmit forked another `ready` row, none ran, and the
+    # lane burned 90 minutes of credits on cancel-and-resubmit churn. The
+    # hand-off text tells the author to submit once; this makes the promise
+    # mechanical: a reviewer submit for a lane_key that already has a LIVE
+    # reviewer task returns that task (idempotent 200, `deduped: true`)
+    # instead of forking a second one. Terminal predecessors (completed /
+    # failed / cancelled) do NOT dedupe — the next sitting's hand-off must
+    # be creatable. cancel_requested counts as live: its row is on its way
+    # out and a resubmit there is the same churn.
+    if (req.role or "").strip().lower() == "reviewer" and req.lane_key:
+        _LIVE_REVIEWER = (TaskStatus.pending, TaskStatus.ready,
+                          TaskStatus.assigned, TaskStatus.running,
+                          TaskStatus.cancel_requested)
+        for t in _state.get_all_tasks():
+            if (t.role == "reviewer" and t.lane_key == req.lane_key
+                    and t.status in _LIVE_REVIEWER):
+                return {**t.model_dump(), "deduped": True}
+
     task_id = _generate_task_id()
     # Default only when the caller said nothing (None). 0 is a legal band —
     # the top one — and must survive to the store untouched (#866). Range
@@ -281,7 +302,19 @@ async def fail_task(task_id: str, req: FailTaskRequest = None):
     task = _state.get_task(task_id)
     if not task:
         raise HTTPException(status_code=404, detail="task not found")
-    reason = req.reason if req else "failed"
+    # #858: a failure must carry a real reason. No body / missing field /
+    # blank reason is a 422 — the busy-lane incident reached operators as
+    # `failed` with `error: None`, and an unexplained failure is a failure
+    # that goes unnoticed. (The `= None` default stays so a bodyless call
+    # gets a clear 422 here instead of FastAPI's schema error; the model
+    # already rejects a body that omits `reason`.)
+    reason = (req.reason if req and req.reason else "").strip()
+    if not reason:
+        raise HTTPException(
+            status_code=422,
+            detail="fail requires a non-empty reason: a failed task with "
+                   "no reason attached is un-investigable (#858)",
+        )
 
     # B2 fix: terminal states (completed/failed/cancelled) → 409
     # cancel_requested is allowed through (worker ack path)

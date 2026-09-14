@@ -63,11 +63,21 @@ def create_app(
     fed_token: str = "",
     cluster_endpoint: str = "",
     node_capabilities: Optional[list] = None,
+    node_capability_probes: Optional[dict] = None,
+    # #892: node.min_free_disk_gb from cluster YAML (None -> default 5.0 GB,
+    # 0 -> rule disabled). Owner ruling: YAML only, NEVER an env var.
+    node_min_free_disk_gb: Optional[float] = None,
     agent_executor_config: Optional[dict] = None,
     static_dir: Optional[str] = None,
     db_path: str = "",
     store_backend: str = "",
     store_dsn_env: str = "HERMES_CLUSTER_PG_DSN",
+    # #899: per-process identity of this executor, carried on every /join so
+    # the main can refuse a SECOND executor for the same node id while the
+    # first is still heartbeating. serve() acquires the node-id single-
+    # instance lock and hands its token down; "" = no identity declared
+    # (older/manual launch — pre-#899 idempotent join semantics).
+    instance_token: str = "",
 ) -> FastAPI:
     """Create and configure the FastAPI application.
 
@@ -164,7 +174,7 @@ def create_app(
     from .recovery.manager import RecoveryManager
 
     # Create managers (ClusterState implements the same API as ClusterStore)
-    _node_manager = NodeManager(state)
+    _node_manager = NodeManager(state, min_free_disk_gb=node_min_free_disk_gb)
     _lease_manager = LeaseManager(state)
     _recovery_manager = RecoveryManager(state)
 
@@ -195,10 +205,17 @@ def create_app(
     # store and the main never sees it.
     if node_role == "worker" and cluster_endpoint:
         from .core.worker_connector import start_worker_connector
+        from .core.disk_preflight import effective_min_free_gb
         # Declare the worker's concurrency ceiling at /join so the main's
         # scheduler never assigns more tasks than this node can run (#833).
         _worker_max_concurrent = int(
             (agent_executor_config or {}).get("max_concurrent", 1)
+        )
+        # #892: report free disk of the volume holding the lanes dir (the
+        # executor's working_dir when set, else HERMES_HOME) in every
+        # join/heartbeat so the main can degrade this node below the floor.
+        _disk_probe_path = str(
+            (agent_executor_config or {}).get("working_dir", "") or ""
         )
         start_worker_connector(
             node_id=state.node_id,
@@ -206,6 +223,10 @@ def create_app(
             capabilities=node_capabilities or [],
             peer_token=fed_token,
             max_concurrent=_worker_max_concurrent,
+            capability_probes=node_capability_probes or None,
+            disk_probe_path=_disk_probe_path,
+            # #899: declare this process's instance identity at /join.
+            instance_token=instance_token,
         )
 
     # Agent executor: when role=worker and agent_executor is configured+enabled,
@@ -229,6 +250,9 @@ def create_app(
                 hermes_bin=ae_cfg_dict.get("hermes_bin", ""),
                 hermes_reviewer_model=ae_cfg_dict.get("hermes_reviewer_model", "qwen3.7-plus"),
                 retry_limit=int(ae_cfg_dict.get("retry_limit", 3)),
+                # #892: worker-side claim guard uses the SAME YAML floor the
+                # main degrades on (None -> default, 0 -> disabled).
+                min_free_disk_gb=effective_min_free_gb(node_min_free_disk_gb),
             )
             _agent_executor = AgentExecutor(
                 config=ae_cfg,

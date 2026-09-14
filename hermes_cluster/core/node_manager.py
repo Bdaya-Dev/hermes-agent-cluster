@@ -28,6 +28,7 @@ from ..models import (
     NodeConfig,
     TimelineEvent,
 )
+from .disk_preflight import disk_reason, effective_min_free_gb
 from ..state.cluster_store import ClusterStore
 
 
@@ -56,6 +57,29 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Events emitted by NodeManager
 # ---------------------------------------------------------------------------
+
+class DuplicateInstanceJoin(Exception):
+    """#899: a /join for a node id whose current instance is still
+    heartbeating, carrying a DIFFERENT instance token — i.e. a second
+    executor trying to share one node id. The router turns this into 409.
+    """
+
+    def __init__(self, node_id: str, holder_token: str, challenger_token: str,
+                 heartbeat_age_s: float, offline_after_s: float):
+        self.node_id = node_id
+        self.holder_token = holder_token
+        self.challenger_token = challenger_token
+        self.heartbeat_age_s = heartbeat_age_s
+        self.offline_after_s = offline_after_s
+        super().__init__(
+            f"node '{node_id}' is already joined by a live instance "
+            f"(heartbeat {heartbeat_age_s:.1f}s old < offline_after "
+            f"{offline_after_s:.1f}s): refusing a second executor for one "
+            f"node id (#899 — two executors spawn every lane twice). Stop "
+            f"the running instance and wait for its heartbeat to go stale, "
+            f"or restart via the documented path."
+        )
+
 
 class NodeEvent:
     """Lightweight event for node lifecycle changes."""
@@ -90,10 +114,17 @@ class NodeManager:
         store: ClusterStore,
         heartbeat_config: Optional[_HeartbeatConfig] = None,
         watchdog_config: Optional[_WatchdogConfig] = None,
+        min_free_disk_gb: Optional[float] = None,
     ):
         self._store = store
         self._heartbeat_cfg = heartbeat_config or _HeartbeatConfig()
         self._watchdog_cfg = watchdog_config or _WatchdogConfig()
+        # #892: main-side disk floor (node.min_free_disk_gb in cluster YAML,
+        # default 5.0, 0 = disabled). The watchdog consults each node's last
+        # REPORTED disk_free_gb: below the floor → degraded (the scheduler only
+        # picks online nodes), above → restored. A node that never reports the
+        # field (older worker) is never affected.
+        self._min_free_disk_gb = effective_min_free_gb(min_free_disk_gb)
 
         # Event listeners (protected by _listeners_lock)
         self._listeners_lock = threading.Lock()
@@ -157,11 +188,33 @@ class NodeManager:
         capabilities: Optional[List[str]] = None,
         load: float = 0.0,
         max_concurrent: int = 0,
+        disk_free_gb: Optional[float] = None,
+        instance_token: str = "",
     ) -> Node:
         """Register a new node in the cluster.
 
         If the node already exists, updates its status to online and
-        refreshes the heartbeat. This is idempotent.
+        refreshes the heartbeat. This is idempotent — for the SAME instance.
+
+        #899 duplicate-executor rule: a re-join carrying a DIFFERENT
+        instance token while the previous instance's heartbeat is still
+        fresh (< offline_after) raises DuplicateInstanceJoin — the main
+        refuses it with 409 instead of letting two executors share a node
+        id (measured on windows_desktop: two executors polled the same
+        assignments and spawned every lane twice). Once the old instance
+        has missed offline_after its heartbeat is stale by the watchdog's
+        own yardstick, so the new join takes the node id over — the restart
+        path stays a single command, no manual leave step.
+
+        CHOSEN POLICY: refuse, not force-replace. A force-replace would
+        silently adopt whichever executor's packet arrives last, and the
+        fleet has no way to tell "operator restarted the worker" apart
+        from "a second wrapper woke up beside the first" — the incident's
+        exact shape: BOTH pollers were live at once. Refusing keeps one
+        owner per node id at all times and makes the duplicate LOUD (the
+        refused executor sees 409; the main's log names both tokens). The
+        stale-heartbeat escape hatch is what keeps refuses from ever
+        wedging a legitimate restart.
 
         Args:
             node_id: unique node identifier
@@ -171,9 +224,18 @@ class NodeManager:
             max_concurrent: maximum simultaneously-assigned tasks the node
                 can run; 0 = unlimited. The scheduler honours this ceiling
                 so an overloaded worker receives no new assignments (#833).
+            disk_free_gb: #892 — free disk the worker reports at join time;
+                None (older worker) never affects status.
+            instance_token: #899 — per-process identity of the joining
+                executor ("" = older worker; pre-#899 idempotent-join
+                semantics are preserved for tokenless re-joins).
 
         Returns:
             The registered Node object.
+
+        Raises:
+            DuplicateInstanceJoin: a different instance holds this node id
+                with a heartbeat younger than offline_after.
         """
         if not node_id:
             raise ValueError("node_id is required")
@@ -183,25 +245,58 @@ class NodeManager:
 
         existing = self._store.get_node(node_id)
         if existing is not None:
-            # Re-join: update status + heartbeat + capabilities + capacity
-            self._store.update_heartbeat(node_id)
+            # #899: duplicate-instance gate (see docstring for the policy).
+            prev_token = getattr(existing, "instance_token", "") or ""
+            if instance_token and prev_token and instance_token != prev_token:
+                hb = existing.last_heartbeat
+                if hb.tzinfo is not None:
+                    # PG TIMESTAMPTZ rows come back tz-aware; join's clock
+                    # is naive UTC (same convention as the watchdog's
+                    # subtraction, which normalises the same way).
+                    hb = hb.replace(tzinfo=None)
+                age = (now - hb).total_seconds()
+                if age < self._watchdog_cfg.offline_after:
+                    raise DuplicateInstanceJoin(
+                        node_id=node_id,
+                        holder_token=prev_token,
+                        challenger_token=instance_token,
+                        heartbeat_age_s=age,
+                        offline_after_s=self._watchdog_cfg.offline_after,
+                    )
+                logger.info(
+                    "node %s: previous instance %s missed offline_after "
+                    "(heartbeat %.1fs old >= %.1fs) — new instance %s takes "
+                    "the node id over", node_id, prev_token[:8], age,
+                    self._watchdog_cfg.offline_after, instance_token[:8])
+            # Re-join: update status + heartbeat + capabilities + capacity.
+            # #892: a join is a fresh report too — route it through the same
+            # disk-aware heartbeat path (below-floor join = degraded + reason;
+            # an above-floor join clears a previous disk degradation, because
+            # update_heartbeat re-forces online on an empty reason).
+            self.send_heartbeat(node_id, disk_free_gb=disk_free_gb)
             if caps:
                 self._store.update_capabilities(node_id, caps)
             if max_concurrent:
                 self._store.update_max_concurrent(node_id, max_concurrent)
+            if instance_token:
+                self._store.update_instance_token(node_id, instance_token)
             node = self._store.get_node(node_id)
             logger.info("node re-joined: %s", node_id)
             self._emit(NodeEvent(node_id, "joined", f"re-join, caps={caps}"))
             return node  # type: ignore
 
+        reason = disk_reason(disk_free_gb, self._min_free_disk_gb)
         node = Node(
             id=node_id,
             name=name or node_id,
             capabilities=caps,
-            status=NodeStatus.online,
+            status=(NodeStatus.degraded if reason else NodeStatus.online),
+            status_reason=reason,
             last_heartbeat=now,
             load=load,
             max_concurrent=max(0, int(max_concurrent)),
+            disk_free_gb=disk_free_gb,
+            instance_token=instance_token or "",
         )
         self._store.register_node(node)
         self._cap_cache[node_id] = list(caps)
@@ -252,7 +347,8 @@ class NodeManager:
     # 2. Heartbeat
     # ------------------------------------------------------------------
 
-    def send_heartbeat(self, node_id: str, load: float = 0.0) -> None:
+    def send_heartbeat(self, node_id: str, load: float = 0.0,
+                       disk_free_gb: Optional[float] = None) -> None:
         """Send a single heartbeat for a node.
 
         Updates the last_heartbeat timestamp and optionally the load.
@@ -262,6 +358,11 @@ class NodeManager:
         Args:
             node_id: the node sending the heartbeat
             load: current load (0.0 - 1.0), clamped
+            disk_free_gb: #892 — free GB reported by the worker on the volume
+                holding its lanes dir (None = not reported, older workers).
+                When the reading sits below the configured floor the store
+                still records it, refreshes the timestamp, but marks the node
+                degraded with a reason instead of forcing it online.
         """
         node = self._store.get_node(node_id)
         if node is None:
@@ -271,10 +372,16 @@ class NodeManager:
         # Clamp load
         load = max(0.0, min(1.0, load))
 
-        self._store.update_heartbeat(node_id, load=load)
+        reason = disk_reason(disk_free_gb, self._min_free_disk_gb)
+        self._store.update_heartbeat(node_id, load=load,
+                                     disk_free_gb=disk_free_gb,
+                                     status_reason=reason)
+        if reason:
+            logger.warning("node %s heartbeat below disk floor: %s", node_id, reason)
         self._emit(NodeEvent(
             node_id, "heartbeat",
-            f"load={load:.2f}",
+            f"load={load:.2f}" + (f" disk_free_gb={disk_free_gb:.2f}"
+                                  if disk_free_gb is not None else ""),
         ))
 
     def start_heartbeat_sender(
@@ -388,8 +495,12 @@ class NodeManager:
     # 4. Status management
     # ------------------------------------------------------------------
 
-    def set_status(self, node_id: str, status: NodeStatus) -> bool:
+    def set_status(self, node_id: str, status: NodeStatus,
+                   reason: str = "") -> bool:
         """Directly set a node's status.
+
+        ``reason`` (non-empty only meaningful when status != online): the #892
+        degradation cause surfaced via Node.status_reason / GET /api/v1/nodes.
 
         Returns True if the node existed.
         """
@@ -398,13 +509,15 @@ class NodeManager:
             return False
 
         old_status = node.status
-        if old_status == status:
+        if old_status == status and (
+                status == NodeStatus.online
+                or (getattr(node, "status_reason", "") or "") == (reason or "")):
             return True
 
-        self._store.set_node_status(node_id, status)
+        self._store.set_node_status(node_id, status, reason)
         self._emit(NodeEvent(
             node_id, "status_changed",
-            f"{old_status.value} → {status.value}",
+            f"{old_status.value} → {status.value}" + (f" ({reason})" if reason else ""),
         ))
         return True
 
@@ -448,17 +561,21 @@ class NodeManager:
                         node_id=n.id,
                         last_heartbeat=n.last_heartbeat,
                         status=n.status.value,
+                        # #892: the watchdog's disk rule fires on the LAST
+                        # reported reading; None (older worker) disables it.
+                        disk_free_gb=getattr(n, "disk_free_gb", None),
                     )
                     for n in nodes
                 ]
 
-            def update_node_status(self_inner, node_id: str, status: str):
+            def update_node_status(self_inner, node_id: str, status: str,
+                                   reason: str = ""):
                 try:
                     ns = NodeStatus(status)
                 except ValueError:
                     ns = NodeStatus.offline
                 # Route through NodeManager to ensure events are emitted
-                node_manager.set_status(node_id, ns)
+                node_manager.set_status(node_id, ns, reason)
 
         return _Registry()
 
@@ -473,6 +590,11 @@ class NodeManager:
             degraded_after=self._watchdog_cfg.degraded_after,
             offline_after=self._watchdog_cfg.offline_after,
             callback=self._on_watchdog_event,
+            # #892: the floor ALSO gates the watchdog pass — a node whose last
+            # reported disk reading is below it stays degraded even if its
+            # heartbeat is fresh (the heartbeat path degrades at report time;
+            # this closes the window between floor raise and next beat).
+            min_free_disk_gb=self._min_free_disk_gb,
         )
         self._watchdog.start()
 
