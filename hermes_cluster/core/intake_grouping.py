@@ -325,6 +325,23 @@ def bundle_title(bundle: BundlePlan) -> str:
     return f"[lane:{bundle.lane_key}][##{bundle.iids[0]}…{bundle.iids[-1]} x{len(bundle.iids)}]"
 
 
+def _parse_github_pr_url(mr_url: str) -> Optional[Tuple[str, int]]:
+    """#902: ``(owner/repo, number)`` if the artifact is a GitHub PR, else None.
+
+    The CLOSE-THE-LOOP branch of the reviewer brief keys on this: a GitLab
+    MR lands with `bdaya-glab mr land`; a GitHub PR is landed by a
+    SUBMITTED LANDING TASK, because the read-only (#882) reviewer has no
+    landing verb there and the GitLab shape strands the PR Draft+unmerged
+    (measured: infra PR #308, 2026-09-14)."""
+    m = re.search(
+        r"https?://(?:www\.)?github\.com/([\w.-]+/[\w.-]+)/pull/(\d+)",
+        mr_url or "",
+    )
+    if not m:
+        return None
+    return m.group(1), int(m.group(2))
+
+
 def reviewer_handoff_brief(bundle: BundlePlan, mr_url: str, head_sha: str,
                            reviewer_lane_key: Optional[str] = None) -> str:
     """#893 item 5: the ONE place the reviewer-task wording lives. The author
@@ -346,8 +363,22 @@ def reviewer_handoff_brief(bundle: BundlePlan, mr_url: str, head_sha: str,
     fixed issue and CLOSE it yourself (needs-human stays a hard stop)."""
     issues = ", ".join(f"#{i}" for i in bundle.iids)
     rev_key = reviewer_lane_key or f"{bundle.lane_key}-rev"
+    # #902: the CLOSE-THE-LOOP PASS branch must match the artifact's host. A
+    # read-only (#882) reviewer on a GITHUB PR has no `bdaya-glab mr land`
+    # verb and cannot `gh pr merge` — the GitLab-shaped instruction left it
+    # with no valid action, so it APPROVEd and stopped, the PR sat Draft, and
+    # the lead hand-dispatched the landing. GitHub PRs therefore close the
+    # loop by SUBMITTING A LANDING TASK (role='author', requires=
+    # ['github-write']) — never by landing it themselves, and never by
+    # "submitting the reviewer task" (that step IS this lane).
+    gh = _parse_github_pr_url(mr_url)
+    title = (
+        f"[lane:{rev_key}][REVIEW {bundle.lane_key} PR #{gh[1]}]"
+        if gh else
+        f"[lane:{rev_key}][REVIEW {bundle.lane_key} MR !{mr_url.rstrip('/').split('/')[-1]}]"
+    )
     return (
-        f"[lane:{rev_key}][REVIEW {bundle.lane_key} MR !{mr_url.rstrip('/').split('/')[-1]}]\n"
+        f"{title}\n"
         f"\n"
         f"## INDEPENDENT REVIEW (shared/claude-plugins#893) — fresh context, reviewer role\n"
         f"\n"
@@ -378,11 +409,33 @@ def reviewer_handoff_brief(bundle: BundlePlan, mr_url: str, head_sha: str,
         f"The note is the durable oracle the landing gate reads.\n"
         f"\n"
         f"CLOSE THE LOOP (#893) — after posting the note:\n"
-        f"  * On PASS at head: YOU land the MR yourself:\n"
-        f"    `bdaya-glab mr land --project <p> --mr <n> --sha {head_sha}`\n"
-        f"    (sha pinned; the tool refuses a stale head). Reviewer != author\n"
-        f"    and this lane is fresh-context, so RV-1 holds — a `needs-human`\n"
-        f"    label is a hard stop: NEVER land past it.\n"
+        + (
+            # #902: GitHub PR branch. The reviewer is read-only (#882) and
+            # `bdaya-glab` has no GitHub landing verb — PASS closes the loop
+            # by SUBMITTING A LANDING TASK, never by landing it itself, and
+            # never by "submitting the reviewer task" (that step is this lane).
+            f"  * On PASS at head (GitHub PR — you do NOT land it yourself:\n"
+            f"    you are read-only #882 and `bdaya-glab mr land` has no GitHub\n"
+            f"    verb): submit a LANDING task via `kanban_cluster_submit` —\n"
+            f"    role='author', lane_key='{gh[0].split('/')[-1]}#land-{gh[1]}',\n"
+            f"    requires=['github-write'], priority=5, and its title/brief IS:\n"
+            f"    `gh pr view {gh[1]} --repo {gh[0]} --json headRefOid` MUST equal\n"
+            f"    {head_sha} (STOP + NEEDS-CHANGES follow-up if the head moved) →\n"
+            f"    `gh pr ready {gh[1]} --repo {gh[0]}` → `gh pr merge {gh[1]}\n"
+            f"    --repo {gh[0]} --merge` → post-merge verify per the PR body's\n"
+            f"    own proof section, then the folded VP-1 note + issue close per\n"
+            f"    the next bullet run on the deployed surface it names. Submit\n"
+            f"    it EXACTLY ONCE (#898 dedupe applies) — never resubmit, never\n"
+            f"    park for the lead. Nothing in this brief ever tells you to\n"
+            f"    'submit the reviewer task': that step is the task you are now\n"
+            f"    completing.\n"
+            if gh else
+            f"  * On PASS at head: YOU land the MR yourself:\n"
+            f"    `bdaya-glab mr land --project <p> --mr <n> --sha {head_sha}`\n"
+            f"    (sha pinned; the tool refuses a stale head). Reviewer != author\n"
+            f"    and this lane is fresh-context, so RV-1 holds — a `needs-human`\n"
+            f"    label is a hard stop: NEVER land past it.\n"
+        ) +
         f"  * FOLDED VP-1 (owner ruling 2026-09-14 — the separate live-verify\n"
         f"    lane is RETIRED; you are the live verifier): for every listed\n"
         f"    user-facing issue, before its close — (1) RE-RUN the issue's\n"
@@ -480,8 +533,15 @@ def bundle_brief(bundle: BundlePlan) -> str:
         f"         never overridden), the posting instruction\n"
         f"         (`bdaya-glab mr note` via `npx -y -p\n"
         f"         @shared/bdaya-gitlab@latest`), and the CLOSE-THE-LOOP rule:\n"
-        f"         on PASS at head the REVIEWER lane lands the MR itself with\n"
-        f"         `bdaya-glab mr land --project <p> --mr <n> --sha <head>`\n"
+        f"         on PASS at head the REVIEWER lane lands a GITLAB MR itself\n"
+        f"         with `bdaya-glab mr land --project <p> --mr <n> --sha <head>`;\n"
+        f"         on a GITHUB PR the reviewer cannot land (#882 read-only, no\n"
+        f"         `bdaya-glab` verb) and instead SUBMITS a landing task\n"
+        f"         (role='author', requires=['github-write'], lane_key\n"
+        f"         `<repo>#land-<n>`, priority 5) whose brief verifies\n"
+        f"         headRefOid==reviewed sha, then `gh pr ready` +\n"
+        f"         `gh pr merge --merge` — the #902 fix that stopped\n"
+        f"         PASSed GitHub PRs sitting Draft with no valid action;\n"
         f"         (reviewer != author, fresh context, so RV-1\n"
         f"         holds; a `needs-human` label is a hard stop — never land past\n"
         f"         it); on NEEDS-CHANGES the reviewer submits a follow-up author\n"
