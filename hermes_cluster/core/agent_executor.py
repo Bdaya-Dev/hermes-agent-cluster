@@ -208,6 +208,12 @@ class ActiveSpawn:
     lane_key: str = ""  # stateful lane identity this delivery belongs to
     role: str = "author"  # author (profile default model) | reviewer (opus tier)
     session_id: str = ""  # hermes session id this lane maps to (lanes table)
+    # #894: path of the lane's ESCALATION side-file. A headless lane that hits
+    # a decision it cannot make (clarify/needs-decision) writes
+    # {"question","options","class"} there and exits; the reap then reports
+    # the task `blocked` with the ballot attached instead of `done`, and the
+    # gateway relay routes the question to the owner's phone.
+    escalation_path: str = ""
     miss_count: int = 0  # consecutive polls where lane was absent from status
     spawn_exit_rc: Optional[int] = None  # set once spawn process exits
     spawn_exit_stderr: str = ""  # captured stderr tail on nonzero exit
@@ -670,6 +676,7 @@ class AgentExecutor:
         lane_key: str = "",
         role: str = "author",
         deliverable_path: str = "",
+        ballot: Optional[dict] = None,
     ) -> Path:
         """Write the per-task brief file the guarded worker lane reads.
 
@@ -702,6 +709,24 @@ class AgentExecutor:
             ]
         if description.strip():
             lines += [description.strip(), ""]
+        # #894: an ANSWERED ballot is the next message into the SAME lane
+        # session — the owner's decision, quoted verbatim, before anything
+        # else. The lane must not re-derive or second-guess it.
+        if ballot and ballot.get("answer"):
+            lines += [
+                "### Decision-answer delivery (shared/claude-plugins#894)",
+                "Your earlier turn escalated this decision to the owner via a Telegram "
+                "ballot. The owner has ANSWERED. Treat the answer below as the owner's "
+                "direct instruction in this session — do not re-ask it, do not "
+                "re-derive it, act on it and continue the task.",
+                "",
+                f"**Question you asked:** {ballot.get('question', '')}",
+                f"**Options you offered:** {' / '.join(ballot.get('options') or [])}",
+                f"**Owner's answer:** {ballot.get('answer', '')}"
+                + (f"  (answered_by={ballot.get('answered_by') or 'owner'}, "
+                   f"answered_at={ballot.get('answered_at') or '?'})"),
+                "",
+            ]
         lines += [
             "### Standing lane rules",
             "- You are a headless worker spawned by the Hermes cluster executor on node "
@@ -711,6 +736,31 @@ class AgentExecutor:
             "- When done, state exactly what you produced (files, MR links, proof) in your final message.",
             "",
         ]
+        if deliverable_path:
+            # #894 (hermes worker mode): the escalation contract, next to the
+            # delivery contract — this is the section every compliant lane
+            # reads before it needs to ask anything. bdaya-dispatch mode has
+            # its own lane-status semantics; not offered there.
+            lines += [
+                "### Decision escalation (shared/claude-plugins#894)",
+                "- You are headless: NEVER call the interactive clarify/AskUserQuestion tool. "
+                "When the task genuinely cannot proceed without an owner decision, WRITE a "
+                "one-shot ballot file and finish this turn's deliverable explaining what you "
+                "blocked on:",
+                f"  1. write `{(Path(deliverable_path).parent if deliverable_path else Path(self._config.working_dir or '.') / 'hermes-results') / (task_id + '.escalation.json')}` "
+                "with JSON `{\"question\": \"...\", \"options\": [\"...\", \"...\"], \"class\": \"technical|product\"}`",
+                "     - `class` routing rule (owner, 2026-09-14): product/business questions "
+                "(acceptance, requirements, priorities) -> \"product\"; everything else -> "
+                "\"technical\" (the default if omitted).",
+                "  2. write your result file (the delivery contract below) stating the decision "
+                "you escalated and what you were blocked on,",
+                "  3. exit 0. The executor files the ballot, parks the task blocked, relays the "
+                "question to the owner's phone, and RESUMES this same session with the answer as "
+                "its next message.",
+                "- Do NOT invent the decision yourself; do not exit nonzero to force attention "
+                "(that reaps as a failure, not a ballot).",
+                "",
+            ]
         if role == "author":
             # #893: the author lane hands off to an INDEPENDENT reviewer
             # itself — no lead session in the loop. Written into the SHARED
@@ -1172,6 +1222,40 @@ class AgentExecutor:
         d.mkdir(parents=True, exist_ok=True)
         return d / f"{task_id}.stderr.log"
 
+    def _hermes_escalation_path(self, task_id: str) -> Path:
+        """Side-file a headless lane writes when it must escalate a DECISION
+        to the owner (#894): {"question", "options", "class"}. The reap turns
+        it into a ballot on the task row (task -> blocked) so the gateway
+        relay can render it on Telegram; the answer resumes the lane.
+
+        Lives beside the transcript logs (never at the DELIVERABLE path — the
+        #868 contract keeps result.md free for the lane's own write)."""
+        d = Path(self._config.working_dir or ".") / "hermes-results"
+        d.mkdir(parents=True, exist_ok=True)
+        return d / f"{task_id}.escalation.json"
+
+    def _read_escalation(self, spawn) -> Optional[dict]:
+        """Parse the escalation side-file: ballot dict or None (absent /
+        malformed / empty — all mean 'no escalation', fail-toward-done)."""
+        path = getattr(spawn, "escalation_path", "") or ""
+        if not path:
+            return None
+        try:
+            p = Path(path)
+            if not p.is_file():
+                return None
+            raw = p.read_text(encoding="utf-8", errors="replace").strip()
+            if not raw:
+                return None
+            data = json.loads(raw)
+        except (OSError, json.JSONDecodeError):
+            logger.warning("task %s: unparseable escalation side-file at %s",
+                           getattr(spawn, "task_id", "?"), path)
+            return None
+        if not isinstance(data, dict):
+            return None
+        return data
+
     def _delivery_model_flag(self, role: str) -> List[str]:
         """Role → model mapping for a native hermes delivery.
 
@@ -1221,10 +1305,12 @@ class AgentExecutor:
         result_path = self._hermes_result_path(task_id)
         stdout_path = self._hermes_stdout_path(task_id)
         stderr_path = self._hermes_stderr_path(task_id)
+        escalation_path = self._hermes_escalation_path(task_id)
         brief_path = self._write_brief(
             task_id, task_title, task.get("description") or "",
             lane_key=lane_key, role=role,
             deliverable_path=str(result_path),
+            ballot=task.get("ballot") or None,
         )
 
         # Spawn-time cleanup of a PREVIOUS delivery's files (#868): the result
@@ -1239,6 +1325,9 @@ class AgentExecutor:
         self._remove_quiet(result_path)
         self._remove_quiet(stdout_path)
         self._remove_quiet(stderr_path)
+        # #894: a stale escalation side-file from an earlier delivery must not
+        # re-block a task whose ballot the owner already answered.
+        self._remove_quiet(escalation_path)
         # NOTE (#892): the executor deliberately does NOT create result.md at
         # spawn time — the #868 contract is that the deliverable path must not
         # pre-exist (a lane's tmp-then-rename can fail with WinError 183 when
@@ -1354,6 +1443,7 @@ class AgentExecutor:
             stdout_path=str(stdout_path),
             stdout_file=stdout_file,
             stderr_path=str(stderr_path),
+            escalation_path=str(escalation_path),
             stderr_file=stderr_file,
             lane_key=lane_key,
             role=role,
@@ -1513,6 +1603,13 @@ class AgentExecutor:
                 or str(self._hermes_stderr_path(task_id))
                 if record.get("mode") == "hermes"
                 else record.get("stderr_path") or ""
+            ),
+            # #894: deterministic from task_id, same as stdout/stderr —
+            # a reconciled hermes spawn must still see its escalation.
+            escalation_path=(
+                str(self._hermes_escalation_path(task_id))
+                if record.get("mode") == "hermes"
+                else ""
             ),
             resumed=True,
             lane_key=lane_key,
@@ -1794,7 +1891,7 @@ class AgentExecutor:
             # promoted delivery is still a real, completed turn — the next
             # brief must resume the same session, so it gets the same care
             # (#871).
-            if (outcome in ("done", "transcript_promoted")
+            if (outcome in ("done", "transcript_promoted", "blocked")
                     and spawn.mode == "hermes"):
                 self._touch_lane_from_spawn(spawn, task_id)
                 # #929: the executor-side cost footnote. The #860 enforcement
@@ -1821,6 +1918,14 @@ class AgentExecutor:
                 self._report_completion(
                     task_id, detail=detail, result=self._read_result_body(spawn)
                 )
+            elif outcome == "blocked":
+                # #894: the lane escalated a DECISION. File the ballot on the
+                # task (POST /block) — the task parks `blocked`, the relay
+                # renders it on the owner's phone, and the answer re-dispatches
+                # this lane on its SAME session. The lane's session row was
+                # just touched above, so resume is guaranteed to find it.
+                self._report_blocked(task_id, self._escalation_ballot(spawn),
+                                     spawn=spawn, detail=detail)
             elif outcome == "non_deliverable":
                 # #870: the result body was NOT a deliverable (provider/
                 # transport error or an echo of the dispatched brief). The
@@ -2048,6 +2153,22 @@ class AgentExecutor:
                         "lane context",
                         task_id,
                     )
+                # #894: ESCALATION WINS OVER DONE. The lane delivered its
+                # result body (that is exactly how a headless lane explains
+                # the decision it cannot make) AND wrote the escalation
+                # side-file: this delivery is NOT complete — the task parks
+                # `blocked` with the ballot so the gateway relay can route
+                # the question to the owner's phone. rc==0 is required: a
+                # crashed lane's stale side-file is a failure, not a ballot.
+                ballot = self._escalation_ballot(spawn)
+                if ballot is not None:
+                    resolved.append((
+                        task_id, spawn, "blocked",
+                        f"lane escalated a decision to the owner: "
+                        f"{ballot['question'][:120]!r} "
+                        f"({len(ballot['options'])} options, class={ballot['class']})",
+                    ))
+                    return
                 resolved.append((
                     task_id, spawn, "done",
                     f"hermes result written in {elapsed:.0f}s ({spawn.result_path})",
@@ -2709,6 +2830,80 @@ class AgentExecutor:
                 f"{self.RESULT_BODY_MAX_BYTES}]" + chr(10) + kept
             )
         return body
+
+    def _escalation_ballot(self, spawn) -> Optional[dict]:
+        """Normalize the lane's escalation side-file into a server ballot.
+
+        The side-file shape is the native `clarify` shape: question +
+        (optional) options + routing class. Missing options become ONE
+        open-ended placeholder — the Telegram render always offers the
+        '✏️ Other (type answer)' row, so the owner can still answer in prose;
+        the alternative (dropping the escalation) would silently swallow a
+        decision the lane explicitly asked for. An unreadable/invalid
+        question yields None — the delivery reaps by its normal rules and
+        the bad side-file is logged, never guessed around.
+        """
+        raw = self._read_escalation(spawn)
+        if raw is None:
+            return None
+        try:
+            from .ballot import build_ballot
+            options = raw.get("options")
+            if not options:
+                logger.warning(
+                    "task %s: escalation side-file has no options; rendering "
+                    "as open-ended (owner answers in prose)", spawn.task_id)
+                options = ["(open answer — type below)"]
+            cls = (raw.get("class") or "").strip().lower() or None
+            return build_ballot(str(raw.get("question") or ""),
+                                [str(o) for o in options],
+                                cls=cls, lane_key=spawn.lane_key or "")
+        except Exception as e:
+            logger.error(
+                "task %s: escalation side-file rejected (%s) — lane must "
+                "write {\"question\", \"options\"?, \"class\"?} JSON to "
+                "<task>.escalation.json (shared/claude-plugins#894)",
+                getattr(spawn, "task_id", "?"), e)
+            return None
+
+    def _report_blocked(self, task_id: str, ballot: Optional[dict],
+                        spawn=None, detail: str = "") -> bool:
+        """File the lane's ballot on main and park the task `blocked` (#894).
+
+        The task's /block handler flips the state and stores the question; if
+        the call fails outright (main down, 409 race) the task keeps its
+        running lease semantics and the watchdog/recovery reaps it — never a
+        silent done.
+
+        A `blocked` reap whose ballot went unreadable between reap and report
+        falls back to reporting the delivery COMPLETED (the result body is
+        real; that is all the fallback can honestly claim) with the loss
+        logged loudly — the same fail-toward-visible rule the #871 promotion
+        path uses.
+        """
+        if ballot is None:
+            logger.error(
+                "task %s: 'blocked' reap without a readable ballot — "
+                "reporting completion instead (escalation side-file lost; "
+                "the owner decision was NOT filed; shared/claude-plugins#894)",
+                task_id)
+            result = self._read_result_body(spawn) if spawn is not None else None
+            self._report_completion(task_id, detail=detail, result=result)
+            return False
+        ok = _signed_request(
+            self._cluster_endpoint,
+            "POST",
+            f"/api/v1/tasks/{task_id}/block",
+            ballot,
+            self._token,
+            self._node_id,
+        )
+        if ok:
+            logger.info("task %s parked blocked on owner ballot: %s",
+                        task_id, ballot["question"][:80])
+        else:
+            logger.error("failed to file ballot on task %s", task_id)
+        return bool(ok)
 
     def _report_completion(
         self, task_id: str, detail: str = "", result: Optional[str] = None

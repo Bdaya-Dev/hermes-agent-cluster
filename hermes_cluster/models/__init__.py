@@ -166,6 +166,14 @@ class Task(BaseModel):
     # cardinality guard read live issues from the STORE, never from a
     # process-local map alone.
     issues: List[str] = Field(default_factory=list)
+    # #894: the lane's decision BALLOT (question + options + class + asked_at,
+    # and the owner's answer once it lands). Set when a headless lane escalates
+    # (clarify/needs-decision): the task flips to `blocked` WITH this record so
+    # the hosted gateway can render it to the owner's phone and POST the tap
+    # back to /answer, which stores the answer and unblocks the SAME lane
+    # session. Shape + validation: hermes_cluster.core.ballot. None = no
+    # ballot outstanding.
+    ballot: Optional[Dict[str, Any]] = None
 
     model_config = {"populate_by_name": True}
 
@@ -799,6 +807,35 @@ class FailTaskRequest(BaseModel):
 
 class CancelTaskRequest(BaseModel):
     reason: str = "cancelled"
+
+
+class BlockTaskRequest(BaseModel):
+    """Body for POST /tasks/{id}/block (#894) — a lane's decision escalation.
+
+    The executor posts this when a headless worker hits clarify/needs-decision:
+    the ballot (question + options + explicit class) is recorded on the task
+    and the task flips to blocked, ready for the gateway relay to render it to
+    the owner's phone.
+    """
+    question: str
+    options: List[str] = []
+    # "technical" (default — the safe guess is the owner's DM) or "product"
+    # (routed to the Bdaya Business group). Owner ruling 2026-09-14: the
+    # ballot MUST carry its class so the relay never guesses.
+    cls: Optional[str] = Field(default=None, alias="class")
+    lane_key: str = ""
+
+    model_config = {"populate_by_name": True}
+
+
+class AnswerTaskRequest(BaseModel):
+    """Body for POST /tasks/{id}/answer (#894) — the owner's decision.
+
+    `answer` is the chosen option text (or free text from "Other");
+    `answered_by` records the owner's chat identity for the audit trail.
+    """
+    answer: str
+    answered_by: str = ""
 
 
 class SetDependenciesRequest(BaseModel):

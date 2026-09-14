@@ -22,6 +22,7 @@ from .state import ClusterState
 from .routers import (
     nodes_router,
     tasks_router,
+    ballots_router,
     leases_router,
     sync_router,
     recovery_router,
@@ -317,6 +318,7 @@ def create_app(
     # Register routers
     app.include_router(nodes_router)
     app.include_router(tasks_router)
+    app.include_router(ballots_router)
     app.include_router(leases_router)
     app.include_router(sync_router)
     app.include_router(recovery_router)

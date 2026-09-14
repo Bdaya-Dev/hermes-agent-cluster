@@ -2,6 +2,7 @@
 
 from .nodes import router as nodes_router
 from .tasks import router as tasks_router
+from .tasks import ballots_router
 from .leases import router as leases_router
 from .sync import router as sync_router
 from .recovery import router as recovery_router
@@ -21,6 +22,7 @@ from .metering import router as metering_router
 __all__ = [
     "nodes_router",
     "tasks_router",
+    "ballots_router",
     "leases_router",
     "sync_router",
     "recovery_router",

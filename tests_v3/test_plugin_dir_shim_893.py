@@ -178,7 +178,8 @@ def test_shim_registers_the_expected_surface(shim_and_module):
     ctx = RecordingContext()
     shim.register(ctx)
     assert sorted(ctx.tools) == [
-        "kanban_cluster_complete", "kanban_cluster_config", "kanban_cluster_heartbeat",
+        "kanban_cluster_answer", "kanban_cluster_block", "kanban_cluster_complete",
+        "kanban_cluster_config", "kanban_cluster_heartbeat",
         "kanban_cluster_init", "kanban_cluster_join", "kanban_cluster_list",
         "kanban_cluster_nodes", "kanban_cluster_status", "kanban_cluster_submit",
     ]

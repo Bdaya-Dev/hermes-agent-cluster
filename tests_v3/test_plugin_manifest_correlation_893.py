@@ -31,6 +31,9 @@ EXPECTED_TOOLS = [
     "kanban_cluster_complete",
     "kanban_cluster_status",
     "kanban_cluster_config",
+    # #894: decision-ballot relay (lane escalates / owner answers).
+    "kanban_cluster_block",
+    "kanban_cluster_answer",
 ]
 
 EXPECTED_HOOKS = ["on_session_start", "on_session_end"]
@@ -87,7 +90,8 @@ def _recorded():
 
 
 def test_register_matches_expected_surface():
-    """The pinned baseline: register() really registers these nine tools + two hooks."""
+    """The pinned baseline: register() really registers these tools + two hooks
+    (nine pre-#894 + kanban_cluster_block / kanban_cluster_answer)."""
     ctx = _recorded()
     assert sorted(ctx.tools) == sorted(EXPECTED_TOOLS)
     assert sorted(ctx.hooks) == sorted(EXPECTED_HOOKS)

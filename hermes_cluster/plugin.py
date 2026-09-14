@@ -482,6 +482,41 @@ def handle_cluster_status(args: dict, **kwargs) -> str:
     return json.dumps(result, indent=2)
 
 
+def handle_cluster_block(args: dict, **kwargs) -> str:
+    """#894: park THIS task blocked on an owner decision ballot.
+
+    A lane that hits a decision it cannot make headless may either write the
+    escalation side-file (the executor's reap files the ballot) or call this
+    directly — same endpoint, same record.
+    """
+    task_id = args.get("task_id")
+    if not task_id:
+        return json.dumps({"error": "task_id is required"})
+    body = {
+        "question": args.get("question") or "",
+        "options": args.get("options") or [],
+    }
+    if args.get("class"):
+        body["class"] = args["class"]
+    result = _api_call("POST", f"/api/v1/tasks/{task_id}/block", body)
+    return json.dumps(result)
+
+
+def handle_cluster_answer(args: dict, **kwargs) -> str:
+    """#894: record the owner's answer to a task's ballot and unblock it.
+
+    Normal flow is the Telegram relay; this tool exists for an operator (or a
+    lead session) answering from the cluster side.
+    """
+    task_id = args.get("task_id")
+    if not task_id:
+        return json.dumps({"error": "task_id is required"})
+    body = {"answer": args.get("answer") or "",
+            "answered_by": str(args.get("answered_by") or "")}
+    result = _api_call("POST", f"/api/v1/tasks/{task_id}/answer", body)
+    return json.dumps(result)
+
+
 def handle_cluster_config(args: dict, **kwargs) -> str:
     """Get or update cluster configuration."""
     if args:
@@ -585,6 +620,41 @@ SCHEMAS = {
                         "exposes it — answers 'how many credits are left'."),
         "parameters": {"type": "object", "properties": {}},
     },
+    "kanban_cluster_block": {
+        "name": "kanban_cluster_block",
+        "description": ("#894: park a task blocked on an owner decision ballot "
+                        "(question + options + class 'technical'|'product'). "
+                        "The hosted gateway relays the ballot to the owner's "
+                        "phone; the answer unblocks the task and resumes the "
+                        "same lane session. Preferred path for a cluster lane "
+                        "is the escalation side-file named in its brief — use "
+                        "this tool directly only from a lead/operator context."),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "task_id": {"type": "string", "description": "The blocked task."},
+                "question": {"type": "string", "description": "The decision, phrased for a phone."},
+                "options": {"type": "array", "items": {"type": "string"},
+                            "description": "The choices (rendered as native buttons + 'Other')."},
+                "class": {"type": "string", "description": "'technical' (default, owner DM) or 'product' (business group)."},
+            },
+            "required": ["task_id", "question"],
+        },
+    },
+    "kanban_cluster_answer": {
+        "name": "kanban_cluster_answer",
+        "description": ("#894: record the owner's answer to a task's ballot and "
+                        "unblock the task (re-dispatches to resume the lane)."),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "task_id": {"type": "string", "description": "The blocked task."},
+                "answer": {"type": "string", "description": "The chosen option text or free text."},
+                "answered_by": {"type": "string", "description": "Who answered (identity for the audit trail)."},
+            },
+            "required": ["task_id", "answer"],
+        },
+    },
     "kanban_cluster_config": {
         "name": "kanban_cluster_config",
         "description": "Get or update cluster configuration.",
@@ -601,6 +671,8 @@ HANDLERS = {
     "kanban_cluster_heartbeat": handle_cluster_heartbeat,
     "kanban_cluster_complete": handle_cluster_complete,
     "kanban_cluster_status": handle_cluster_status,
+    "kanban_cluster_block": handle_cluster_block,
+    "kanban_cluster_answer": handle_cluster_answer,
     "kanban_cluster_config": handle_cluster_config,
 }
 
