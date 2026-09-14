@@ -404,9 +404,18 @@ def create_app(
             # is not.
             logger.exception("startup reschedule failed (continuing)")
 
+        # #906: the metering supervisor starts HERE (uvicorn lifespan), not in
+        # create_app() — bare app objects in tests/CI stay thread-free, while
+        # the running server reconciles metering.enabled -> poller live/armed
+        # every tick, without relying on a PUT through /api/v1/config.
+        if _metering_poller is not None:
+            _metering_poller.start_supervisor()
+
     # Shutdown handler — stop all background threads
     @app.on_event("shutdown")
     async def shutdown():
+        if _metering_poller is not None:
+            _metering_poller.stop_supervisor()
         _node_manager.stop_heartbeat_sender()
         _node_manager.stop_watchdog()
         _lease_manager.stop()

@@ -613,6 +613,61 @@ class MeteringPoller:
                                         name="alibaba-metering-poller")
         self._thread.start()
 
+    # -- #906 supervisor: honor runtime enable/disable without a restart -----
+    #
+    # The docstring has always promised "enabled/interval/alert_below change
+    # WITHOUT a restart" — that held only while the loop was already running,
+    # because the single arming path was the PUT /api/v1/config post-save
+    # callback. Two holes measured on the hosted main (#906): (1) that
+    # callback sat behind the read-only-YAML 500, so it never ran there at
+    # all; (2) a store-side flip (any writer other than that endpoint) had
+    # no arming path whatsoever — poller_running stayed false until a pod
+    # restart. The loop can NOT simply "always run and gate the fetch":
+    # test_default_main_creates_no_metering_thread pins the exit-139 CI rule
+    # that a disabled main starts no fetch thread. A tiny always-off-until-
+    # needed supervisor tick reconciles enabled <-> running; app.py starts it
+    # ONLY on the server startup event (uvicorn lifespan), so bare
+    # create_app()/test/CI processes never see even this thread.
+
+    def start_supervisor(self, interval_s: float = 60.0) -> bool:
+        """Start the reconcile tick (idempotent). Cheap: one Event.wait per
+        interval, and current_enabled() is a config read, no network."""
+        sup = getattr(self, "_supervisor", None)
+        if sup is not None and sup["thread"] is not None and sup["thread"].is_alive():
+            return True
+        sup = {"stop": threading.Event(), "thread": None,
+               "interval_s": max(0.05, float(interval_s))}
+        t = threading.Thread(target=self._supervise, args=(sup,),
+                             daemon=True, name="alibaba-metering-supervisor")
+        sup["thread"] = t
+        self._supervisor = sup
+        t.start()
+        return True
+
+    def stop_supervisor(self) -> None:
+        sup = getattr(self, "_supervisor", None)
+        if sup is not None:
+            sup["stop"].set()
+            sup["thread"] = None
+
+    def _supervise(self, sup: Dict[str, Any]) -> None:
+        stop_evt: threading.Event = sup["stop"]
+        while not stop_evt.is_set():
+            try:
+                enabled = self.current_enabled()
+                running = bool(self._thread and self._thread.is_alive())
+                if enabled and not running:
+                    logger.info("metering supervisor: runtime config enabled "
+                                "— arming poll loop (#906)")
+                    self.start()
+                elif not enabled and running:
+                    logger.info("metering supervisor: runtime config disabled "
+                                "— stopping poll loop (#906)")
+                    self.stop()
+            except Exception as exc:  # the tick must never die
+                logger.warning("metering supervisor tick failed: %s", exc)
+            stop_evt.wait(sup["interval_s"])
+
     def stop(self) -> None:
         self._stop.set()
         self._thread = None
