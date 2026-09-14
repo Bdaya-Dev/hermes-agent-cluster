@@ -1135,12 +1135,17 @@ class _GitLabPoller:
 
         # ALL-OR-NOTHING (crash-mid-cycle must not leave half-published
         # bundles): PHASE 1 — run every fallible GitLab I/O and build the
-        # plans; PHASE 2 — only then create the tasks. The store has no
-        # delete_task, so rollback is impossible; the guarantee is achieved
-        # by construction instead (097d7ea7 pod: the links-shape crash fired
-        # per-repo INSIDE the old loop, so any earlier repo's bundle had
-        # already been created and sat 'ready' with a crashed cycle behind
-        # it).
+        # plans; PHASE 2 — only then create the tasks, in ONE store
+        # transaction via create_tasks_batch (any exception rolls back every
+        # row — the per-task create_task loop that lived here committed one
+        # transaction PER task, so a crash between two PHASE-2 writes stranded
+        # a partial batch on the SQLite/Postgres stores; PR#43 review finding
+        # 3). The store has no delete_task, so rollback is impossible AFTER
+        # a commit — the guarantee is: nothing fallible remains between the
+        # plans and the single commit. (097d7ea7 pod: the links-shape crash
+        # fired per-repo INSIDE the old loop, so any earlier repo's bundle
+        # had already been created and sat 'ready' with a crashed cycle
+        # behind it.)
         pending_plans: List[BundlePlan] = []
 
         for proj_path, pairs in by_repo.items():
@@ -1200,10 +1205,46 @@ class _GitLabPoller:
                     continue
             pending_plans.append(plan)
 
-        # PHASE 2 — pure store writes: every fallible step already survived,
-        # so a crash cannot strand a partially-published batch.
+        # PHASE 2 — ONE atomic batch write. Every fallible step already
+        # survived in phase 1, and the store publishes the whole set in a
+        # single transaction (create_tasks_batch: one _tx/_txn for all rows;
+        # any exception rolls back every task — see
+        # tests_v3/test_intake_batch_create_txn_43r.py), so a crash between
+        # two bundle writes cannot strand a partial batch. The old per-task
+        # create_task loop left exactly that residue on the SQLite/Postgres
+        # stores (PR#43 review finding 3; the hosted main runs Postgres).
+        plans_payload: List[Dict[str, Any]] = []
         for plan in pending_plans:
-            task = _create_bundle_task(self.state, plan, requires)
+            task_id = "task_" + secrets.token_hex(8)
+            plans_payload.append(dict(
+                task_id=task_id,
+                title=bundle_title(plan),
+                requires=list(requires),
+                priority=plan.priority,
+                lane_key=plan.lane_key,
+                role="author",
+                description=bundle_brief(plan),
+                issues=list(plan.issue_ids),
+            ))
+        if not plans_payload:
+            return
+        # The batch primitive exists on all three stores (ClusterState,
+        # ClusterStore, PostgresClusterStore + the SyncPostgres bridge via
+        # __getattr__). Anything older fails LOUD — a silent fallback to
+        # per-task writes would reintroduce the partial-batch window.
+        tasks = self.state.create_tasks_batch(plans_payload)
+        # Bookkeeping runs ONLY after the commit: a rolled-back batch must
+        # not leave dedup entries pointing at tasks that don't exist (the
+        # issue would be intake-invisible forever) nor consume _seen_keys.
+        # Matched by id, not position: an INSERT-IGNORE'd duplicate would
+        # otherwise misattribute a task id to the wrong bundle.
+        by_id = {t.id: t for t in tasks}
+        for plan, payload in zip(pending_plans, plans_payload):
+            task = by_id.get(payload["task_id"])
+            if task is None:  # id collided with an existing row: dedup to it
+                task = self.state.get_task(payload["task_id"])
+                if task is None:
+                    continue
             for pid in plan.issue_ids:
                 _issue_dedup_to_task_id[pid] = task.id
                 self._seen_keys.add(pid)
@@ -1211,6 +1252,13 @@ class _GitLabPoller:
             created_ids.append(task.id)
             logger.info("intake: grouped lane task %s lane=%s bundle=%s (%s)",
                         task.id, plan.lane_key, plan.issue_ids, plan.reason)
+        # Same 'queue it now' kick as the per-issue path, ONCE for the batch.
+        # The lane-block guard inside the scheduler keeps one sitting per lane
+        # key — band-0 bundles still jump the QUEUE (priority sort), they only
+        # wait for an ACTIVE sitting on the same lane, exactly as a per-issue
+        # task did when the lane plugin denied a second session (#833 rule #1).
+        self.state.trigger_pending_tasks()
+        self.state.schedule_pending()
 
     async def poll_once(self) -> Dict[str, Any]:
         """One intake cycle: policy scopes when configured, else legacy env.

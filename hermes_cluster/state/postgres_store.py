@@ -624,6 +624,52 @@ class PostgresClusterStore:
             row = await conn.fetchrow("SELECT * FROM tasks WHERE id = $1", task_id)
         return self._row_to_task(row)
 
+    async def create_tasks_batch(self, plans: List[Dict[str, Any]]) -> List[Task]:
+        """Create MANY tasks atomically — one bundle per grouped-intake
+        PHASE-2 plan, all published or none (PR#43 review finding 3).
+
+        Structural twin of ``ClusterStore.create_tasks_batch``: ONE ``_txn()``
+        wraps the ENTIRE loop (per-plan ``create_task`` commits one
+        transaction each, so a crash between two writes stranded a partial
+        batch — and the hosted main runs this class). asyncpg rolls the whole
+        transaction back on any exception escaping the block. Statements run
+        on the transaction ``conn`` (pool-level ``self._fetch`` would
+        auto-commit on checkout and make the transaction decorative). The
+        per-row insert+guarded-promote semantics are identical to
+        ``create_task``; the kick (trigger/schedule) stays in the caller.
+        """
+        now = _utcnow()
+        async with self._txn() as conn:
+            for plan in plans:
+                await conn.execute(
+                    """INSERT INTO tasks
+                       (id, title, requires, depends_on, priority, status,
+                        created_at, updated_at, version, lane_key, role,
+                        description, issues)
+                       VALUES ($1, $2, $3, '[]', $4, $5, $6, $6, 1, $7, $8, $9, $10)
+                       ON CONFLICT (id) DO NOTHING""",
+                    plan["task_id"], plan["title"],
+                    _json_dumps(list(plan.get("requires") or [])),
+                    plan.get("priority", 3),
+                    TaskStatus.pending.value, now,
+                    plan.get("lane_key", ""), plan.get("role", "author"),
+                    plan.get("description", ""),
+                    _json_dumps(list(plan.get("issues") or [])),
+                )
+            # Promote ONLY this batch's rows (no dependencies at creation,
+            # mirroring create_task's status-guarded UPDATE).
+            ids = [plan["task_id"] for plan in plans]
+            if ids:
+                await conn.execute(
+                    f"""UPDATE tasks SET status = $1, updated_at = $2
+                        WHERE id = ANY($3::text[]) AND status = $4""",
+                    TaskStatus.ready.value, now, ids,
+                    TaskStatus.pending.value,
+                )
+            rows = await conn.fetch(
+                "SELECT * FROM tasks WHERE id = ANY($1::text[])", ids)
+        return [self._row_to_task(r) for r in rows]
+
     async def get_task(self, task_id: str) -> Optional[Task]:
         row = await self._row("SELECT * FROM tasks WHERE id = $1", task_id)
         return self._row_to_task(row) if row else None
