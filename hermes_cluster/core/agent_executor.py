@@ -129,6 +129,12 @@ class AgentExecutorConfig:
     # two in one evening), small enough that a genuinely broken brief cannot
     # burn a node's quota looping.
     retry_limit: int = 3
+    # #892: the same floor the worker connector reports against — the executor
+    # REFUSES to claim any task while the volume holding working_dir (where
+    # hermes-briefs/hermes-results live, i.e. the lanes dir / HERMES_HOME volume)
+    # is below it. Sourced from cluster YAML node.min_free_disk_gb (owner
+    # ruling: never an env var). None -> default 5.0; 0 -> guard disabled.
+    min_free_disk_gb: Optional[float] = None
 
 
 # ---------------------------------------------------------------------------
@@ -450,6 +456,14 @@ class AgentExecutor:
 
     def _claim_and_spawn(self, max_spawns: int) -> None:
         """Poll main for assigned tasks and spawn workers for them."""
+        # #892 disk preflight: refuse the WHOLE cycle below the configured floor
+        # (a full disk killed every lane this node took on 2026-09-14 05:32Z —
+        # Errno 28 in concurrent_log_handler, then rc=120). One clear log line;
+        # tasks stay unclaimed on the main for re-dispatch to a healthy node.
+        from .disk_gate import disk_gate_blocks
+        if disk_gate_blocks(self._config.working_dir or "",
+                            getattr(self._config, "min_free_disk_gb", None)):
+            return
         # GET /api/v1/tasks from main node
         tasks = _signed_request(
             self._cluster_endpoint,
@@ -780,6 +794,88 @@ class AgentExecutor:
                 continue
         return out
 
+    # -------------------------------------------------------------------
+    # First-line diagnostic (#892): the 2026-09-14 full-disk deaths left the
+    # LAST stderr line as fail_reason and nothing in the result file. The
+    # runner now writes a sentinel into the task's result file BEFORE starting
+    # hermes; a clean lane overwrites the path (write_file) or transcript
+    # promotion replaces it, a dead lane leaves the sentinel plus appended
+    # crash diagnostics. Machine-checkable first line, same contract as the
+    # #871 PROMOTION_MARKER below.
+    # -------------------------------------------------------------------
+
+    RESULT_SENTINEL = (
+        "<!-- LANE-STARTED: the executor wrote this before launching hermes; "
+        "the lane never delivered a result. Crash diagnostics follow (if any) "
+        "— NOT a verdict (shared/claude-plugins#892). -->"
+    )
+
+    def _write_result_sentinel(self, result_path: Path, task_id: str) -> bool:
+        """Best-effort sentinel write; False when even this fails (disk full!).
+        The spawn proceeds regardless — the sentinel is a diagnostic bonus,
+        never a precondition of running a lane."""
+        try:
+            result_path.parent.mkdir(parents=True, exist_ok=True)
+            result_path.write_text(
+                f"{self.RESULT_SENTINEL}\n<!-- task: {task_id} -->\n",
+                encoding="utf-8",
+            )
+            return True
+        except OSError as e:
+            logger.warning(
+                "could not write result sentinel for task %s at %s: %s",
+                task_id, result_path, e,
+            )
+            return False
+
+    @staticmethod
+    def _content_after_sentinel(contents: str) -> str:
+        """Strip our own executor-written lines so a sentinel-only file reads
+        as NO content. Without this, the #892 diagnostic would itself become a
+        false-completion body at the rc==0 content gate (the pre-#870 trap):
+        a file whose only lines are ours is not a lane deliverable."""
+        if not contents:
+            return contents
+        lines = contents.splitlines()
+        while lines and (
+            lines[0] == AgentExecutor.RESULT_SENTINEL
+            or lines[0].startswith("<!-- task:")
+        ):
+            lines.pop(0)
+        return "\n".join(lines).strip()
+
+
+    def _append_crash_diagnostics(self, spawn: "ActiveSpawn", text: str) -> None:
+        """Guarantee the sentinel + crash block in the lane's result file (rc!=0
+        / timeout reap) — the #892 first-line diagnostic.
+
+        Three cases: (a) file absent (sentinel write itself failed on the full
+        disk, or the lane deleted it) → write sentinel + diagnostics fresh, the
+        whole point being a dead lane leaves SOMETHING; (b) first line is our
+        sentinel → append the crash block; (c) any other content (the lane
+        delivered) → never rewritten. Silent on any OSError: fail_reason
+        carries the same detail regardless, so this write must not break the
+        reap itself.
+        """
+        path = getattr(spawn, "result_path", "") or ""
+        if not path:
+            return
+        try:
+            p = Path(path)
+            if not p.is_file():
+                self._write_result_sentinel(p, getattr(spawn, "task_id", "?"))
+                # fall through and append even if the sentinel write failed —
+                # direct append is the last best-effort chance.
+            else:
+                with p.open("r", encoding="utf-8", errors="replace") as f:
+                    first = f.readline()
+                if not first.startswith("<!-- LANE-STARTED:"):
+                    return
+            with p.open("a", encoding="utf-8") as f:
+                f.write(text)
+        except OSError:
+            pass
+
     # Marker line stamped at the top of a promoted result.md (#871). Loud for
     # humans, exact for machines: a merge gate can grep the first line and
     # refuse to treat the file as a verdict. Keep in sync with tests.
@@ -908,6 +1004,13 @@ class AgentExecutor:
         self._remove_quiet(result_path)
         self._remove_quiet(stdout_path)
         self._remove_quiet(stderr_path)
+        # NOTE (#892): the executor deliberately does NOT create result.md at
+        # spawn time — the #868 contract is that the deliverable path must not
+        # pre-exist (a lane's tmp-then-rename can fail with WinError 183 when
+        # it does, and test_agent_executor_result_file_868 proves both). The
+        # first-line diagnostic instead lands HERE at reap: _reap_hermes_spawn
+        # writes the sentinel+diagnostics file for a lane that died without
+        # one, which is the moment we know it never delivered.
 
 
         # Stateful lane resolution: resume an existing live lane's session,
@@ -1505,6 +1608,10 @@ class AgentExecutor:
                 )
             except OSError:
                 contents = ""
+            # #892: drop our own pre-spawn sentinel lines BEFORE judging — a
+            # file containing only the sentinel is a died-lane diagnostic, not
+            # content, and must fall through to the no-deliverable paths below.
+            contents = self._content_after_sentinel(contents)
             if contents.strip():
                 # #870: non-empty is NOT sufficient — two production shapes
                 # rode this exact gate to a fabricated 'completed': a
@@ -1558,6 +1665,15 @@ class AgentExecutor:
             detail = f"hermes exited rc={rc} after {elapsed:.0f}s"
             if spawn.spawn_exit_stderr:
                 detail += f": {spawn.spawn_exit_stderr[:300]}"
+            # #892: a crashed lane leaves the FIRST-LINE diagnostic in its
+            # result file, not just the last stderr line in fail_reason.
+            self._append_crash_diagnostics(
+                spawn,
+                f"\n## Crash diagnostics (written by the executor at reap)\n\n"
+                f"- outcome: rc={rc} after {elapsed:.0f}s\n"
+                + (f"- last stderr:\n\n```\n{spawn.spawn_exit_stderr}\n```\n"
+                   if spawn.spawn_exit_stderr else "- no stderr captured\n"),
+            )
             resolved.append((task_id, spawn, "spawn_failed", detail))
             return
 
@@ -1634,6 +1750,14 @@ class AgentExecutor:
                 task_id, spawn, "no_result",
                 f"hermes exited rc=0 after {elapsed:.0f}s but wrote no result",
             ))
+            # #892: same class as a crash — a lane that leaves nothing gets the
+            # first-line diagnostic written by the executor at reap.
+            self._append_crash_diagnostics(
+                spawn,
+                f"\n## Crash diagnostics (written by the executor at reap)\n\n"
+                f"- outcome: rc=0 after {elapsed:.0f}s but NO deliverable "
+                f"(lane printed its final message without writing result.md)\n",
+            )
             return
 
         # Timeout is the outer bound for a still-running lane. Kill the child so
@@ -1644,6 +1768,14 @@ class AgentExecutor:
                 self._config.spawn_timeout, task_id, getattr(spawn.process, "pid", "?"),
             )
             self._kill_spawn_process(spawn)
+            # #892: a timed-out lane is a crashed lane — leave the first-line
+            # diagnostic unless the lane already delivered something.
+            self._append_crash_diagnostics(
+                spawn,
+                f"\n## Crash diagnostics (written by the executor at reap)\n\n"
+                f"- outcome: killed after exceeding {self._config.spawn_timeout:.0f}s "
+                f"spawn timeout\n",
+            )
             resolved.append((
                 task_id, spawn, "timeout",
                 f"exceeded {self._config.spawn_timeout:.0f}s",
@@ -1970,6 +2102,9 @@ class AgentExecutor:
         except OSError as exc:
             logger.warning("could not read result body at %s: %s", path, exc)
             return None
+        # #892: a sentinel-only file is the executor's own diagnostic, never a
+        # deliverable — carry nothing (same strip as the completion gate).
+        body = self._content_after_sentinel(body)
         if not body.strip():
             return None
         raw = body.encode("utf-8")

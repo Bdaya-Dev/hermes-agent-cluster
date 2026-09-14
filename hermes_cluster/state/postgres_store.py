@@ -116,7 +116,9 @@ CREATE TABLE IF NOT EXISTS nodes (
     status TEXT DEFAULT 'online',
     last_heartbeat TIMESTAMPTZ,
     load DOUBLE PRECISION DEFAULT 0.0,
-    max_concurrent INTEGER DEFAULT 0
+    max_concurrent INTEGER DEFAULT 0,
+    disk_free_gb DOUBLE PRECISION,
+    status_reason TEXT DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS tasks (
@@ -348,6 +350,11 @@ class PostgresClusterStore:
             # Idempotent column drift for databases created before #870
             # (CREATE TABLE IF NOT EXISTS never touches an existing table):
             # the main-side re-queue counter and the per-spawn delivery count.
+            # #892 adds the disk-preflight columns to `nodes` the same way.
+            await conn.execute(
+                "ALTER TABLE nodes ADD COLUMN IF NOT EXISTS disk_free_gb DOUBLE PRECISION")
+            await conn.execute(
+                "ALTER TABLE nodes ADD COLUMN IF NOT EXISTS status_reason TEXT DEFAULT ''")
             await conn.execute(
                 "ALTER TABLE tasks ADD COLUMN IF NOT EXISTS attempts INTEGER DEFAULT 0")
             # #874: the lane deliverable, so a result outlives the node that made it.
@@ -461,18 +468,22 @@ class PostgresClusterStore:
 
     async def register_node(self, node: Node) -> None:
         await self._fetch(
-            """INSERT INTO nodes (id, name, capabilities, status, last_heartbeat, load, max_concurrent)
-               VALUES ($1, $2, $3, $4, $5, $6, $7)
+            """INSERT INTO nodes (id, name, capabilities, status, last_heartbeat, load, max_concurrent,
+                 disk_free_gb, status_reason)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
                ON CONFLICT (id) DO UPDATE SET
                  name = EXCLUDED.name,
                  capabilities = EXCLUDED.capabilities,
                  status = EXCLUDED.status,
                  last_heartbeat = EXCLUDED.last_heartbeat,
                  load = EXCLUDED.load,
-                 max_concurrent = EXCLUDED.max_concurrent""",
+                 max_concurrent = EXCLUDED.max_concurrent,
+                 disk_free_gb = EXCLUDED.disk_free_gb,
+                 status_reason = EXCLUDED.status_reason""",
             node.id, node.name, _json_dumps(node.capabilities),
             node.status.value, _aware(node.last_heartbeat), float(node.load),
             int(node.max_concurrent),
+            node.disk_free_gb, getattr(node, "status_reason", ""),
         )
         if self._on_node_online:
             try:
@@ -488,11 +499,28 @@ class PostgresClusterStore:
         rows = await self._all("SELECT * FROM nodes")
         return [self._row_to_node(r) for r in rows]
 
-    async def update_heartbeat(self, node_id: str, load: float = 0.0) -> None:
-        await self._fetch(
-            "UPDATE nodes SET last_heartbeat = $1, status = $2, load = $3 WHERE id = $4",
-            _utcnow(), NodeStatus.online.value, load, node_id,
-        )
+    async def update_heartbeat(self, node_id: str, load: float = 0.0,
+                               disk_free_gb: Optional[float] = None,
+                               status_reason: str = "") -> None:
+        # #892: status follows the caller's verdict — NodeManager passes
+        # status_reason when the reported disk is below the floor; the beat
+        # refreshes the clock WITHOUT forcing online (the unconditional force
+        # is what kept the full-disk node schedulable during the 2026-09-14
+        # incident). Empty reason = the pre-#892 force-online. disk_free_gb
+        # None (older worker) leaves the stored column untouched.
+        status = NodeStatus.degraded.value if status_reason else NodeStatus.online.value
+        if disk_free_gb is None:
+            await self._fetch(
+                "UPDATE nodes SET last_heartbeat = $1, status = $2, load = $3, "
+                "status_reason = $4 WHERE id = $5",
+                _utcnow(), status, load, status_reason, node_id,
+            )
+        else:
+            await self._fetch(
+                "UPDATE nodes SET last_heartbeat = $1, status = $2, load = $3, "
+                "disk_free_gb = $4, status_reason = $5 WHERE id = $6",
+                _utcnow(), status, load, float(disk_free_gb), status_reason, node_id,
+            )
 
     async def update_capabilities(self, node_id: str, caps: List[str]) -> None:
         # ONE atomic statement (round-2 review of 1043352). The previous
@@ -565,14 +593,18 @@ class PostgresClusterStore:
         )
         return row["c"]
 
-    async def set_node_status(self, node_id: str, status: NodeStatus) -> None:
+    async def set_node_status(self, node_id: str, status: NodeStatus,
+                              reason: str = "") -> None:
         await self._fetch(
-            "UPDATE nodes SET status = $1 WHERE id = $2",
-            status.value, node_id,
+            "UPDATE nodes SET status = $1, status_reason = $2 WHERE id = $3",
+            status.value,
+            reason if status != NodeStatus.online else "",
+            node_id,
         )
 
     def _row_to_node(self, row) -> Node:
         hb = row["last_heartbeat"]
+        keys = row.keys()
         return Node(
             id=row["id"],
             name=row["name"],
@@ -581,6 +613,11 @@ class PostgresClusterStore:
             last_heartbeat=hb if hb else datetime.utcnow(),
             load=row["load"],
             max_concurrent=row["max_concurrent"] or 0,
+            # #892: a DB created before the drift ALTERs lacks the columns —
+            # treat as never-reported/blank (identical semantics to an older
+            # worker that never sends disk_free_gb).
+            disk_free_gb=row["disk_free_gb"] if "disk_free_gb" in keys else None,
+            status_reason=row["status_reason"] if "status_reason" in keys else "",
         )
 
     # -------------------------------------------------------------------
