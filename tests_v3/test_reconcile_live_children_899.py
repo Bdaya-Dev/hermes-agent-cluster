@@ -187,6 +187,9 @@ class TestSiblingRecordRefresh:
         """Ops knob: HERMES_CLUSTER_PERSISTED_REFRESH_S<0 disables refresh
         (the documented pre-#899 one-shot seeding)."""
         monkeypatch.setenv("HERMES_CLUSTER_PERSISTED_REFRESH_S", "-1")
-        from hermes_cluster.core.agent_executor import (
-            _persisted_ids_refresh_interval)
-        assert _persisted_ids_refresh_interval() < 0
+        from hermes_cluster.core import agent_executor as ae_mod
+        helper = getattr(ae_mod, "_persisted_ids_refresh_interval", None)
+        assert helper is not None, (
+            "#899: _persisted_ids_refresh_interval missing — the executor "
+            "seeds persisted ids once at reconcile and never again")
+        assert helper() < 0

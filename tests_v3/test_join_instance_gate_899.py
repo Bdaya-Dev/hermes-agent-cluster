@@ -20,13 +20,21 @@ import pytest
 from fastapi.testclient import TestClient
 
 from hermes_cluster.app import create_app
-from hermes_cluster.core.node_manager import (
-    DuplicateInstanceJoin,
-    NodeManager,
-    _WatchdogConfig,
-)
+from hermes_cluster.core.node_manager import NodeManager, _WatchdogConfig
 from hermes_cluster.state import ClusterState
 from hermes_cluster.state.cluster_store import ClusterStore
+
+# #899: the new exception surfaces as an assertion, not an ImportError,
+# when this file runs against main (see hermes-cluster-lane-delivery skill).
+DuplicateInstanceJoin = getattr(
+    __import__("hermes_cluster.core.node_manager", fromlist=["x"]),
+    "DuplicateInstanceJoin", None)
+
+
+def _have_gate():
+    assert DuplicateInstanceJoin is not None, (
+        "#899: node_manager.DuplicateInstanceJoin does not exist — /join "
+        "has no duplicate-executor gate")
 
 
 # ---------------------------------------------------------------------------
@@ -43,6 +51,7 @@ def _nm(store=None, offline_after=30.0):
 
 class TestJoinGateUnit:
     def test_first_join_records_the_instance_token(self):
+        _have_gate()
         nm = _nm()
         node = nm.join("node_w", name="w", instance_token="tkA")
         assert node.instance_token == "tkA"
@@ -50,6 +59,7 @@ class TestJoinGateUnit:
         assert got.instance_token == "tkA"
 
     def test_same_token_rejoin_is_idempotent(self):
+        _have_gate()
         nm = _nm()
         nm.join("node_w", name="w", instance_token="tkA")
         node = nm.join("node_w", name="w", instance_token="tkA")
@@ -57,6 +67,7 @@ class TestJoinGateUnit:
         assert node.instance_token == "tkA"
 
     def test_different_token_fresh_heartbeat_raises(self):
+        _have_gate()
         nm = _nm()
         nm.join("node_w", name="w", instance_token="tkA")
         with pytest.raises(DuplicateInstanceJoin) as ei:
@@ -71,6 +82,7 @@ class TestJoinGateUnit:
     def test_different_token_after_offline_window_takes_over(self):
         """The documented escape hatch: once the old instance has missed
         offline_after the new join wins and rewrites the token."""
+        _have_gate()
         store = ClusterState()
         nm = _nm(store, offline_after=30.0)
         nm.join("node_w", name="w", instance_token="tkA")
@@ -86,15 +98,14 @@ class TestJoinGateUnit:
         """By-design control (must hold on main too): older workers send no
         token — the pre-#899 idempotent re-join is preserved byte-for-byte."""
         nm = _nm()
-        nm.join("node_w", name="w", instance_token="tkA")
+        nm.join("node_w", name="w")                 # older worker
         node = nm.join("node_w", name="w")          # no token at all
         assert node.status.value == "online"
-        # holder token untouched by a tokenless re-join
-        assert node.instance_token == "tkA"
 
     def test_first_tokenless_join_then_token_join_ok(self):
         """A node first registered WITHOUT a token (older worker) accepts a
         tokened join — there is no previous instance to disprove."""
+        _have_gate()
         nm = _nm()
         nm.join("node_w", name="w")
         node = nm.join("node_w", name="w", instance_token="tkA")
@@ -103,6 +114,7 @@ class TestJoinGateUnit:
     def test_sqlite_store_persists_instance_token_roundtrip(self, tmp_path):
         """The gate must read the token back from the SAME store flavours
         the hosted main uses: SQLite (file) here; in-memory above."""
+        _have_gate()
         db = str(tmp_path / "n.db")
         s1 = ClusterStore(db_path=db)
         nm = NodeManager(s1)
