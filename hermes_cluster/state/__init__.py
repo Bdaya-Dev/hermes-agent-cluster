@@ -38,6 +38,7 @@ from ..core.scheduler import (
     FairScheduler,
     lane_blocked_ready_ids,
 )
+from ..core.lane_affinity import AffinityScheduler
 
 
 def _generate_id(prefix: str = "") -> str:
@@ -86,7 +87,8 @@ class ClusterState:
         self._max_decisions: int = 200
 
         # Fair scheduler (least-loaded node, round-robin ties, capacity-aware)
-        self._fair_scheduler = FairScheduler()
+        # + lane-to-node affinity (#858 defect 2).
+        self._fair_scheduler = AffinityScheduler()
 
         # Federation registry
         self._federation_lock = threading.Lock()
@@ -750,6 +752,16 @@ class ClusterState:
         # Tasks that still hold an active lease must not be re-assigned.
         leased_task_ids = self._active_leased_task_ids()
 
+        # Lane-to-node affinity (#858 defect 2): snapshot lane placements
+        # (lane_key -> owning node) up front; lanes live under their own
+        # lock, so read them BEFORE acquiring _tasks_lock (lock order:
+        # _task_spawns_lock alone, then _tasks_lock — never nested).
+        with self._task_spawns_lock:
+            lane_nodes = {
+                key: (rec.get("node") or "")
+                for key, rec in self._lanes.items()
+            }
+
         with self._tasks_lock:
             # LFP-1 cardinality guard (#762): ready tasks whose lane already
             # has an active/earlier sibling are held back for a later tick.
@@ -773,11 +785,15 @@ class ClusterState:
             )
 
             for task in ready_tasks:
-                node = self._fair_scheduler.choose(
-                    task.requires, online_nodes, active_counts
+                node, pinned = self._fair_scheduler.choose_pinned(
+                    task.requires, online_nodes, active_counts,
+                    pinned_node_id=lane_nodes.get(task.lane_key, "")
+                    if task.lane_key else "",
                 )
                 if node is None:
-                    # No candidate has spare capacity (or none matches caps):
+                    # Pinned lane whose node is offline/degraded/at capacity
+                    # — PARK (stays ready; never re-home a lane, #858) — or
+                    # no candidate has spare capacity for an unpinned task:
                     # leave the task ready for a later trigger.
                     continue
 
@@ -795,7 +811,8 @@ class ClusterState:
                     priority=task.priority,
                     node_id=node.id,
                     score=1.0,
-                    reason="least_loaded_capability_match",
+                    reason=("lane_affinity_pinned" if pinned
+                            else "least_loaded_capability_match"),
                 )
                 self.record_decision(decision)
 

@@ -44,6 +44,7 @@ from ..core.scheduler import (
     FairScheduler,
     lane_blocked_ready_ids,
 )
+from ..core.lane_affinity import AffinityScheduler
 
 logger = logging.getLogger(__name__)
 
@@ -290,7 +291,7 @@ class ClusterStore:
         self._max_deliveries: int = 1000
 
         # Fair scheduler (least-loaded node, round-robin ties, capacity-aware)
-        self._fair_scheduler = FairScheduler()
+        self._fair_scheduler = AffinityScheduler()
 
         self._init_db()
 
@@ -1263,12 +1264,26 @@ class ClusterStore:
                 if r["id"] not in leased and r["id"] not in lane_blocked
             ]
 
+            # #858 defect 2 (lane-to-node affinity): one row per lane_key
+            # from the lanes table maps each lane to the node that owns its
+            # session + clone. A ready task with a lane_key pinned to a node
+            # routes ONLY to that node; it parks (stays ready) when the node
+            # is offline or at capacity. Unplaced lanes schedule freely.
+            lane_nodes = {
+                r["lane_key"]: (r["node"] or "")
+                for r in conn.execute("SELECT lane_key, node FROM lanes").fetchall()
+            }
+
             for task in ready_tasks:
-                node = self._fair_scheduler.choose(
-                    task.requires, online_nodes, active_counts
+                node, pinned = self._fair_scheduler.choose_pinned(
+                    task.requires, online_nodes, active_counts,
+                    pinned_node_id=lane_nodes.get(task.lane_key, "")
+                    if task.lane_key else "",
                 )
                 if node is None:
-                    # No candidate with spare capacity: leave ready for a later trigger.
+                    # Pinned lane whose node is offline/degraded/at capacity
+                    # (pinned=True), or no candidate with spare capacity:
+                    # leave ready for a later trigger — never re-home a lane.
                     continue
 
                 conn.execute(
@@ -1286,7 +1301,8 @@ class ClusterStore:
                     priority=task.priority,
                     node_id=node.id,
                     score=1.0,
-                    reason="least_loaded_capability_match",
+                    reason=("lane_affinity_pinned" if pinned
+                            else "least_loaded_capability_match"),
                 )
                 # Inline record_decision to avoid nested _tx()
                 conn.execute(
