@@ -2876,7 +2876,15 @@ class AgentExecutor:
             return drained
 
     def _find_lease_for_task(self, task_id: str) -> str:
-        """Find the active lease ID for a task from the main node."""
+        """Find the active lease ID for a task from the main node.
+
+        #916: node-id tolerance. Nodes register as ``node_<name>`` (the
+        /join router prefixes it) while the executor runs with the BARE
+        id; the scheduler-created lease therefore carries the prefixed
+        spelling. An exact-match lookup renewed nothing for scheduler-
+        assigned tasks — the same spelling gap ``_is_assigned_to_me``
+        already tolerates (#804). Accept both forms.
+        """
         leases = _signed_request(
             self._cluster_endpoint,
             "GET",
@@ -2887,10 +2895,16 @@ class AgentExecutor:
         )
         if leases is None:
             return ""
+        mine = {self._node_id, f"node_{self._node_id}"}
         for lease in leases:
+            lease_node = lease.get("node_id", "") or ""
+            node_matches = (
+                lease_node in mine
+                or lease_node.removeprefix("node_") == self._node_id
+            )
             if (
                 lease.get("task_id") == task_id
-                and lease.get("node_id") == self._node_id
+                and node_matches
                 and lease.get("status") == "active"
             ):
                 return lease.get("id", "")

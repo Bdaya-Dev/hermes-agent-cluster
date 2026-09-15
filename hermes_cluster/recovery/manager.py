@@ -201,8 +201,11 @@ class RecoveryManager:
         Scans all active leases, marks expired ones, and triggers
         recovery for affected nodes.
 
-        Returns:
-            Summary of expired leases and recovery actions.
+        #916 ask 2: after the sweep, any task still ``running`` with no
+        live lease is LOUD — a WARNING naming task and node, so the
+        wedgeless-lease state is visible to log monitors even when nobody
+        polls /cluster/status. This is exactly the recovery-blind shape
+        the incident measured (9 running, 0 leases).
         """
         # This triggers the lease manager's expiry check
         active_leases = self._state.get_active_leases()
@@ -216,10 +219,27 @@ class RecoveryManager:
             self.trigger_recovery(node_id)
             recovered_nodes.append(node_id)
 
+        # Visibility sweep: re-read liveness AFTER recovery (recovery
+        # itself may have revoked/rescheduled). A read-only helper; the
+        # scan never drives expiry, it reports what survived the pass.
+        try:
+            unleased = self._state.unleased_running_tasks()
+        except AttributeError:
+            unleased = []
+        for row in unleased:
+            logger.warning(
+                "#916 unleased running task: task=%s node=%s "
+                "age_s=%s since_update_s=%s — recovery cannot reclaim "
+                "what has no lease",
+                row.get("task_id"), row.get("assigned_to") or "?",
+                row.get("age_seconds"), row.get("since_update_seconds"),
+            )
+
         return {
             "expired_nodes": list(expired_nodes),
             "recovered_nodes": recovered_nodes,
             "active_leases": len(active_leases),
+            "unleased_running": len(unleased),
         }
 
     # ------------------------------------------------------------------

@@ -182,15 +182,20 @@ def test_running_task_not_unassigned_while_lease_alive(store_cls):
 
 @pytest.mark.parametrize("store_cls", BOTH_STORES)
 def test_leased_task_is_not_requeued_by_scheduler(store_cls):
-    """A ready-flavoured task that still holds a lease stays put (defence in
-    depth — schedule_pending itself skips live-lease tasks)."""
+    """A running task that still holds a live lease stays put (defence in
+    depth — schedule_pending itself skips live-lease tasks).
+
+    #916 update: the scheduler LEASES ON ASSIGN now, so the first
+    schedule_pending already produced the protective lease — the old
+    manual create_lease would stack a second live lease on the same task
+    and make the single revoke at the end insufficient (unassign would
+    still see a live lease). The lease under test IS the scheduler's."""
     store = make_store(store_cls)
     register_node(store, "n1")
     register_node(store, "n2")
 
     tid = add_ready_tasks(store, 1)[0]
     store.schedule_pending()
-    store.create_lease(tid, "n1", timedelta(minutes=5))
 
     new_task = add_ready_tasks(store, 1, prefix="extra")[0]
     store.schedule_pending()

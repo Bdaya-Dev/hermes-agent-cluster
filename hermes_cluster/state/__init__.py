@@ -34,9 +34,11 @@ from ..models import (
 )
 from ..core.scheduler import (
     ACTIVE_TASK_STATUSES,
+    SCHEDULER_ASSIGNED_TTL,
     TERMINAL_TASK_STATUSES,
     FairScheduler,
     lane_blocked_ready_ids,
+    unleased_running_rows,
 )
 from ..core.lane_affinity import AffinityScheduler
 
@@ -640,6 +642,15 @@ class ClusterState:
                 if lease.status == LeaseStatus.expired
             ]
 
+    def unleased_running_tasks(self) -> List[Dict[str, Any]]:
+        """#916 visibility: running tasks holding NO live lease. Read-only
+        (the leased set comes from _active_leased_task_ids, which never
+        fires the expiry callback) — a status poll must not drive
+        recovery. Shared row shape via unleased_running_rows."""
+        return unleased_running_rows(
+            self.get_all_tasks(), self._active_leased_task_ids(),
+        )
+
     def _active_leased_task_ids(self) -> set:
         """Task IDs holding a not-yet-expired ACTIVE lease (read-only).
 
@@ -901,6 +912,15 @@ class ClusterState:
                 task.version += 1
                 active_counts[node.id] = active_counts.get(node.id, 0) + 1
                 self._fair_scheduler.mark_picked(node.id)
+
+                # #916: the PUSH path must carry the same proof-of-life the
+                # PULL (claim) path has. Every recovery path enumerates work
+                # via get_active_leases(); an assignment without a lease is
+                # invisible to it forever, so a wedged scheduler-assigned
+                # task holds its LFP-1 lane unendably. Lease on assign.
+                # (tasks_lock -> leases_lock is the established order — see
+                # unassign_task's lease guard.)
+                self.create_lease(task.id, node.id, SCHEDULER_ASSIGNED_TTL)
 
                 # Record decision
                 decision = SchedulingDecision(
