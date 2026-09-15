@@ -503,6 +503,12 @@ def handle_cluster_block(args: dict, **kwargs) -> str:
     }
     if args.get("class"):
         body["class"] = args["class"]
+    # #912: carry the FORMAL ballot's address when one exists for this
+    # question — the answer then comes back with a decision_resolve directive.
+    if args.get("decision_ref"):
+        body["decision_ref"] = str(args["decision_ref"])
+    if args.get("decision_id"):
+        body["decision_id"] = str(args["decision_id"])
     result = _api_call("POST", f"/api/v1/tasks/{task_id}/block", body)
     return json.dumps(result)
 
@@ -643,6 +649,8 @@ SCHEMAS = {
                 "options": {"type": "array", "items": {"type": "string"},
                             "description": "The choices (rendered as native buttons + 'Other')."},
                 "class": {"type": "string", "description": "'technical' (default, owner DM) or 'product' (business group)."},
+                "decision_ref": {"type": "string", "description": "#912: the FORMAL ballot's address this question mirrors: 'group[/sub]/project#<iid>' (a decision_create-tier ballot). Malformed -> 422; omit only when no formal side exists."},
+                "decision_id": {"type": "string", "description": "#912: the formal ballot's id ('D14') when decision_ref names one."},
             },
             "required": ["task_id", "question"],
         },

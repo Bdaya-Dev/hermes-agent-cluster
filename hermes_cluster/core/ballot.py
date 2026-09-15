@@ -63,6 +63,8 @@ def build_ballot(
     options: List[str],
     cls: Optional[str] = None,
     lane_key: str = "",
+    decision_ref: Optional[str] = None,
+    decision_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Build a fresh (unanswered) ballot from a lane's escalation.
 
@@ -70,13 +72,28 @@ def build_ballot(
     ballot must carry its class explicitly so the relay never guesses, and
     the safe guess for a fleet question is the owner's DM, not the business
     group.
+
+    #912 (carrier<->formal wiring): a ballot that mirrors a FORMAL GitLab
+    decision (the decision_create tier) should carry its location —
+    ``decision_ref`` = "group[/sub]/project#<iid>", optional ``decision_id``
+    ("D14"). Absent is legal (open-ended asks, no formal side); malformed is
+    a hard BallotError — a half-wired ref is exactly the mislink class this
+    closes, so the STRICT path refuses it at creation, never at answer time.
     """
+    from .ballot_wiring import parse_decision_ref, validate_decision_id
+    try:
+        parsed_ref = parse_decision_ref(decision_ref)
+        parsed_id = validate_decision_id(decision_id)
+    except ValueError as e:
+        raise BallotError(str(e))
     ballot: Dict[str, Any] = {
         "question": (question or "").strip(),
         "options": [str(o).strip() for o in (options or [])],
         "class": cls if cls else DEFAULT_CLASS,
         "lane_key": lane_key or "",
         "asked_at": _utcnow_iso(),
+        "decision_ref": (parsed_ref or {}).get("raw", "") if parsed_ref else "",
+        "decision_id": parsed_id or "",
         "answer": None,
         "answered_at": None,
         "answered_by": "",
