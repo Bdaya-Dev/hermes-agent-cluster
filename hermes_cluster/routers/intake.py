@@ -82,8 +82,13 @@ The cardinality guard (#762) keeps at most one queued bundle per lane key
 backlog), and the scheduler (core/scheduler.lane_blocked_ready_ids, applied
 by all three stores) never assigns a ready task whose lane already has an
 ACTIVE sitting — the same invariant bdaya-enforcement's lane_key_guard DENIES
-at spawn time (#833 note 133037 rule #1). Default OFF: an unconfigured policy
-keeps the per-issue wiring byte-for-byte (#886 regression guard).
+at spawn time (#833 note 133037 rule #1). ACCUMULATION WINDOW
+(``grouping.accumulate_window_s``): with grouping on, a band>0 lane keeps
+its waiting candidates UNBUNDLED until the oldest has aged that many seconds
+(band-0 and cap-full batches go instantly) — without it, steady-state issues
+arriving between sittings each mint their own single-issue lane, re-creating
+the 1:1 shape #762 exists to kill. Default 0 (off): an unconfigured policy
+keeps the pre-window grouped shape byte-for-byte (#886 regression guard).
 
 Webhook authentication: set `GITLAB_INTAKE_WEBHOOK_SECRET` to validate the
 `X-Gitlab-Token` header. When unset, the webhook accepts any POST (logs a warning).
@@ -663,7 +668,10 @@ async def webhook(request: Request):
             return {"status": "deduped", "reason": "issue already in a live task"}
         if priority > 0:
             return {"status": "queued-grouping",
-                    "reason": "grouping enabled; next poll cycle bundles it"}
+                    "reason": ("grouping enabled; poll cycles accumulate it "
+                               "into this lane's next bundle"
+                               + (" (window %ss)" % policy.grouping.accumulate_window_s
+                                  if policy.grouping.accumulate_window_s > 0 else ""))}
         lane = lane_key_for(path_with_namespace, cfg)
         if any(b == 0 for _, b in view.queued_bundles.get(lane, [])):
             # A band-0 bundle for this lane is already queued; the poller
