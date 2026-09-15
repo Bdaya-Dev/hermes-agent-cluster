@@ -110,6 +110,63 @@ def _signed_post(
 _connector_started = False
 _connector_lock = threading.Lock()
 
+# The connector must be STOPPABLE. `_loop` below is `while True:`, so without
+# these a started thread ends only when the PROCESS ends: a worker cannot be
+# reconfigured without a restart, and two connectors can be alive at once
+# (#899's duplicate-executor incident). The stop event is also the only way a
+# test can end a connector it started — a daemon thread survives the test that
+# made it and keeps posting into whatever `_signed_post` is patched to next.
+_connector_stop = threading.Event()
+_connector_thread: Optional[threading.Thread] = None
+
+def _beat_wait(interval: float) -> bool:
+    """Wait one beat. Returns True if a stop was requested during the wait.
+
+    This is a NAMED SEAM, and both of its properties matter:
+
+      * production gets an INTERRUPTIBLE wait. `time.sleep(interval)` is not
+        interruptible, so a stop had to wait out the whole beat -- with the
+        app's default 10s beat that outlived a 5s join and the thread
+        survived the shutdown that asked it to stop (measured: CI run
+        35004484899, `worker-connector-test-worker` still alive).
+      * the connector tests drive this loop by replacing the wait with one
+        that raises SystemExit after N cycles. They used to patch
+        `time.sleep` -- an implementation detail -- which is why the loop
+        could not switch to an interruptible primitive without breaking
+        them. They now patch this function, which is what they always meant.
+    """
+    return _connector_stop.wait(interval)
+
+
+def stop_worker_connector(timeout: float = 5.0) -> bool:
+    """Stop the running connector and wait for its thread to finish.
+
+    Returns True if a thread was running and has now exited, False if there
+    was nothing to stop. Idempotent, and safe to call when the connector was
+    never started — a shutdown path that raises is a shutdown path nobody
+    calls. Clears `_connector_started` so a later start is not a silent
+    no-op that logs "already running" and beats nothing.
+    """
+    global _connector_started, _connector_thread
+
+    _connector_stop.set()
+    thread = _connector_thread
+    joined = False
+    if thread is not None and thread.is_alive():
+        thread.join(timeout)
+        joined = not thread.is_alive()
+        if not joined:
+            logger.warning(
+                "worker connector did not stop within %.1fs — thread %s is "
+                "still alive", timeout, thread.name)
+    elif thread is not None:
+        joined = True
+
+    with _connector_lock:
+        _connector_started = False
+    _connector_thread = None
+    return joined
+
 
 def run_probe(name: str, spec: dict) -> bool:
     """Execute one capability probe command; True iff it exits 0 (#867)."""
@@ -394,7 +451,12 @@ def start_worker_connector(
                         "— re-joining next cycle", registered_id)
                     registered_id = None
 
-            time.sleep(heartbeat_interval)
+            if _beat_wait(heartbeat_interval):
+                logger.info("worker connector stopping: node=%s", node_id)
+                return
 
+    global _connector_thread
+    _connector_stop.clear()
     thread = threading.Thread(target=_loop, daemon=True, name=f"worker-connector-{node_id}")
+    _connector_thread = thread
     thread.start()

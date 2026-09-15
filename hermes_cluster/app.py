@@ -458,6 +458,16 @@ def create_app(
         _recovery_manager.stop_auto_recovery()
         if _agent_executor:
             _agent_executor.stop()
+        # The worker connector is a background loop like every other one
+        # above, and was the only one this handler did not stop — it had no
+        # stop path to call. Without it a worker's join/heartbeat thread
+        # outlives the app that started it: a reconfigure leaves the old
+        # connector beating beside the new one (two live executors for one
+        # node id is #899's incident), and in-process app tests leak a
+        # thread into every later test.
+        if node_role == "worker" and cluster_endpoint:
+            from .core.worker_connector import stop_worker_connector
+            stop_worker_connector()
 
     # Dashboard static file serving
     if static_dir:
