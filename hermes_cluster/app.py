@@ -37,6 +37,7 @@ from .routers import (
     cluster_router,
     intake_router,
     metering_router,
+    capabilities_router,
 )
 from .routers import nodes as nodes_mod
 from .routers import tasks as tasks_mod
@@ -54,6 +55,7 @@ from .routers import setup as setup_mod
 from .routers import cluster as cluster_mod
 from .routers import intake as intake_mod
 from .routers import metering as metering_mod
+from .routers import capabilities as capabilities_mod
 import logging
 logger = logging.getLogger(__name__)
 
@@ -291,6 +293,7 @@ def create_app(
     config_mod.init(state)
     visualization_mod.init(state)
     cluster_mod.init(state)
+    capabilities_mod.init(state)
     intake_mod.init(state)
 
     # --- Alibaba Token Plan metering poller (main-side, same process as the
@@ -331,6 +334,7 @@ def create_app(
     app.include_router(visualization_router)
     app.include_router(setup_router)
     app.include_router(cluster_router)
+    app.include_router(capabilities_router)
     app.include_router(intake_router)
     app.include_router(metering_router)
 
