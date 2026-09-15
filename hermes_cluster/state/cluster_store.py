@@ -135,7 +135,10 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- #894: the lane's decision ballot (JSON: question/options/class/
     -- asked_at/answer/answered_at/answered_by). Set on escalation, read by
     -- the gateway relay, filled by POST /tasks/{id}/answer.
-    ballot TEXT
+    ballot TEXT,
+    -- #911: the cancel's re-queue intent (NULL = never cancelled through an
+    -- intent-aware path -> legacy release semantics; 0 = hold, 1 = release).
+    cancel_requeue INTEGER
 );
 
 -- Stateful lanes: one row per lane_key, keyed to the hermes session it owns.

@@ -149,7 +149,12 @@ CREATE TABLE IF NOT EXISTS tasks (
     issues TEXT DEFAULT '[]',
     -- #894: the lane's decision ballot (JSON TEXT): question/options/class/
     -- asked_at/answer/answered_at/answered_by. See hermes_cluster.core.ballot.
-    ballot TEXT
+    ballot TEXT,
+    -- #911: the cancel's re-queue intent (NULL = never cancelled through an
+    -- intent-aware path -> legacy release semantics). Fresh CREATEs carry it
+    -- (the importer runs _SCHEMA_SQL only, not the connect() migration list);
+    -- existing DBs get it from the ALTER below.
+    cancel_requeue BOOLEAN
 );
 
 -- Stateful lanes: one row per lane_key, keyed to the hermes session it owns.
