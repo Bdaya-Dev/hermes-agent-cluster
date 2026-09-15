@@ -282,6 +282,41 @@ def test_reviewer_number_match_is_bounded(client):
         "a verdict on !22 does not gate the landing for !2")
 
 
+def test_abbreviated_sha_matches_by_prefix(client):
+    """Reviewer round-1 finding (NEEDS-CHANGES, qwen3.7-plus): landings
+    abbreviate the verdict sha ('37935ca0' for
+    '37935ca094a683dd93cb8071e2242a5f98a18ea1'). Git-convention prefix
+    equality (either direction, >=7 hex by the matcher's own bound) is a
+    match; a DIFFERENT sha still can never be — that is the property the
+    lock exists for."""
+    full = "37935ca094a683dd93cb8071e2242a5f98a18ea1"
+    other = _submit(client, "prep", requires=["tooling"])
+    oid = other.json()["id"]
+    _review(client, lane="repo!21", result=(
+        "# Independent review verdict\n**Verdict**: PASS\n"
+        f"**Head sha**: {full}\n"))
+    client.post(f"/api/v1/tasks/{oid}/complete", json={"result": "ok"})
+    r = _submit(client, f"LAND repo!21 MUST EQUAL {full[:8]}",
+                role="author", lane_key="repo#land-21",
+                requires=["github-write"], depends_on=[oid])
+    assert _task(client, r.json()["id"])["status"] == TaskStatus.ready.value, (
+        "an abbreviated sha in the landing title must satisfy the lock")
+    # ...and a genuinely different sha still holds:
+    wrong = "13667c0f9a1b2c3d4e5f60718293a4b5c6d7e8f9"
+    other2 = _submit(client, "prep2", requires=["tooling"])
+    oid2 = other2.json()["id"]
+    _review(client, lane="repo!22", result=(
+        "# Independent review verdict\n**Verdict**: PASS\n"
+        f"**Head sha**: {wrong}\n"))
+    client.post(f"/api/v1/tasks/{oid2}/complete", json={"result": "ok"})
+    r2 = _submit(client, f"LAND repo!22 MUST EQUAL {full[:8]}",
+                 role="author", lane_key="repo#land-22",
+                 requires=["github-write"], depends_on=[oid2])
+    t2 = _task(client, r2.json()["id"])
+    assert t2["status"] == TaskStatus.pending.value, (
+        "prefix matching must never let a DIFFERENT sha through")
+
+
 def test_non_landing_tasks_never_gated(client):
     """Control: an author delivery on a branch-shaped lane with no land-key
     and no 'LAND' title is untouched by the verdict gate — including the

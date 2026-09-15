@@ -246,7 +246,13 @@ def hold_reason(all_tasks: List, task) -> Optional[str]:
         return (f"landing held (#914): the PASS on {target} (task {rid}) "
                 f"pins no head sha — a sha-less verdict certifies no head")
     named = {s.lower() for s in _SHA_RE.findall(title)}
-    if vsha not in named:
+    # Git-convention sha comparison (reviewer round 1, NEEDS-CHANGES):
+    # landings routinely abbreviate the verdict sha ('37935ca094a683dd93cb
+    # 8071e2242a5f98a18ea1' -> '37935ca0'). _SHA_RE only matches runs of
+    # 7-40 hex, so prefix equality in either direction is a match within
+    # git's own collision bounds — while a DIFFERENT sha still can never
+    # match, which is the security property the lock exists for.
+    if not any(vsha.startswith(s) or s.startswith(vsha) for s in named):
         return (f"landing held (#914): reviewer PASS pins sha {vsha} "
                 f"({target}, task {rid}) but the landing names "
                 f"{', '.join(sorted(named)) or '(no sha)'} — a verdict at "
