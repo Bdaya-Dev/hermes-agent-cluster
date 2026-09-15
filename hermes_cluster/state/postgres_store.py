@@ -100,6 +100,10 @@ from ..core.scheduler import (
 )
 from ..core.ballot import parse_ballot_column
 from ..core.lane_affinity import AffinityScheduler
+from ..core.landing_gate import (
+    hold_reason as landing_hold_reason,
+    landing_artifact,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1358,6 +1362,26 @@ class PostgresClusterStore:
                     by_id.get(d) == TaskStatus.completed.value for d in depends
                 )
             if ok:
+                # #914: a landing task promotes only on the board's latest
+                # un-superseded PASS at a sha it names; held landings stay
+                # pending with the violated gate in fail_reason.
+                row_full = await self._row(
+                    "SELECT * FROM tasks WHERE id = $1", row["id"])
+                candidate = self._row_to_task(row_full) if row_full else None
+                if candidate is not None and landing_artifact(candidate):
+                    all_rows = await self._all("SELECT * FROM tasks")
+                    tasks = [self._row_to_task(r) for r in all_rows]
+                    reason = landing_hold_reason(tasks, candidate)
+                    if reason is not None:
+                        if (row_full["fail_reason"] or "") != reason:
+                            await self._fetch(
+                                """UPDATE tasks SET fail_reason = $1,
+                                          updated_at = $2
+                                   WHERE id = $3 AND status = $4""",
+                                reason, now, row["id"],
+                                TaskStatus.pending.value,
+                            )
+                        continue
                 n = await self._exec_status_rowcount(
                     """UPDATE tasks SET status = $1, updated_at = $2
                        WHERE id = $3 AND status = $4""",

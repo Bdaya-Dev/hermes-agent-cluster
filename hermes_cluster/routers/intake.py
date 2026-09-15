@@ -693,6 +693,9 @@ async def webhook(request: Request):
         title=title,
         priority=priority,
         requires=requires,
+        # #872 (deeper half): the issue body IS the brief — give it the
+        # column it now has instead of leaving it nowhere.
+        description=attrs.get("description", "") or "",
     )
     status = "created" if is_new else "deduped"
     return {"status": status, "task_id": task.id, "priority": task.priority,
@@ -885,12 +888,18 @@ def _create_task_from_issue(
     priority: int = 3,
     requires: Optional[list] = None,
     state: Any = None,
+    description: str = "",
 ) -> tuple[Task, bool]:
     """Create a cluster task from a GitLab issue, dedup by key.
 
     ``state`` defaults to the module-bound ClusterState (set by init()); the
     poller passes its own bound state so a directly-constructed poller (tests,
     embedded use) works without global init.
+
+    #872 (deeper half): the issue BODY is the brief and rides in the task's
+    own `description` column; the title stays the one-line `[#iid] Issue
+    title` goal. Before this the body had nowhere to go, which is exactly the
+    conflation that let one lane's brief land in another lane's title.
 
     Returns (task, is_new) where is_new=True if a new task was created,
     False if an existing task was returned (dedup hit).
@@ -912,6 +921,7 @@ def _create_task_from_issue(
         title=f"[#{display_iid}] {title}",
         requires=requires if requires is not None else _intake_requires(),
         priority=priority,
+        description=description or "",
     )
     _issue_dedup_to_task_id[dedup_key] = task_id
     st.trigger_pending_tasks()
@@ -1474,6 +1484,9 @@ class _GitLabPoller:
                         priority=priority,
                         requires=requires,
                         state=self.state,
+                        # #872 (deeper half): the issue body IS the brief —
+                        # give it the column it now has.
+                        description=issue.get("description", "") or "",
                     )
                     if is_new:
                         self.tasks_created += 1

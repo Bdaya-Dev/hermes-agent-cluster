@@ -132,15 +132,18 @@ class TaskManager:
         priority: int = 3,
         depends_on: Optional[List[str]] = None,
         assign_to: Optional[str] = None,
+        description: str = "",
     ) -> Task:
         """Create a new task with optional dependencies and immediate assignment.
 
         Args:
-            title: Task title (required).
+            title: Task title (required). One-line goal (#872: the brief, if
+                there is one, goes in `description`, not here).
             requires: Node capabilities needed (empty = any node).
             priority: 1=highest, 5=lowest (default 3).
             depends_on: Task IDs that must complete first.
             assign_to: Immediately assign to a specific node (skips auto-schedule).
+            description: The task's brief in its own column (#872 deeper half).
 
         Returns:
             Created Task object.
@@ -153,7 +156,7 @@ class TaskManager:
 
         task_id = _generate_id("task")
         task = self._store.create_task(
-            task_id, title, requires or [], priority
+            task_id, title, requires or [], priority, description=description
         )
 
         # Set dependencies if provided
