@@ -1438,8 +1438,12 @@ class ClusterStore:
             ready_tasks = [
                 self._row_to_task(r)
                 for r in conn.execute(
+                    # Band ASC (0 = top), then NEWEST FIRST within the band —
+                    # owner ruling 2026-09-15, "priority goes to the most
+                    # recent issues first then working towards the older
+                    # ones". Band still dominates; recency is the tiebreak.
                     """SELECT * FROM tasks WHERE status = ?
-                       ORDER BY priority, created_at""",
+                       ORDER BY priority, created_at DESC""",
                     (TaskStatus.ready.value,),
                 ).fetchall()
                 if r["id"] not in leased and r["id"] not in lane_blocked

@@ -146,7 +146,8 @@ class Node(BaseModel):
 # ===========================================================================
 
 # Documented default band when a submitter says nothing (#866): the sort is
-# ascending (ORDER BY priority, created_at), bands run 0 (top) .. 5.
+# ORDER BY priority ASC, created_at DESC -- band ascending (0 = top), then
+# NEWEST FIRST within the band (owner ruling 2026-09-15). Bands run 0 .. 5.
 DEFAULT_PRIORITY = 3
 
 
@@ -821,7 +822,8 @@ class SetDrainedRequest(BaseModel):
 class SubmitTaskRequest(BaseModel):
     title: str
     requires: List[str] = []
-    # Bands for the ascending scheduler sort (ORDER BY priority, created_at):
+    # Bands for the scheduler sort (ORDER BY priority ASC, created_at DESC
+    # -- newest first within a band, owner ruling 2026-09-15):
     # 0=top band (most urgent), 1..5 documented bands, unset -> default 3.
     # None is the not-supplied sentinel (#866): 0 used to double as it, so a
     # caller sending 0 "to mean what the sort says" was silently rewritten

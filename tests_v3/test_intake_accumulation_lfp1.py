@@ -153,7 +153,11 @@ def test_window_off_reproduces_legacy_bundle_immediately(clean_env, monkeypatch)
     res = asyncio.run(poller.poll_once())
     assert len(res["created"]) == 1
     t = st.get_task(res["created"][0])
-    assert t.issues == ["invora/invora-flutter#901", "invora/invora-flutter#902"]
+    # NEWEST FIRST (owner ruling 2026-09-15). #902 is aged 3s, #901 aged 5s,
+    # so #902 leads. This test's subject is the window being OFF (bundle
+    # immediately); the order is incidental to it but pinned so a future
+    # ordering change cannot pass unnoticed.
+    assert t.issues == ["invora/invora-flutter#902", "invora/invora-flutter#901"]
 
 
 def test_window_holds_young_then_bundles_whole_accumulation(clean_env, monkeypatch):
@@ -172,14 +176,20 @@ def test_window_holds_young_then_bundles_whole_accumulation(clean_env, monkeypat
     # Same cycle again — still nothing (idempotent hold).
     assert asyncio.run(poller.poll_once())["created"] == []
     # The oldest issue crosses the window boundary (poller re-reads state
-    # each cycle): ONE bundle, all three issues, in oldest-first order.
+    # each cycle): ONE bundle, all three issues.
+    #
+    # NOTE the two different roles `created_at` plays here, which is easy to
+    # conflate: the WINDOW is measured from the OLDEST issue (it is a proxy
+    # for "how long has this window been open"), while the bundle's ORDER is
+    # NEWEST FIRST (owner ruling 2026-09-15). So #911 is what releases the
+    # hold, and #913 is what leads the bundle.
     routes["/groups/invora/issues"] = [_aged(911, 1801), _aged(912, 1791),
                                        _aged(913, 1781)]
     res = asyncio.run(poller.poll_once())
     assert len(res["created"]) == 1, "aged backlog must bundle in ONE task"
     t = st.get_task(res["created"][0])
-    assert t.issues == ["invora/invora-flutter#911", "invora/invora-flutter#912",
-                        "invora/invora-flutter#913"]
+    assert t.issues == ["invora/invora-flutter#913", "invora/invora-flutter#912",
+                        "invora/invora-flutter#911"]
     assert t.lane_key == "invora-flutter#env/dev"
     # The bundled trio is now blocked (one queued sitting per lane): a FRESH
     # young issue joins no bundle until the window ages it too.
@@ -209,17 +219,40 @@ def test_band0_never_waits_for_window(clean_env, monkeypatch):
 
 def test_cap_full_bundle_ignores_window(clean_env, monkeypatch):
     """Owner sitting-size target met -> no hold even when everything is
-    young: 40 candidates arrive at once, one full-size bundle fires now."""
+    young: 40 candidates arrive at once, one CAP-SIZED bundle fires now.
+
+    The cap is 30 (owner ruling 2026-09-15, "a limit of 30 issues"); it was
+    40 under the earlier "30-40" intent. The 10 surplus candidates ride the
+    NEXT sitting — that is the documented behaviour of the exemption
+    ("waiting longer only delays a full sitting while surplus arrivals ride
+    the NEXT window anyway"), not a dropped-issue bug.
+    """
+    from hermes_cluster.core.intake_grouping import GroupingConfig
+
     monkeypatch.setenv("GITLAB_INTAKE_ENDPOINT", "https://gitlab.test")
     st = ClusterState()
-    issues = [_aged(1000 + i, 3) for i in range(40)]
+    cap = GroupingConfig().max_bundle_size
+    # DISTINCT ages, descending: i=0 is the OLDEST (aged 100s), i=cap+9 the
+    # NEWEST (aged 61s). All still young relative to the 1800s window, which
+    # is the point — the cap exemption fires regardless of age.
+    # (An earlier draft of this test used a uniform age for every issue,
+    # which made "the newest ten" meaningless and the ordering assertion
+    # unfalsifiable — it passed on id order alone.)
+    issues = [_aged(1000 + i, 100 - i) for i in range(cap + 10)]
     poller = _poller(st, _routes(issues), _cfg(
         [{"type": "group", "path": "invora", "enabled": True}],
         grouping=_grouping_policy(accumulate_window_s=1800)))
     res = asyncio.run(poller.poll_once())
     assert len(res["created"]) == 1
     t = st.get_task(res["created"][0])
-    assert len(t.issues) == 40
+    assert len(t.issues) == cap, (
+        f"a full sitting must be exactly the cap ({cap}), not the candidate "
+        f"count — got {len(t.issues)}")
+    # Newest-first: the cap-sized batch takes the NEWEST candidates, so the
+    # 10 surplus left behind are the OLDEST ten.
+    bundled = {int(x.rsplit("#", 1)[1]) for x in t.issues}
+    assert bundled == set(range(1000 + 10, 1000 + cap + 10)), (
+        "the sitting must take the NEWEST cap-many issues")
 
 
 def test_missing_created_at_fails_open(clean_env, monkeypatch):
