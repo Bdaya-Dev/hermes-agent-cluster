@@ -732,6 +732,39 @@ class AgentExecutor:
                    f"answered_at={ballot.get('answered_at') or '?'})"),
                 "",
             ]
+            # #912: the formal-ballot obligation rides the same delivery.
+            formal = ballot.get("formal") or {}
+            if formal.get("state") == "formal-resolvable" and formal.get("formal_ref"):
+                fr = formal["formal_ref"]
+                lines += [
+                    f"### Formal ballot actuation due (shared/claude-plugins#912)",
+                    f"Your carrier answer is AUTHORITATIVE but the FORMAL ballot "
+                    f"at `{fr['project']}#{fr['issue_iid']}`"
+                    + (f" (id `{formal.get('decision_id')}`)" if formal.get("decision_id") else "")
+                    + " is still unticked. Actuate it BEFORE continuing:",
+                    "  `decision_resolve` with project/issueIid/id from the ref above, "
+                    "chosen = the option key matching the answer (decision_get first to "
+                    "read the option keys), decider from answered_by, rationale = the "
+                    "answer text, registryProject shared/knowledge-base. The tick+label+"
+                    "registry+PM-DECISION mechanics are that tool's job, not yours.",
+                    "",
+                ]
+            elif formal.get("state") == "needs-actuation":
+                lines += [
+                    "### Formal ballot actuation due (shared/claude-plugins#912)",
+                    "The owner answered this carrier ballot, but the escalation "
+                    "carried NO decision_ref to a formal (decision_create-tier) "
+                    "ballot — either none exists or it was never wired. Do NOT "
+                    "re-ask the owner. If the question corresponds to a formal "
+                    "ballot on a known issue, actuate it via decision_resolve "
+                    "(decision_get first); if no formal ballot exists, the "
+                    "answer stands alone — record it on the owning issue as a "
+                    "PM DECISION note and say in your return value that the "
+                    "carrier had no formal side (that gap is #912's "
+                    "needs-actuation class — file the missing decision_ref at "
+                    "block time next round).",
+                    "",
+                ]
         lines += [
             "### Standing lane rules",
             "- You are a headless worker spawned by the Hermes cluster executor on node "
@@ -2885,11 +2918,13 @@ class AgentExecutor:
             cls = (raw.get("class") or "").strip().lower() or None
             return build_ballot(str(raw.get("question") or ""),
                                 [str(o) for o in options],
-                                cls=cls, lane_key=spawn.lane_key or "")
+                                cls=cls, lane_key=spawn.lane_key or "",
+                                decision_ref=raw.get("decision_ref"),
+                                decision_id=raw.get("decision_id"))
         except Exception as e:
             logger.error(
                 "task %s: escalation side-file rejected (%s) — lane must "
-                "write {\"question\", \"options\"?, \"class\"?} JSON to "
+                "write {\"question\", \"options\"?, \"class\"?, \"decision_ref\"?, \"decision_id\"?} JSON to "
                 "<task>.escalation.json (shared/claude-plugins#894)",
                 getattr(spawn, "task_id", "?"), e)
             return None
