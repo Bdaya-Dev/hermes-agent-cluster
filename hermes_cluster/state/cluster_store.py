@@ -46,6 +46,10 @@ from ..core.scheduler import (
 )
 from ..core.ballot import parse_ballot_column
 from ..core.lane_affinity import AffinityScheduler
+from ..core.landing_gate import (
+    hold_reason as landing_hold_reason,
+    landing_artifact,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1336,7 +1340,13 @@ class ClusterStore:
         )
 
     def trigger_pending_tasks(self) -> int:
-        """Promote pending tasks with all dependencies met to ready."""
+        """Promote pending tasks with all dependencies met to ready.
+
+        #914: a LANDING task is promoted only when the board's latest
+        reviewer verdict on its artifact is an un-superseded PASS at a sha
+        the landing names; a held landing records WHY in fail_reason and
+        stays pending (operator override: POST /tasks/{id}/advance).
+        """
         promoted = 0
         with self._tx() as conn:
             rows = conn.execute(
@@ -1347,30 +1357,46 @@ class ClusterStore:
             for row in rows:
                 depends = _json_loads(row["depends_on"])
                 if not depends:
-                    conn.execute(
-                        """UPDATE tasks SET status = ?, updated_at = ?
-                           WHERE id = ? AND status = ?""",
-                        (TaskStatus.ready.value, _dt_to_str(datetime.utcnow()),
-                         row["id"], TaskStatus.pending.value),
-                    )
-                    promoted += 1
+                    ok = True
                 else:
-                    all_done = True
+                    ok = True
                     for dep_id in depends:
                         dep_row = conn.execute(
                             "SELECT status FROM tasks WHERE id = ?", (dep_id,)
                         ).fetchone()
                         if dep_row is None or dep_row["status"] != TaskStatus.completed.value:
-                            all_done = False
+                            ok = False
                             break
-                    if all_done:
-                        conn.execute(
-                            """UPDATE tasks SET status = ?, updated_at = ?
-                               WHERE id = ? AND status = ?""",
-                            (TaskStatus.ready.value, _dt_to_str(datetime.utcnow()),
-                             row["id"], TaskStatus.pending.value),
-                        )
-                        promoted += 1
+                if not ok:
+                    continue
+                # #914 verdict gate: consult the board only for tasks that
+                # even look like landings (cheap title/lane pre-check).
+                full = conn.execute(
+                    "SELECT * FROM tasks WHERE id = ?", (row["id"],)
+                ).fetchone()
+                candidate = self._row_to_task(full) if full else None
+                if candidate is not None and (
+                        landing_artifact(candidate) is not None):
+                    all_rows = conn.execute("SELECT * FROM tasks").fetchall()
+                    tasks = [self._row_to_task(r) for r in all_rows]
+                    reason = landing_hold_reason(tasks, candidate)
+                    if reason is not None:
+                        if (full["fail_reason"] or "") != reason:
+                            conn.execute(
+                                """UPDATE tasks SET fail_reason = ?,
+                                          updated_at = ?
+                                   WHERE id = ? AND status = ?""",
+                                (reason, _dt_to_str(datetime.utcnow()),
+                                 row["id"], TaskStatus.pending.value),
+                            )
+                        continue
+                conn.execute(
+                    """UPDATE tasks SET status = ?, updated_at = ?
+                       WHERE id = ? AND status = ?""",
+                    (TaskStatus.ready.value, _dt_to_str(datetime.utcnow()),
+                     row["id"], TaskStatus.pending.value),
+                )
+                promoted += 1
         return promoted
 
     def schedule_pending(self) -> int:
