@@ -92,9 +92,11 @@ from ..models import (
 )
 from ..core.scheduler import (
     ACTIVE_TASK_STATUSES,
+    SCHEDULER_ASSIGNED_TTL,
     TERMINAL_TASK_STATUSES,
     FairScheduler,
     lane_blocked_ready_ids,
+    unleased_running_rows,
 )
 from ..core.ballot import parse_ballot_column
 from ..core.lane_affinity import AffinityScheduler
@@ -848,6 +850,20 @@ class PostgresClusterStore:
         rows = await self._all("SELECT * FROM tasks")
         return [self._row_to_task(r) for r in rows]
 
+    async def unleased_running_tasks(self) -> List[Dict[str, Any]]:
+        """#916 visibility: running tasks holding NO live lease. Read-only
+        SELECT (same predicate as schedule_pending_detailed's leased set)
+        — a status poll must not drive the expiry-marking side effect.
+        """
+        now = _utcnow()
+        leased = {
+            r["task_id"] for r in await self._all(
+                "SELECT task_id FROM leases WHERE status = $1 AND expires_at > $2",
+                LeaseStatus.active.value, now,
+            )
+        }
+        return unleased_running_rows(await self.get_all_tasks(), leased)
+
     async def set_task_result(self, task_id: str, result: Optional[str]) -> bool:
         """Persist a lane's deliverable on the task row (#874). No-op on empty."""
         if result is None or not str(result).strip():
@@ -1488,6 +1504,20 @@ class PostgresClusterStore:
                             continue
                         active_counts[node.id] = active_counts.get(node.id, 0) + 1
                         self._fair_scheduler.mark_picked(node.id)
+
+                        # #916: lease on assign — the push path gets the
+                        # same recovery protection as the claim path (see
+                        # ClusterState). Same transaction as the guarded
+                        # UPDATE above, so an assign and its lease land
+                        # atomically under the schedule advisory lock.
+                        await conn.execute(
+                            """INSERT INTO leases
+                               (id, task_id, node_id, created_at, expires_at, status)
+                               VALUES ($1, $2, $3, $4, $5, $6)""",
+                            f"lease_{secrets.token_hex(8)}", task.id, node.id,
+                            now, now + SCHEDULER_ASSIGNED_TTL,
+                            LeaseStatus.active.value,
+                        )
 
                         await conn.execute(
                             """INSERT INTO scheduling_decisions

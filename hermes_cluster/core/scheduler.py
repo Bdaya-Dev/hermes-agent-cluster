@@ -42,12 +42,80 @@ from __future__ import annotations
 
 from typing import Any, Dict, Iterable, List, Optional
 
-from ..models import Node, TaskStatus
+from ..models import LeaseConfig, Node, TaskStatus
 
 # Task states that occupy a node slot. ``running`` is what the scheduler
 # sets on assignment; ``assigned`` exists in the Go enum and would count
 # the same way if a store ever uses it.
 ACTIVE_TASK_STATUSES = frozenset({TaskStatus.running, TaskStatus.assigned})
+
+# #916: the TTL a scheduler-assigned (PUSH-model) task gets when
+# ``schedule_pending`` leases it on assign. Deliberately THE SAME value as
+# the claim path's default (``LeaseConfig.ttl`` = 60s): the lease's purpose
+# on both models is identical — proof-of-life of the worker holding the
+# sitting — and the same renewal machinery serves both (the executor's
+# poll loop renews every live spawn, well inside the window). A shorter
+# push TTL would race legitimately long lanes on a slow renewal tick; a
+# longer one would delay reclaiming a wedged lane, which is the whole
+# point of the push lease. If the wedge-vs-renew contract ever changes
+# (e.g. renewal moves off the poll cadence), THIS constant is the place
+# to say so — the argument lives in the PR body of shared/claude-plugins#916.
+SCHEDULER_ASSIGNED_TTL = LeaseConfig().ttl
+
+
+def unleased_running_rows(tasks: Iterable[Any],
+                          leased_task_ids: Any,
+                          now: Optional[Any] = None) -> List[Dict[str, Any]]:
+    """#916 ask 2 — VISIBILITY: running tasks with no LIVE lease.
+
+    A scheduler-assigned task used to have no lease at all, so the exact
+    incident shape (9 running, GET /leases == []) was indistinguishable
+    from health. After the lease-on-assign fix, an unleased-running row
+    means one of two reportable things: a legacy row from before the fix,
+    or a lease that died (worker silent, recovery not yet run — or
+    recovery itself broken). Either way a monitor must be able to COUNT
+    it. ``leased_task_ids`` is the set of task ids holding a lease that
+    is ACTIVE *and* not past expires_at — each store computes it with
+    its existing read-only lease filter, so a status poll never drives
+    the expiry-marking side effect (that is recovery, and a GET must not
+    cause one).
+
+    Returns dicts (not Tasks) so every store surface can serialize the
+    same shape straight into /cluster/status and the recovery scan log.
+    """
+    from datetime import datetime as _dt
+    leased = set(leased_task_ids)
+    if now is None:
+        now = _dt.utcnow()
+    rows = []
+    for t in tasks:
+        if isinstance(t, dict):
+            status = t.get("status")
+            status = getattr(status, "value", status)
+            if status != TaskStatus.running.value:
+                continue
+            tid = t.get("id")
+            if tid in leased:
+                continue
+            assigned = t.get("assigned_to") or ""
+            created = t.get("created_at")
+            updated = t.get("updated_at")
+        else:
+            if t.status != TaskStatus.running:
+                continue
+            if t.id in leased:
+                continue
+            assigned = t.assigned_to or ""
+            created = t.created_at
+            updated = t.updated_at
+            tid = t.id
+        rows.append({
+            "task_id": tid,
+            "assigned_to": assigned,
+            "age_seconds": int((now - created).total_seconds()) if created else None,
+            "since_update_seconds": int((now - updated).total_seconds()) if updated else None,
+        })
+    return rows
 
 
 def lane_blocked_ready_ids(tasks: Iterable[Any]) -> set:

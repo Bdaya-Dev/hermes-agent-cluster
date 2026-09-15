@@ -21,6 +21,12 @@ async def cluster_status():
     """Cluster overview for Dashboard."""
     task_counts = _state.task_counts()
     uptime_seconds = int((datetime.utcnow() - _state.started_at).total_seconds())
+    # #916 ask 2: a `running` task with NO live lease is the exact shape
+    # of the incident that motivated this fix (9 running, GET /leases ->
+    # []) — and it used to be indistinguishable from health. Surface it
+    # as a count + per-task detail so a monitor can key on
+    # `unleased_running > 0` without scraping the lease table itself.
+    unleased = _state.unleased_running_tasks()
     # S3 fix: surface all task counts including cancel states
     return {
         "cluster_id": _state.cluster_id,
@@ -37,6 +43,8 @@ async def cluster_status():
             "cancel_requested": task_counts.get("cancel_requested", 0),
             "cancelled": task_counts.get("cancelled", 0),
         },
+        "unleased_running": len(unleased),
+        "unleased_running_tasks": unleased,
         "uptime_seconds": uptime_seconds,
         "version": "python-1.0.0",
     }

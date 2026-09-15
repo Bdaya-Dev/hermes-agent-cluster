@@ -40,9 +40,11 @@ from ..models import (
 )
 from ..core.scheduler import (
     ACTIVE_TASK_STATUSES,
+    SCHEDULER_ASSIGNED_TTL,
     TERMINAL_TASK_STATUSES,
     FairScheduler,
     lane_blocked_ready_ids,
+    unleased_running_rows,
 )
 from ..core.ballot import parse_ballot_column
 from ..core.lane_affinity import AffinityScheduler
@@ -796,6 +798,21 @@ class ClusterStore:
             rows = self._conn.execute("SELECT * FROM tasks").fetchall()
         return [self._row_to_task(r) for r in rows]
 
+    def unleased_running_tasks(self) -> List[Dict[str, Any]]:
+        """#916 visibility: running tasks holding NO live lease. Read-only
+        SELECT (same predicate as schedule_pending_detailed's leased set)
+        — a status poll must not drive the expiry-marking side effect.
+        """
+        now = _dt_to_str(datetime.utcnow())
+        with self._lock:
+            leased = {
+                r["task_id"] for r in self._conn.execute(
+                    "SELECT task_id FROM leases WHERE status = ? AND expires_at > ?",
+                    (LeaseStatus.active.value, now),
+                ).fetchall()
+            }
+        return unleased_running_rows(self.get_all_tasks(), leased)
+
     def set_task_result(self, task_id: str, result: Optional[str]) -> bool:
         """Persist a lane's deliverable on the task row (#874).
 
@@ -1505,6 +1522,22 @@ class ClusterStore:
                 )
                 active_counts[node.id] = active_counts.get(node.id, 0) + 1
                 self._fair_scheduler.mark_picked(node.id)
+
+                # #916: lease on assign — the push path gets the same
+                # recovery protection as the claim path (see ClusterState).
+                # Inline INSERT mirroring create_lease's schema (a nested
+                # _tx() under this one would deadlock the RLock's sqlite
+                # connection handoff — every writer in this function is
+                # inline for that reason).
+                _s916_lease_id = _generate_id("lease")
+                _s916_expires = now + SCHEDULER_ASSIGNED_TTL
+                conn.execute(
+                    """INSERT INTO leases
+                       (id, task_id, node_id, created_at, expires_at, status)
+                       VALUES (?, ?, ?, ?, ?, ?)""",
+                    (_s916_lease_id, task.id, node.id, _dt_to_str(now),
+                     _dt_to_str(_s916_expires), LeaseStatus.active.value),
+                )
 
                 decision = SchedulingDecision(
                     task_id=task.id,

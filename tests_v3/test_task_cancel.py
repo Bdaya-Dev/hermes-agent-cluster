@@ -716,16 +716,22 @@ class TestRound3Fixes:
     def test_r3_1_unleased_running_dependent_cancelled_immediately(self, client):
         """R3-1: cascade must branch on lease existence, not status.
 
-        A scheduler-assigned running task has status=running but NO lease.
-        When its parent fails/cancels, it must be cancelled immediately,
-        NOT set to cancel_requested (which would be an un-ackable zombie).
-        """
+        A running task with NO live lease — the #804 revive shape, or any
+        row whose lease was revoked out from under it — when its parent
+        fails/cancels, must be cancelled immediately, NOT set to
+        cancel_requested (which would be an un-ackable zombie).
+
+        #916 update: the scheduler leases on assign NOW, so "running with
+        no lease" is no longer the natural post-schedule state; the live
+        lease is explicitly revoked to construct the shape this branch
+        guards (the same shape /cluster/status reports as
+        unleased_running)."""
         node_id = _join_node(client)
         parent_id = _create_task(client)
         child_id = _create_task(client)
         client.post(f"/api/v1/tasks/{child_id}/dependencies", json={"depends_on": [parent_id]})
 
-        # Scheduler assigns child to running (no lease created by scheduler)
+        # Scheduler assigns child to running (and leases it, #916).
         resp = client.post("/api/v1/schedule/trigger")
         assert resp.status_code == 200
 
@@ -735,11 +741,15 @@ class TestRound3Fixes:
         assert child["status"] == "running", \
             f"child should be running (scheduler-assigned), got {child['status']}"
 
-        # Verify NO lease exists for child (scheduler doesn't create leases)
+        # Construct the guarded shape: strip the child's live lease so it
+        # is running-without-ownership (the legacy / revive / revoked state).
+        for l in client.get("/api/v1/leases").json():
+            if l["task_id"] == child_id and l["status"] == "active":
+                assert client.delete(f"/api/v1/leases/{l['id']}").status_code == 200
         leases = client.get("/api/v1/leases").json()
         active_leases_for_child = [l for l in leases if l["task_id"] == child_id and l["status"] == "active"]
         assert len(active_leases_for_child) == 0, \
-            "scheduler-assigned running task must have no lease"
+            "setup: child must be running with no live lease"
 
         # Fail parent — child should cascade to cancelled immediately (not cancel_requested)
         client.post(f"/api/v1/tasks/{parent_id}/fail", json={"reason": "broken"})
