@@ -392,7 +392,11 @@ class SyncReceiver:
                 if existing is None:
                     # Create new task
                     self._store.create_task(
-                        task.id, task.title, task.requires, task.priority
+                        task.id, task.title, task.requires, task.priority,
+                        # #872 (deeper half): carry the brief column across the
+                        # sync hop; dropping it here would strand the lane's
+                        # brief off the node that owns it.
+                        description=task.description,
                     )
                     # Set status and assigned_to if different from default
                     if task.status != TaskStatus.pending:

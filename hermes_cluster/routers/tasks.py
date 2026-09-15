@@ -184,20 +184,40 @@ def _action_ref_mismatches(brief: str, target: str) -> list:
 
 @router.post("")
 async def submit_task(req: SubmitTaskRequest):
-    # #872: a task's `title` IS its brief -- the schema has no description
-    # column. On 2026-09-12 the authoring path wrote one task's brief verbatim
-    # into another task's title: the reviewer lane for PR#274 received an
-    # IMPLEMENTATION brief naming no PR at all. The lane did exactly as asked
-    # and posted nothing; the lead read `completed` with no verdict, concluded
-    # the result was lost, and paid for a re-review plus a 13-agent diagnosis.
-    # There was never a lost verdict -- only a brief that did not match its lane.
+    # #872: the authoring path once wrote one task's brief verbatim into
+    # another task's title -- and because `title` IS the brief a lane receives
+    # (the schema had no description column), the lane did the wrong job and
+    # reported `completed`. PR#30/#35 added the guards below while title still
+    # doubled as the brief. THIS is the deeper fix the issue asks for: the
+    # brief gets its own column. `title` is the one-line GOAL (what --goal and
+    # the dashboard show); `description` is the job text. A sender that still
+    # pastes the brief into title (no description) keeps the legacy shape and
+    # the byte-identical guard verdicts -- nothing is silently loosened.
+    brief = req.description if req.description.strip() else req.title
+
+    # The wrong-column shape itself is loud: a multi-line title on a
+    # lane-bearing task is exactly the 7.5 KB markdown blob the incident lanes
+    # got -- a brief sitting in the goal column. Lane-less tasks (intake,
+    # plain work items) are untouched.
+    if req.lane_key and "\n" in req.title.strip():
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"brief in the wrong column (#872): lane_key {req.lane_key!r} "
+                f"got a multi-line title -- that is a brief pasted into the "
+                f"goal field. Send the job text in `description` and keep "
+                f"`title` one line."
+            ),
+        )
+
     target = _lane_target(req.lane_key)
-    if target and not _brief_names_target(req.title, target):
+    if target and not _brief_names_target(brief, target):
         raise HTTPException(
             status_code=422,
             detail=(
                 f"brief/target disagreement (#872): lane_key {req.lane_key!r} "
-                f"names target {target}, but the title -- which IS the brief -- "
+                f"names target {target}, but the brief "
+                f"({'description' if brief is not req.title else 'title -- which IS the brief'}) "
                 f"never mentions it. The lane would run the wrong job and report "
                 f"completed. Fix the brief, or the lane_key."
             ),
@@ -206,16 +226,20 @@ async def submit_task(req: SubmitTaskRequest):
     # instructing `gh pr comment 273`. The presence check above accepted it;
     # only the lane overriding its own brief saved that verdict. Every number
     # the brief binds a posting/reviewing action to must equal the lane's
-    # target -- broad verbs (CLI + prose), strict per number.
+    # target -- broad verbs (CLI + prose), strict per number. The goal line is
+    # swept too: it rides to the lane as --goal beside the brief, so a foreign
+    # action number there is the same wrong-job signal.
     if target:
-        mismatches = _action_ref_mismatches(req.title, target)
+        mismatches = _action_ref_mismatches(brief, target)
+        if brief is not req.title:
+            mismatches += _action_ref_mismatches(req.title, target)
         if mismatches:
             raise HTTPException(
                 status_code=422,
                 detail=(
                     f"brief/action disagreement (#872): lane_key "
-                    f"{req.lane_key!r} names target {target}, but the title -- "
-                    f"which IS the brief -- binds a posting/reviewing action "
+                    f"{req.lane_key!r} names target {target}, but the brief "
+                    f"binds a posting/reviewing action "
                     f"to {', '.join(sorted(set(mismatches)))}. The lane would "
                     f"act on the wrong target -- or silently override its own "
                     f"brief and get lucky. Fix the number in the brief, or "
@@ -297,6 +321,7 @@ async def submit_task(req: SubmitTaskRequest):
         priority,
         lane_key=req.lane_key,
         role=req.role,
+        description=req.description,
         depends_on=deps,
     )
     # Promote pending → ready (tasks with no deps go to ready immediately;
