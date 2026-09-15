@@ -39,6 +39,7 @@ from .routers import (
     metering_router,
     capabilities_router,
     lanes_router,
+    release_router,
 )
 from .routers import nodes as nodes_mod
 from .routers import tasks as tasks_mod
@@ -58,6 +59,7 @@ from .routers import intake as intake_mod
 from .routers import metering as metering_mod
 from .routers import capabilities as capabilities_mod
 from .routers import lanes as lanes_mod
+from .routers import release as release_mod
 import logging
 logger = logging.getLogger(__name__)
 
@@ -343,11 +345,35 @@ def create_app(
             logger.info("Alibaba metering poller started "
                         "(metering.enabled: true in runtime config)")
     metering_mod.set_poller(_metering_poller)
-    # Turning metering on/off at runtime: PUT /api/v1/config carries the
-    # `metering` section (ConfigJSON extra=allow) -> post-save hook arms or
-    # disarms the loop without a redeploy.
-    config_mod.set_post_save_callback(
-        (lambda: _metering_poller.ensure_started()) if _metering_poller else None)
+    # --- Release-drift poller (#917: merged-but-not-running must never be
+    # silent). Same gating discipline as metering: the thread only exists
+    # while release_drift.enabled is true in the runtime store; a default-off
+    # node starts NO thread and makes NO network calls. Alerts ride the same
+    # task_failed webhook fan-out (the Telegram path). Detection is READ-ONLY
+    # by construction — it can never move a pin: the release stays a reviewed
+    # GitOps PR against bdaya-website-infra.
+    _drift_poller = None
+    if node_role == "main":
+        from .core.release_drift_poller import (ReleaseDriftPoller,
+                                                _seed_drift_from_config_file)
+        _seed_drift_from_config_file(state)
+        _drift_poller = ReleaseDriftPoller(state=state, hook_manager=hook_manager)
+        # dynamic attribute, same as state._metering_poller above (ClusterState
+        # has no declared fields for pollers; routers read them off here).
+        setattr(state, "_release_drift_poller", _drift_poller)
+        if _drift_poller.ensure_started():
+            logger.info("release-drift poller started "
+                        "(release_drift.enabled: true in runtime config)")
+    release_mod.set_poller(_drift_poller)
+    # Turning metering/drift on/off at runtime: PUT /api/v1/config carries the
+    # `metering` / `release_drift` sections (ConfigJSON extra=allow) ->
+    # post-save hook arms or disarms the loops without a redeploy.
+    def _arm_pollers():
+        if _metering_poller:
+            _metering_poller.ensure_started()
+        if _drift_poller:
+            _drift_poller.ensure_started()
+    config_mod.set_post_save_callback(_arm_pollers if (_metering_poller or _drift_poller) else None)
 
     # Register routers
     app.include_router(nodes_router)
@@ -369,12 +395,13 @@ def create_app(
     app.include_router(lanes_router)
     app.include_router(intake_router)
     app.include_router(metering_router)
+    app.include_router(release_router)
 
     # Health endpoint (outside /api/v1)
     @app.get("/health")
     async def health():
         uptime = int((time.time() - state.started_at.timestamp()))
-        return {
+        out = {
             "status": "ok",
             "cluster_id": state.cluster_id,
             "node_id": state.node_id,
@@ -382,6 +409,15 @@ def create_app(
             "uptime_seconds": uptime,
             "version": "python-1.0.0",
         }
+        # #917: /health answering 200 said nothing about WHICH build was
+        # running — that is why a stale pin looked healthy everywhere. Echo
+        # the stamped commit (public-repo sha, no secret) so a single
+        # unauthenticated GET answers "is the code I merged actually running?".
+        from .core.release_drift_poller import ReleaseDriftPoller
+        build_commit = ReleaseDriftPoller.deployed_commit()
+        if build_commit:
+            out["build_commit"] = build_commit
+        return out
 
     # Metrics endpoint (placeholder)
     @app.get("/metrics")
@@ -446,12 +482,17 @@ def create_app(
         # every tick, without relying on a PUT through /api/v1/config.
         if _metering_poller is not None:
             _metering_poller.start_supervisor()
+        if _drift_poller is not None:
+            _drift_poller.start_supervisor()
 
     # Shutdown handler — stop all background threads
     @app.on_event("shutdown")
     async def shutdown():
         if _metering_poller is not None:
             _metering_poller.stop_supervisor()
+        if _drift_poller is not None:
+            _drift_poller.stop_supervisor()
+            _drift_poller.stop()
         _node_manager.stop_heartbeat_sender()
         _node_manager.stop_watchdog()
         _lease_manager.stop()

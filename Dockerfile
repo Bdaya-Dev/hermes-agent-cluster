@@ -31,6 +31,14 @@ ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1
 
+# #917 release-drift: the running system must be able to answer "is merged
+# code actually what I'm running?" — cluster-image.yml stamps the built commit
+# into the image at build time (build arg -> ENV), and
+# hermes_cluster/core/release_drift_poller.py compares it against fork main.
+# Empty (a local build) = unpinned: reported, never a false alarm.
+ARG HERMES_CLUSTER_BUILD_COMMIT=""
+ENV HERMES_CLUSTER_BUILD_COMMIT=${HERMES_CLUSTER_BUILD_COMMIT}
+
 WORKDIR /app
 
 # Package + metadata only (see .dockerignore — tests, dashboards, db files and
