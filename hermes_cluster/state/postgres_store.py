@@ -612,11 +612,29 @@ class PostgresClusterStore:
         ``capabilities`` because the /join upsert rewrites capabilities from
         whatever the worker declares locally, so a drain expressed there is
         erased by the node's next check-in.
+
+        Takes ``HERMES_SCHEDULE_LOCK``, unlike its sibling updaters
+        (``update_capabilities`` / ``update_max_concurrent`` /
+        ``update_instance_token``), which do not. Those tolerate a one-tick
+        race: a scheduler pass that read the node a moment earlier hands it
+        work under slightly stale capabilities, and the next tick corrects
+        itself. Drain cannot tolerate it, because the whole guarantee it sells
+        is "this node receives NOTHING" — a single task leaked into the
+        window is the guarantee being false, and an operator drains precisely
+        when a node must stop, usually because work landing there is already
+        failing. Serializing against the scheduler makes the guarantee true
+        rather than nearly-true; the cost is one advisory lock on an operator
+        action taken by hand.
         """
-        await self._fetch(
-            "UPDATE nodes SET drained = $1 WHERE id = $2",
-            bool(drained), node_id,
-        )
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                await conn.execute(
+                    "SELECT pg_advisory_xact_lock($1)", HERMES_SCHEDULE_LOCK,
+                )
+                await conn.execute(
+                    "UPDATE nodes SET drained = $1 WHERE id = $2",
+                    bool(drained), node_id,
+                )
 
     async def update_instance_token(self, node_id: str, instance_token: str) -> None:
         """#899: record which executor instance currently owns this node id

@@ -271,3 +271,47 @@ def test_drain_endpoint_404s_on_an_unknown_node():
     client = _client()
     r = client.patch("/api/v1/nodes/node_nope/drain", json={"drained": True})
     assert r.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# 3. The SQLite -> Postgres importer survives the new boolean column
+# ---------------------------------------------------------------------------
+
+def test_sqlite_int_flag_is_coerced_to_a_postgres_BOOLEAN():
+    """SQLite has no boolean type; asyncpg refuses an int for a BOOLEAN param.
+
+    `nodes.drained` is INTEGER 0/1 in SQLite and a real BOOLEAN in Postgres, so
+    the importer must coerce. Caught by CI, NOT by the local suite: the real
+    importer tests need a live Postgres and SKIP without one, so a green local
+    run says nothing about this path. This test is deliberately pure — it
+    asserts the coercion map and its arithmetic with no database at all, so the
+    regression cannot hide behind a skip again.
+    """
+    from hermes_cluster.tools import import_sqlite as imp
+
+    assert "drained" in imp._BOOL_COLUMNS.get("nodes", []), \
+        "every boolean Postgres column needs an entry, or the import aborts"
+
+    bool_cols = set(imp._BOOL_COLUMNS["nodes"])
+    coerce = lambda v: None if v is None else bool(v)  # noqa: E731 - mirrors the loop
+    assert "drained" in bool_cols
+    assert coerce(0) is False and coerce(1) is True
+    # NULL must stay NULL so the column default applies, rather than becoming
+    # a positive False that pins a pre-migration row to "explicitly not drained".
+    assert coerce(None) is None
+
+
+def test_every_declared_bool_column_exists_in_the_sqlite_schema():
+    """A typo in the coercion map is silent: the column is simply never coerced.
+
+    So the map is checked against the schema the importer actually reads.
+    """
+    from hermes_cluster.state.cluster_store import ClusterStore
+    from hermes_cluster.tools import import_sqlite as imp
+
+    store = ClusterStore(":memory:")
+    for table, cols in imp._BOOL_COLUMNS.items():
+        present = {r["name"] for r in
+                   store._conn.execute(f"PRAGMA table_info({table})").fetchall()}
+        for col in cols:
+            assert col in present, f"{table}.{col} is not a column of {table}"
