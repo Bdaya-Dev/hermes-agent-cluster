@@ -53,7 +53,7 @@ TABLES = [
 # these tests without a Postgres, so a green local run says nothing about this
 # path. Any future boolean column must be added here.
 _BOOL_COLUMNS = {
-    "nodes": ["drained"],
+    "nodes": ["drained", "duplicate_executor"],
 }
 
 # ISO-datetime TEXT columns in SQLite -> TIMESTAMPTZ in Postgres.

@@ -31,9 +31,10 @@ import time
 from pathlib import Path
 from typing import Dict, List, Optional
 from urllib.request import Request, urlopen
-from urllib.error import URLError
+from urllib.error import HTTPError, URLError
 
 from .disk_preflight import disk_free_gb
+from .health_selfreport import CpuSampler, cpu_load_pct
 
 logger = logging.getLogger(__name__)
 
@@ -90,6 +91,14 @@ def _signed_post(
     try:
         with urlopen(req, timeout=timeout) as resp:
             return json.loads(resp.read().decode())
+    except HTTPError as e:
+        # #879: distinguish an answered HTTP error from a transport failure —
+        # the caller must tell a 409 (a duplicate executor exists; an
+        # operator must stop one) apart from "main unreachable" (keep
+        # heartbeating quietly). The sentinel dict carries the status code;
+        # normal payloads never have a "__http_error__" key.
+        logger.warning("signed POST %s answered HTTP %s", path, e.code)
+        return {"__http_error__": e.code}
     except URLError as e:
         logger.warning("signed POST %s failed: %s", path, e)
         return None
@@ -140,6 +149,7 @@ def start_worker_connector(
     capability_probes: Optional[Dict[str, dict]] = None,
     disk_probe_path: str = "",
     instance_token: str = "",
+    health_fn=None,
 ) -> None:
     """Start the outbound worker connector thread.
 
@@ -177,6 +187,18 @@ def start_worker_connector(
             one; the survivor keeps heartbeating regardless). Empty (older
             launch path) omits the field — pre-#899 tokenless join
             semantics are preserved.
+        live/health observation: ``health_fn`` — callable returning
+            ``(live_spawns_list_or_None, duplicate_executor_bool)`` sourced
+            from the local AgentExecutor (``live_spawns()`` plus the #899
+            duplicate-observation flag). Sampled every beat into the
+            ``lane_count`` / ``duplicate_executor`` payload fields next to a
+            CPU busy-fraction reading; the MAIN thresholds them (against the
+            node's declared max_concurrent / node.max_cpu_load) and degrades
+            the node. Without this the duplicate-executor incident class
+            (100% CPU, every lane doubled) stayed invisible: the connector
+            thread keeps beating healthy while the node burns. None = no
+            executor wired yet (the CPU reading still rides; absent fields
+            are the older-worker contract the main honours).
     """
     global _connector_started
     with _connector_lock:
@@ -198,6 +220,35 @@ def start_worker_connector(
 
     def _disk_report() -> Optional[float]:
         return disk_free_gb(_disk_probe_target())
+
+    # #879: shared CPU sampler for the beat cadence (the delta window is the
+    # heartbeat interval; first measure() primes it and reports None).
+    _cpu_sampler = CpuSampler()
+
+    def _health_fields() -> dict:
+        """Sample the #879 self-report; every field is omitted when unknown
+        (older-worker contract: absent field = no information = rule inert).
+        Never raises — a failed probe must not take the heartbeat down."""
+        out: Dict[str, object] = {}
+        try:
+            pct = cpu_load_pct(_cpu_sampler)
+        except Exception:
+            pct = None
+        if pct is not None:
+            out["cpu_load_pct"] = pct
+        if health_fn is not None:
+            try:
+                spawns, dup = health_fn()
+                if spawns is not None:
+                    out["lane_count"] = len(spawns)
+                # Always send the bool once wired: an OMITTED field means
+                # "unknown" to the main and keeps the last stored value —
+                # the watchdog would then re-degrade on the stale True long
+                # after the duplicate drained. False clears it.
+                out["duplicate_executor"] = bool(dup)
+            except Exception:
+                logger.debug("health probe failed", exc_info=True)
+        return out
 
     token = _resolve_peer_token(peer_token)
     if not token:
@@ -280,6 +331,9 @@ def start_worker_connector(
                 disk_gb = _disk_report()
                 if disk_gb is not None:
                     join_data["disk_free_gb"] = disk_gb
+                # #879: the join carries the same health self-report as the
+                # beat (a join is a fresh report).
+                join_data.update(_health_fields())
                 result = _signed_post(
                     cluster_endpoint, "/api/v1/nodes/join", join_data, token, node_id
                 )
@@ -290,6 +344,19 @@ def start_worker_connector(
                         registered_id,
                     )
                 else:
+                    if isinstance(result, dict) and \
+                            result.get("__http_error__") == 409:
+                        # #879/#899: main refused this join — a live sibling
+                        # holds the node id. This instance is the DUPLICATE
+                        # (or the sibling is wedged); either way an operator
+                        # must stop one. Loud, and retried forever so the
+                        # first one's death is still picked up.
+                        logger.error(
+                            "worker connector: join REFUSED 409 — another "
+                            "live executor holds node id %s (#899). One of "
+                            "the two must be stopped; the main also sees the "
+                            "survivor's duplicate_executor self-report.",
+                            node_id)
                     logger.warning(
                         "worker connector: join failed, will retry in %.1fs",
                         heartbeat_interval,
@@ -305,6 +372,10 @@ def start_worker_connector(
                 disk_gb = _disk_report()
                 if disk_gb is not None:
                     hb_data["disk_free_gb"] = disk_gb
+                # #879: and the health self-report (CPU busy fraction, live
+                # lane count, duplicate-executor observation) — same omit-
+                # when-unknown contract, same degrade-and-restore policy.
+                hb_data.update(_health_fields())
                 # #897: act on the beat's ANSWER. A restarted main whose store
                 # lost this node answers {"status":"unknown_node"}; dropping
                 # registered_id sends the loop through the (idempotent) join

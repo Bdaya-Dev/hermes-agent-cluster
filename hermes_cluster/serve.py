@@ -49,6 +49,10 @@ def main():
                 # an env var). Absent key -> create_app default 5.0; explicit
                 # 0 disables the rule.
                 args.node_min_free_disk_gb = cfg["node"].get("min_free_disk_gb", None)
+                # #879: CPU self-report ceiling — same YAML-only discipline.
+                # Absent -> rule disabled (0); the lane-backlog and
+                # duplicate-executor rules stay armed regardless.
+                args.node_max_cpu_load = cfg["node"].get("max_cpu_load", None)
             if "server" in cfg:
                 args.port = cfg["server"].get("port", args.port)
                 args.host = cfg["server"].get("bind", args.host)
@@ -131,6 +135,8 @@ def main():
         node_capabilities=getattr(args, "node_capabilities", []),
         node_capability_probes=getattr(args, "node_capability_probes", {}) or None,
         node_min_free_disk_gb=getattr(args, "node_min_free_disk_gb", None),
+        # #879: CPU ceiling for the health self-report rules (YAML only).
+        node_max_cpu_load=getattr(args, "node_max_cpu_load", None),
         agent_executor_config=getattr(args, "agent_executor_config", None),
         static_dir=static_dir if static_dir else None,
         db_path=getattr(args, "db_path", "") or "",

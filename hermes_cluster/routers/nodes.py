@@ -17,6 +17,7 @@ from ..core.disk_preflight import (
     DEFAULT_MIN_FREE_DISK_GB,
     disk_reason,
 )
+from ..core.health_selfreport import health_reason
 
 router = APIRouter(prefix="/api/v1/nodes", tags=["nodes"])
 
@@ -46,6 +47,10 @@ async def join(req: JoinRequest):
                 # NodeManager.join; older tokenless workers keep the
                 # idempotent pre-#899 re-join behaviour).
                 instance_token=req.instance_token,
+                # #879: the join is also the worker's first health self-report.
+                cpu_load_pct=req.cpu_load_pct,
+                lane_count=req.lane_count,
+                duplicate_executor=req.duplicate_executor,
             )
         except DuplicateInstanceJoin as exc:
             raise HTTPException(status_code=409, detail=str(exc))
@@ -59,6 +64,11 @@ async def join(req: JoinRequest):
             max_concurrent=req.max_concurrent,
             disk_free_gb=req.disk_free_gb,
             instance_token=req.instance_token,
+            # #879: health self-report recorded even without a NodeManager
+            # (the fallback path still surfaces it via GET /api/v1/nodes).
+            cpu_load_pct=req.cpu_load_pct,
+            lane_count=req.lane_count,
+            duplicate_executor=req.duplicate_executor,
         )
         _state.register_node(node)
     return JoinResponse(node_id=node.id, status="registered")
@@ -74,16 +84,44 @@ async def heartbeat(req: HeartbeatRequest):
     # a 4xx would make old connectors log an auth failure instead.
     node_exists = True
     if _node_manager:
-        _node_manager.send_heartbeat(req.node_id, disk_free_gb=req.disk_free_gb)
+        _node_manager.send_heartbeat(req.node_id, disk_free_gb=req.disk_free_gb,
+                                     # #879: health self-report rides the beat.
+                                     cpu_load_pct=req.cpu_load_pct,
+                                     lane_count=req.lane_count,
+                                     duplicate_executor=req.duplicate_executor)
         node_exists = _node_manager.get_node(req.node_id) is not None
     else:
         reason = disk_reason(req.disk_free_gb, _min_free_disk_gb())
-        node_exists = _state.get_node(req.node_id) is not None
+        # #879: the fallback path applies the same rules with the same
+        # thresholds (the NodeManager's config when present, else the
+        # defaults: CPU rule off, node ceiling from its registered row).
+        node = _state.get_node(req.node_id)
+        h_reason = health_reason(
+            req.cpu_load_pct, _max_cpu_load(),
+            req.lane_count,
+            int(getattr(node, "max_concurrent", 0) or 0) if node else 0,
+            req.duplicate_executor,
+        )
+        if h_reason:
+            reason = f"{reason}; {h_reason}" if reason else h_reason
+        node_exists = node is not None
         _state.update_heartbeat(req.node_id, disk_free_gb=req.disk_free_gb,
-                                status_reason=reason)
+                                status_reason=reason,
+                                cpu_load_pct=req.cpu_load_pct,
+                                lane_count=req.lane_count,
+                                duplicate_executor=req.duplicate_executor)
     if not node_exists:
         return {"status": "unknown_node", "node_id": req.node_id}
     return {"status": "ok"}
+
+
+def _max_cpu_load() -> float:
+    """The CPU ceiling the fallback heartbeat path consults — the
+    NodeManager's configured node.max_cpu_load when present, else 0
+    (rule disabled: the same default as everywhere else)."""
+    if _node_manager is not None:
+        return float(getattr(_node_manager, "_max_cpu_load", 0.0))
+    return 0.0
 
 
 def _min_free_disk_gb() -> float:

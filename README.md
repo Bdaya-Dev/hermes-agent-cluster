@@ -200,6 +200,34 @@ forced, `taskkill /F` (or `pkill -f hermes_cluster.serve`) *after*
 booting the task/agent out — the lock file's dead pid is then revalidated
 away automatically by the next start.
 
+#### Node health self-report (#879 — a sick node says so)
+
+The #899 duplicate-executor incident had a second symptom: through the
+whole event `GET /api/v1/nodes` reported `windows_desktop_worker` as
+`online` with an empty `status_reason`, while the box ran at 100% CPU and
+every lane spawned twice. Liveness is heartbeat-based and the beat comes
+from the connector's own thread — which stays healthy precisely when the
+node around it is not. Every beat also *forced* `online` (the same
+unconditional force #892 removed for disk). The node now reports its own
+health on every join/heartbeat and the main degrades it with a reason:
+
+| Reported field | Rule (main-side) | Fires when |
+| --- | --- | --- |
+| `cpu_load_pct` | `>= node.max_cpu_load` (YAML only; absent/0 = disabled) | the box is CPU-pinned (Windows: `GetSystemTimes` deltas; POSIX: 1-min load avg / CPUs; unreadable = field omitted) |
+| `lane_count` | `> ` the node's declared `max_concurrent` | more lanes are live than the executor's own claim ceiling admits — the duplicate-executor/spawn-storm fingerprint (always armed) |
+| `duplicate_executor` | truth = degraded | the local executor's #899 refresh sees spawn records appearing in the shared store that it did not write (self-healing: once the duplicate's lanes drain the flag clears) |
+
+Absent fields (older worker) keep every rule inert — byte-for-byte
+pre-#879 behaviour. The degradation is worker-reported and therefore
+auto-restores on the next healthy beat; the only operator-revocable state
+remains `drained` (#907). A refused duplicate (409 at `/join`) also logs
+loudly on its own side. Opt in on each worker/main:
+
+```yaml
+node:
+  max_cpu_load: 0.9   # 0/absent = CPU rule off; lane/dup rules stay on
+```
+
 #### Deployment Requirements: GitLab intake policy surface
 
 The GitLab intake feature (`/api/v1/intake/gitlab/*`, runtime policy store —
