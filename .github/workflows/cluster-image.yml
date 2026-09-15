@@ -37,6 +37,12 @@ on:
       - '.github/workflows/cluster-image.yml'
   workflow_dispatch: {}
 
+# Serialize on the ref: two pushes to main must not interleave their train
+# bookkeeping (pin read -> PR open) — the second reads the first's pin.
+concurrency:
+  group: cluster-image-${{ github.ref }}
+  cancel-in-progress: false
+
 # id-token: write = the OIDC token this job exchanges for GCP credentials
 # (Workload Identity Federation). Nothing else here needs a write scope.
 permissions:
@@ -55,6 +61,8 @@ jobs:
   build-and-push:
     name: Build and push image (tag = commit SHA)
     runs-on: ubuntu-latest
+    outputs:
+      digest: ${{ steps.digest.outputs.digest }}
     steps:
       - uses: actions/checkout@v4
 
@@ -77,6 +85,7 @@ jobs:
       - name: Build image
         run: |
           docker build \
+            --build-arg HERMES_CLUSTER_BUILD_COMMIT="${GITHUB_SHA}" \
             -t ${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.REPO }}/${{ env.IMAGE }}:${{ github.sha }} \
             -f Dockerfile .
 
@@ -84,10 +93,121 @@ jobs:
         run: |
           docker push ${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.REPO }}/${{ env.IMAGE }}:${{ github.sha }}
 
+      # Resolve the pushed tag to its digest LIVE from the registry (same WIF
+      # auth the push just used) and hand it to the release-PR job. The train
+      # contract is "digest resolved from Artifact Registry, not copied from a
+      # previous train" (#917 acceptance) — reading it back from the registry
+      # immediately after push is what "resolved" means.
+      - name: Resolve pushed digest
+        id: digest
+        run: |
+          D=$(gcloud artifacts docker images describe \
+                "${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.REPO }}/${{ env.IMAGE }}:${{ github.sha }}" \
+                --format 'value(image_summary.digest)' --quiet)
+          if ! echo "$D" | grep -Eq '^sha256:[0-9a-f]{64}$'; then
+            echo "::error::digest resolution failed (got '${D:0:20}…') — refusing to emit a tag-only release"
+            exit 1
+          fi
+          echo "digest=$D" >> "$GITHUB_OUTPUT"
+
       - name: Summary
         run: |
           echo "### Image pushed" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "\`${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.REPO }}/${{ env.IMAGE }}:${{ github.sha }}\`" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "digest \`${{ steps.digest.outputs.digest }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "Release = bump the \`images:\` tag in infra-github \`cluster-config/hermes-main/kustomization.yaml\` (GitOps only; the Deployment is never touched by hand)." >> "$GITHUB_STEP_SUMMARY"
+
+  # ---------------------------------------------------------------------------
+  # #917 option 1 — AUTO-OPEN (never auto-MERGE) the release PR.
+  #
+  # The defect: the image builds, then nothing moves the pin, and nothing
+  # compares pin to main (train 5 merged by hand 7.5h after its images were
+  # built; the gap reopened 13 min later). This job removes the step that was
+  # actually being forgotten — NOTICING — and changes nothing about the gate:
+  # the PR opens against bdaya-website-infra and a human or reviewer lane
+  # still merges it. The release stays GitOps (the pin is a manifest field
+  # ArgoCD reconciles) and stays reviewed.
+  #
+  # Runs on push to main (the normal train) AND on workflow_dispatch (an
+  # operator's manual re-notice of the built SHA). It CANNOT merge: this job
+  # requests no write permission on any repo, the token it reads carries no
+  # merge authority by grant, and a mechanical test pins that no merge API
+  # call exists in this file or the script (tests_v3/
+  # test_release_pr_script_917.py::test_no_merge_call_anywhere).
+  #
+  # Credential: repository secret RELEASE_PR_TOKEN on THIS repo only — a
+  # fine-grained PAT scoped to the single repo Bdaya-Dev/bdaya-website-infra,
+  # Contents:Write + Pull requests:Write (no merge authority). While the
+  # token is absent the job fails CLOSED with a loud summary: the in-pod
+  # drift alarm shipped alongside this job (hermes_cluster/core/
+  # release_drift*.py) is the backstop #917 prescribes for "option 1
+  # breaking" — the gap can never go unnoticed even here. WIF is unchanged:
+  # no GCP credential is created or widened for this job (the digest came
+  # from the build job's existing WIF SA).
+  # ---------------------------------------------------------------------------
+  open-release-pr:
+    name: Open/update release PR (never merge)
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      RELEASE_PR_TOKEN: ${{ secrets.RELEASE_PR_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Credential present?
+        id: cred
+        run: |
+          if [ -n "$RELEASE_PR_TOKEN" ]; then
+            echo "present=1" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=0" >> "$GITHUB_OUTPUT"
+            echo "::warning::RELEASE_PR_TOKEN not configured — release PR NOT auto-opened. The in-pod drift alarm (release_drift) will keep raising it until a train lands."
+          fi
+
+      # #917 acceptance is precisely worded: a green push to main that
+      # touches hermes_cluster/** owes a release. The build itself fires on
+      # Dockerfile/pyproject/workflow changes too (a rebuild of identical
+      # cluster code); this gate stops the PR-open for those — opening a
+      # train whose range carries no cluster change is noise, and noise is
+      # how a release process gets ignored.
+      - name: Push touches cluster code?
+        id: gate
+        run: |
+          n=$(gh api "repos/${{ github.repository }}/compare/${{ github.sha }}~1...${{ github.sha }}" \
+                --jq '[.files[]? | select(.filename | startswith("hermes_cluster/"))] | length' 2>/dev/null || echo 0)
+          if [ "${n:-0}" -gt 0 ]; then
+            echo "cluster_code=1" >> "$GITHUB_OUTPUT"
+          else
+            echo "cluster_code=0" >> "$GITHUB_OUTPUT"
+            echo "::notice::push built an image but touched no hermes_cluster/** file — no release owed"
+          fi
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Open release PR
+        if: steps.cred.outputs.present == '1' && steps.gate.outputs.cluster_code == '1'
+        env:
+          RESOLVED_DIGEST: ${{ needs.build-and-push.outputs.digest }}
+        run: python3 .github/scripts/release-pr-917.py
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "### Release PR (auto-opened, #917)"
+            echo ""
+            echo "* **Auto-MERGE: impossible from this workflow** — no job here has merge permissions and the token carries none."
+            echo ""
+            if [ "${{ steps.cred.outputs.present }}" = "1" ] && [ "${{ steps.gate.outputs.cluster_code }}" = "1" ]; then
+              echo "Open/update attempted with the resolved digest \`${{ needs.build-and-push.outputs.digest }}\`."
+            elif [ "${{ steps.cred.outputs.present }}" != "1" ]; then
+              echo "**Skipped: RELEASE_PR_TOKEN absent.** Provision it (see PR body) — until then #917's backstop (the in-pod release-drift alarm) is what notices."
+            else
+              echo "Skipped: the push touched no \`hermes_cluster/**\` file — image rebuilt, nothing new to release."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
