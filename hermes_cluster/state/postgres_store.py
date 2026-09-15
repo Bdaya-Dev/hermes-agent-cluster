@@ -122,7 +122,10 @@ CREATE TABLE IF NOT EXISTS nodes (
     disk_free_gb DOUBLE PRECISION,
     status_reason TEXT DEFAULT '',
     instance_token TEXT DEFAULT '',
-    drained BOOLEAN DEFAULT FALSE
+    drained BOOLEAN DEFAULT FALSE,
+    cpu_load_pct DOUBLE PRECISION,
+    lane_count INTEGER,
+    duplicate_executor BOOLEAN
 );
 
 CREATE TABLE IF NOT EXISTS tasks (
@@ -371,6 +374,14 @@ class PostgresClusterStore:
             # capability-strip drain had, where the next heartbeat undid it.
             await conn.execute(
                 "ALTER TABLE nodes ADD COLUMN IF NOT EXISTS drained BOOLEAN DEFAULT FALSE")
+            # #879: worker health self-report. NULL = never reported (older
+            # worker) → the health rules never fire (same drift as #892 disk).
+            await conn.execute(
+                "ALTER TABLE nodes ADD COLUMN IF NOT EXISTS cpu_load_pct DOUBLE PRECISION")
+            await conn.execute(
+                "ALTER TABLE nodes ADD COLUMN IF NOT EXISTS lane_count INTEGER")
+            await conn.execute(
+                "ALTER TABLE nodes ADD COLUMN IF NOT EXISTS duplicate_executor BOOLEAN")
             await conn.execute(
                 "ALTER TABLE tasks ADD COLUMN IF NOT EXISTS attempts INTEGER DEFAULT 0")
             # #874: the lane deliverable, so a result outlives the node that made it.
@@ -489,8 +500,9 @@ class PostgresClusterStore:
     async def register_node(self, node: Node) -> None:
         await self._fetch(
             """INSERT INTO nodes (id, name, capabilities, status, last_heartbeat, load, max_concurrent,
-                 disk_free_gb, status_reason, instance_token)
-               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                 disk_free_gb, status_reason, instance_token,
+                 cpu_load_pct, lane_count, duplicate_executor)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
                ON CONFLICT (id) DO UPDATE SET
                  name = EXCLUDED.name,
                  capabilities = EXCLUDED.capabilities,
@@ -500,12 +512,18 @@ class PostgresClusterStore:
                  max_concurrent = EXCLUDED.max_concurrent,
                  disk_free_gb = EXCLUDED.disk_free_gb,
                  status_reason = EXCLUDED.status_reason,
-                 instance_token = EXCLUDED.instance_token""",
+                 instance_token = EXCLUDED.instance_token,
+                 cpu_load_pct = EXCLUDED.cpu_load_pct,
+                 lane_count = EXCLUDED.lane_count,
+                 duplicate_executor = EXCLUDED.duplicate_executor""",
             node.id, node.name, _json_dumps(node.capabilities),
             node.status.value, _aware(node.last_heartbeat), float(node.load),
             int(node.max_concurrent),
             node.disk_free_gb, getattr(node, "status_reason", ""),
             getattr(node, "instance_token", ""),
+            getattr(node, "cpu_load_pct", None),
+            getattr(node, "lane_count", None),
+            getattr(node, "duplicate_executor", None),
         )
         if self._on_node_online:
             try:
@@ -523,26 +541,39 @@ class PostgresClusterStore:
 
     async def update_heartbeat(self, node_id: str, load: float = 0.0,
                                disk_free_gb: Optional[float] = None,
-                               status_reason: str = "") -> None:
+                               status_reason: str = "",
+                               cpu_load_pct: Optional[float] = None,
+                               lane_count: Optional[int] = None,
+                               duplicate_executor: Optional[bool] = None) -> None:
         # #892: status follows the caller's verdict — NodeManager passes
         # status_reason when the reported disk is below the floor; the beat
         # refreshes the clock WITHOUT forcing online (the unconditional force
         # is what kept the full-disk node schedulable during the 2026-09-14
         # incident). Empty reason = the pre-#892 force-online. disk_free_gb
         # None (older worker) leaves the stored column untouched.
+        # #879: same rule for the health self-report fields — a None report
+        # keeps the stored column (an absent field is "no information").
         status = NodeStatus.degraded.value if status_reason else NodeStatus.online.value
-        if disk_free_gb is None:
-            await self._fetch(
-                "UPDATE nodes SET last_heartbeat = $1, status = $2, load = $3, "
-                "status_reason = $4 WHERE id = $5",
-                _utcnow(), status, load, status_reason, node_id,
-            )
-        else:
-            await self._fetch(
-                "UPDATE nodes SET last_heartbeat = $1, status = $2, load = $3, "
-                "disk_free_gb = $4, status_reason = $5 WHERE id = $6",
-                _utcnow(), status, load, float(disk_free_gb), status_reason, node_id,
-            )
+        sets = ["last_heartbeat = $1", "status = $2", "load = $3",
+                "status_reason = $4"]
+        params = [_utcnow(), status, load, status_reason]
+        if disk_free_gb is not None:
+            sets.append(f"disk_free_gb = ${len(params) + 1}")
+            params.append(float(disk_free_gb))
+        if cpu_load_pct is not None:
+            sets.append(f"cpu_load_pct = ${len(params) + 1}")
+            params.append(float(cpu_load_pct))
+        if lane_count is not None:
+            sets.append(f"lane_count = ${len(params) + 1}")
+            params.append(int(lane_count))
+        if duplicate_executor is not None:
+            sets.append(f"duplicate_executor = ${len(params) + 1}")
+            params.append(bool(duplicate_executor))
+        params.append(node_id)
+        await self._fetch(
+            f"UPDATE nodes SET {', '.join(sets)} WHERE id = ${len(params)}",
+            *params,
+        )
 
     async def update_capabilities(self, node_id: str, caps: List[str]) -> None:
         # ONE atomic statement (round-2 review of 1043352). The previous
@@ -688,6 +719,12 @@ class PostgresClusterStore:
             # NOT drained is the safe default (a node keeps working; the
             # opposite default would silently dark the whole fleet).
             drained=bool(row["drained"]) if "drained" in keys else False,
+            # #879: health self-report — absent column or NULL = never
+            # reported; the rules stay inert (older-worker semantics).
+            cpu_load_pct=row["cpu_load_pct"] if "cpu_load_pct" in keys else None,
+            lane_count=row["lane_count"] if "lane_count" in keys else None,
+            duplicate_executor=(row["duplicate_executor"]
+                                if "duplicate_executor" in keys else None),
         )
 
     # -------------------------------------------------------------------
