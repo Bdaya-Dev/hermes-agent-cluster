@@ -19,6 +19,7 @@ from .cluster import router as cluster_router
 from .intake import router as intake_router
 from .metering import router as metering_router
 from .capabilities import router as capabilities_router
+from .lanes import router as lanes_router
 
 __all__ = [
     "nodes_router",
@@ -37,4 +38,5 @@ __all__ = [
     "setup_router",
     "cluster_router",
     "intake_router",
+    "lanes_router",
 ]

@@ -521,6 +521,15 @@ async def cancel_task(task_id: str, req: CancelTaskRequest = None):
         raise HTTPException(status_code=404, detail="task not found")
 
     reason = req.reason if req else "cancelled"
+    # #911: record the re-queue INTENT BEFORE the status flip (same
+    # ordering rule as the #894 ballot: a reader that sees the state must
+    # never see it without the record that authorized it). An absent flag
+    # is an EXPLICIT hold: a bodyless/reason-only cancel is how the
+    # operator says "this bundle is folded elsewhere" — releasing its
+    # members is what re-spawned the consolidated work twice on 2026-09-15.
+    # requeue=true keeps the pre-#911 release for infra drains ("reschedule
+    # this work").
+    requeue = bool(req.requeue) if (req and req.requeue is not None) else False
 
     # Terminal states → 409 (ERR_TASK_NOT_CANCELABLE)
     if task.status in (
@@ -538,17 +547,25 @@ async def cancel_task(task_id: str, req: CancelTaskRequest = None):
     # No lease → cancelled immediately; has lease → revoke, → cancel_requested
     lease = _lease_manager.get_by_task(task_id) if _lease_manager else None
     if lease is None:
+        # #911: intent BEFORE the flip — a reader that sees `cancelled`
+        # must also see the release/hold decision that authorized it.
+        _state.set_task_cancel_requeue(task_id, requeue)
         _state.set_task_status(task_id, TaskStatus.cancelled, fail_reason=reason)
         # S4 fix: cascade-cancel dependents
         _cascade_cancel_dependents(task_id, f"parent {task_id} cancelled")
-        return {"status": "cancelled", "phase": "immediate"}
+        return {"status": "cancelled", "phase": "immediate",
+                "requeue": requeue}
 
     # Has lease → revoke it, → cancel_requested
     _lease_manager.revoke(lease.id)
+    # #911: record the intent at the FIRST transition, not at the worker's
+    # ack — a crash between cancel and ack must not resurrect the bundle.
+    _state.set_task_cancel_requeue(task_id, requeue)
     _state.set_task_status(task_id, TaskStatus.cancel_requested, fail_reason=reason)
     # S4 fix: cascade-cancel dependents
     _cascade_cancel_dependents(task_id, f"parent {task_id} cancelled")
-    return {"status": "cancel_requested", "phase": "pending_ack"}
+    return {"status": "cancel_requested", "phase": "pending_ack",
+            "requeue": requeue}
 
 
 @router.post("/{task_id}/unblock")

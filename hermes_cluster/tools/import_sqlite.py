@@ -54,6 +54,11 @@ TABLES = [
 # path. Any future boolean column must be added here.
 _BOOL_COLUMNS = {
     "nodes": ["drained", "duplicate_executor"],
+    # #911: the cancel re-queue intent — SQLite INTEGER 0/1 vs Postgres
+    # BOOLEAN, same coercion requirement as every flag above (the module
+    # comment: any future boolean column must be added here). NULL (no
+    # intent recorded) passes through as None untouched.
+    "tasks": ["cancel_requeue"],
 }
 
 # ISO-datetime TEXT columns in SQLite -> TIMESTAMPTZ in Postgres.
