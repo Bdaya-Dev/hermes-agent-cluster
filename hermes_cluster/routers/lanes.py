@@ -38,6 +38,7 @@ Honesty rules baked into the report path:
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 
+from ..core.lane_affinity import same_node
 from ..state import ClusterState
 
 router = APIRouter(prefix="/api/v1/lanes", tags=["lanes"])
@@ -61,14 +62,18 @@ class LaneReportRequest(BaseModel):
 
 
 def _same_node(a: str, b: str) -> bool:
-    """Node-id spelling tolerance (executor runs bare ``<name>``, registry
-    is ``node_<name>``) — the scheduler-side twin of the same rule in
-    core/lane_affinity.py, applied here so a worker reporting under its
-    executor spelling is not 403'd by its registered spelling."""
-    if not a or not b:
-        return False
-    return (a == b or a.removeprefix("node_") == b
-            or b.removeprefix("node_") == a)
+    """Node-id spelling tolerance for the placement-authority gate.
+
+    Delegates to :func:`core.lane_affinity.same_node` — ONE implementation,
+    so the 403 gate here and the scheduler's pin match can never disagree
+    about whether two spellings name the same node.
+
+    This used to carry its own asymmetric copy of the rule, which the RV-1
+    reviewer of PR#67 broke with a working exploit: ``_same_node("node_x",
+    "node_node_x")`` returned True, so a caller holding ``node_x``'s token
+    could pin lanes onto the unrelated node ``node_node_x``.
+    """
+    return same_node(a, b)
 
 
 @router.post("/report")

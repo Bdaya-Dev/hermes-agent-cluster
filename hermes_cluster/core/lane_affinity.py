@@ -42,6 +42,49 @@ from ..models import Node
 
 from .scheduler import FairScheduler, node_at_capacity, node_can_run
 
+_NODE_PREFIX = "node_"
+
+
+def canonical_node_id(node_id: str) -> str:
+    """The bare node name: at most ONE leading ``node_`` removed.
+
+    The registry stores ``node_<name>`` while an executor reports the bare
+    ``<name>`` (measured 2026-09-15 on all three fleet members), so the two
+    spellings must compare equal.
+
+    **Deliberately strips at most one prefix, and is deliberately NOT
+    idempotent.** ``canonical_node_id("node_node_x") == "node_x"``, which is
+    a DIFFERENT node from ``"x"``. Stripping greedily until no prefix remains
+    would be idempotent and WRONG: it collapses ``node_node_x`` onto ``x``
+    and re-opens the bypass below. Idempotency is not the property this
+    needs — symmetry is.
+
+    Apply it to BOTH operands exactly once; never strip one side and compare
+    it to the raw other side (see :func:`same_node`).
+    """
+    s = (node_id or "").strip()
+    return s[len(_NODE_PREFIX):] if s.startswith(_NODE_PREFIX) else s
+
+
+def same_node(a: str, b: str) -> bool:
+    """Do two node-id spellings name the same node?
+
+    Single source of truth for the #909 placement-authority check and the
+    scheduler's pin match — one function so the security gate and the
+    scheduler can never disagree about node identity.
+
+    The original form was ASYMMETRIC — ``a == b or a.removeprefix("node_") ==
+    b or b.removeprefix("node_") == a`` — which made ``same_node("node_x",
+    "node_node_x")`` true: stripping ``b`` yields ``"node_x"``, equal to raw
+    ``a``. The RV-1 reviewer of PR#67 proved the consequence with a working
+    exploit: a caller holding the token for ``node_x`` could pin lanes onto
+    the unrelated node ``node_node_x``, defeating the 403 gate whose entire
+    job is "a lane may only be pinned to the reporting node".
+    """
+    if not a or not b:
+        return False
+    return canonical_node_id(a) == canonical_node_id(b)
+
 
 class AffinityScheduler(FairScheduler):
     """Fair planner with lane-to-node affinity.
@@ -74,9 +117,7 @@ class AffinityScheduler(FairScheduler):
         # bare ``<name>`` while the registry is ``node_<name>``, and either
         # spelling can land in the lanes row. A pin stored under one
         # spelling must match its twin, or the fix would PARK every lane.
-        def _same(a: str, b: str) -> bool:
-            return (a == b or a.removeprefix("node_") == b
-                    or b.removeprefix("node_") == a)
+        _same = same_node
 
         for node in online_nodes:
             if not _same(node.id, pinned_node_id):
