@@ -11,6 +11,7 @@ Endpoints:
 from __future__ import annotations
 
 import copy
+import logging
 import os
 import signal
 import sys
@@ -23,6 +24,7 @@ from fastapi.responses import PlainTextResponse
 from ..models import ConfigJSON
 
 router = APIRouter(prefix="/api/v1/config", tags=["config"])
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Module-level state — initialized by app.py via init()
@@ -30,6 +32,15 @@ router = APIRouter(prefix="/api/v1/config", tags=["config"])
 _store = None  # ClusterStore or ClusterState
 _config_path: str = ""
 _restart_callback = None  # Optional callable invoked on restart request
+# Optional callable invoked AFTER a successful config save (same lifecycle
+# hook shape as restart): the metering poller uses it to arm/disarm without
+# a redeploy (PUT config -> ensure_started reads metering.enabled).
+_post_save_callback = None
+
+
+def set_post_save_callback(callback) -> None:
+    global _post_save_callback
+    _post_save_callback = callback
 
 
 def init(store, config_path: str = "", restart_callback=None):
@@ -152,19 +163,36 @@ async def update_config(cfg: ConfigJSON):
     if _store:
         _store.set_config(config_dict)
 
-    # Persist to file if path configured
+    # Persist to file if path configured. BEST-EFFORT (#906): on the hosted
+    # main the config path is the GitOps-seeded ConfigMap mount
+    # (/etc/hermes/cluster.yaml) — read-only BY DESIGN, since the runtime
+    # store is authoritative after first boot (see the seed-once rule in
+    # core/metering.py and routers/intake). A failed file mirror must never
+    # 500 a save that already landed in the store: operators read the 500 as
+    # "the change did not apply" and retried or rolled back something that
+    # HAD applied. Log and skip; report the file state in the response.
     path = _config_path or (getattr(_store, "get_config_path", lambda: "")() if _store else "")
+    file_status = "skipped"
     if path:
         try:
             with open(path, "w") as f:
                 yaml.dump(config_dict, f, default_flow_style=False, sort_keys=False)
+            file_status = "written"
         except OSError as e:
-            raise HTTPException(
-                status_code=500,
-                detail=f"failed to save config to {path}: {e}",
-            )
+            logger.warning(
+                "config YAML mirror not written (%s: %s) — runtime store "
+                "holds the change; this is expected on the read-only GitOps "
+                "mount (#906)", path, e)
 
-    return {"status": "saved", "config": config_dict}
+    # Lifecycle hook after a successful save (metering arm/disarm without a
+    # redeploy). Best-effort: a poller failure must never mask a saved config.
+    if _post_save_callback:
+        try:
+            _post_save_callback()
+        except Exception:
+            logging.getLogger(__name__).exception("post-save config callback failed")
+
+    return {"status": "saved", "config": config_dict, "file": file_status}
 
 
 @router.post("/validate")

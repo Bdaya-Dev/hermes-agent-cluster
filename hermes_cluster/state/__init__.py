@@ -123,6 +123,15 @@ class ClusterState:
 
     def register_node(self, node: Node) -> None:
         with self._nodes_lock:
+            # #907: a re-register REPLACES the Node object, so every field the
+            # caller did not carry over is silently reset — including the
+            # operator's `drained` flag, which would hand work straight back to
+            # a quarantined node. Drain is owner state; nothing on a worker's
+            # registration path may clear it. (The SQLite store had the same
+            # bug via INSERT OR REPLACE; both are fixed together.)
+            existing = self._nodes.get(node.id)
+            if existing is not None and getattr(existing, "drained", False):
+                node.drained = True
             self._nodes[node.id] = node
         if self._on_node_online:
             try:
@@ -140,7 +149,10 @@ class ClusterState:
 
     def update_heartbeat(self, node_id: str, load: float = 0.0,
                          disk_free_gb: Optional[float] = None,
-                         status_reason: str = "") -> None:
+                         status_reason: str = "",
+                         cpu_load_pct: Optional[float] = None,
+                         lane_count: Optional[int] = None,
+                         duplicate_executor: Optional[bool] = None) -> None:
         with self._nodes_lock:
             if node_id in self._nodes:
                 n = self._nodes[node_id]
@@ -150,11 +162,23 @@ class ClusterState:
                 # unconditional force is what kept the full-disk node schedulable
                 # during the 05:32Z incident. disk_free_gb None → stored value
                 # kept (an older worker's beat says nothing about disk).
+                # #879: the reason may now ALSO come from the health
+                # self-report; the rule is identical — a non-empty reason
+                # means degraded, an empty one re-forces online.
                 n.status = (NodeStatus.degraded if status_reason
                             else NodeStatus.online)
                 n.status_reason = status_reason
                 if disk_free_gb is not None:
                     n.disk_free_gb = disk_free_gb
+                # #879: record the raw health observations (None = the beat
+                # carried nothing → keep the last known value, same rule as
+                # disk above).
+                if cpu_load_pct is not None:
+                    n.cpu_load_pct = cpu_load_pct
+                if lane_count is not None:
+                    n.lane_count = lane_count
+                if duplicate_executor is not None:
+                    n.duplicate_executor = bool(duplicate_executor)
                 n.load = load
 
     def update_capabilities(self, node_id: str, caps: List[str]) -> None:
@@ -167,6 +191,21 @@ class ClusterState:
                         self._on_capability_change(node_id, old_caps, caps)
                     except Exception:
                         pass
+
+    def set_drained(self, node_id: str, drained: bool) -> None:
+        """Drain or un-drain a node (#907) — OPERATOR state, never worker state.
+
+        A drained node is handed NOTHING by the scheduler, including a task
+        with an empty ``requires``. It is a field of its own rather than an
+        empty ``capabilities`` list because ``register_node``'s re-join path
+        rewrites capabilities from the worker's local config, so a drain
+        expressed that way is erased by the node's next check-in — measured
+        2026-09-15, which orphaned the 9 tasks requiring the stripped
+        capability.
+        """
+        with self._nodes_lock:
+            if node_id in self._nodes:
+                self._nodes[node_id].drained = bool(drained)
 
     def update_max_concurrent(self, node_id: str, max_concurrent: int) -> None:
         """Update a node's concurrency ceiling (re-join may re-declare it)."""
@@ -221,13 +260,17 @@ class ClusterState:
         role: str = "author",
         description: str = "",
         issues: Optional[List[str]] = None,
+        depends_on: Optional[List[str]] = None,
     ) -> Task:
         now = datetime.utcnow()
         task = Task(
             id=task_id,
             title=title,
             requires=requires,
+            depends_on=list(depends_on or []),
             priority=priority,
+            # #905: a dep-held task stays pending — trigger_pending_tasks
+            # (called by the router right after) is the single promotion gate.
             status=TaskStatus.pending,
             created_at=now,
             updated_at=now,
@@ -259,6 +302,7 @@ class ClusterState:
                 id=plan["task_id"],
                 title=plan["title"],
                 requires=list(plan.get("requires") or []),
+                depends_on=list(plan.get("depends_on") or []),
                 priority=plan.get("priority", 3),
                 status=TaskStatus.ready if not plan.get("depends_on")
                 else TaskStatus.pending,
@@ -377,6 +421,47 @@ class ClusterState:
                 task.version += 1
                 return True
             return False
+
+    def set_task_ballot(self, task_id: str, ballot: Optional[dict]) -> bool:
+        """Record a decision ballot on the task (#894). None clears it."""
+        with self._tasks_lock:
+            task = self._tasks.get(task_id)
+            if task is None:
+                return False
+            task.ballot = ballot
+            task.updated_at = datetime.utcnow()
+            task.version += 1
+            return True
+
+    def set_task_cancel_requeue(self, task_id: str, requeue: bool) -> bool:
+        """Record the cancel re-queue INTENT on the task row (#911).
+
+        Called by the /cancel handler BEFORE the status flip so any reader
+        that sees `cancelled` also sees the intent that authorized it.
+        True = release the members to the next grouped cycle; False = hold
+        them back (intentional consolidation cancel).
+        """
+        with self._tasks_lock:
+            task = self._tasks.get(task_id)
+            if task is None:
+                return False
+            task.cancel_requeue = bool(requeue)
+            task.updated_at = datetime.utcnow()
+            task.version += 1
+            return True
+
+    def unblock_to_ready(self, task_id: str) -> bool:
+        """/answer path (#894): a blocked task with an ANSWERED ballot returns
+        to ``ready`` (not ``pending`` like legacy unblock) so its lane-affinity
+        re-dispatches to the SAME worker holding the lane session."""
+        with self._tasks_lock:
+            task = self._tasks.get(task_id)
+            if task is None or task.status != TaskStatus.blocked:
+                return False
+            task.status = TaskStatus.ready
+            task.updated_at = datetime.utcnow()
+            task.version += 1
+            return True
 
     def requeue_task(self, task_id: str, reason: str = "") -> bool:
         """#870: a delivery whose result body was not a deliverable — the

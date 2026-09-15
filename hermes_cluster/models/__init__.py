@@ -105,6 +105,15 @@ class Node(BaseModel):
     last_heartbeat: datetime = Field(default_factory=datetime.utcnow)
     load: float = 0.0  # 0.0 - 1.0
     max_concurrent: int = 0  # max simultaneously-assigned tasks; 0 = unlimited
+    # #907: operator drain. True = the scheduler sends this node NOTHING, even
+    # a task with an empty `requires`. It is OWNER state, not worker state: a
+    # worker re-join refreshes heartbeat/capabilities/capacity and must leave
+    # this flag alone, because the machine being unfit to run work is exactly
+    # the thing the worker itself cannot be trusted to report (measured
+    # 2026-09-15: a node that could not write any lane result kept heartbeating
+    # healthy, and a capability-strip meant to fence it was reverted by the
+    # node's own next registration).
+    drained: bool = False
     # #892 factory resilience: free GB on the volume holding the worker's
     # lanes/HERMES_HOME, reported in every join/heartbeat. None = the worker
     # did not report it (older worker) — the main's disk rules never fire on
@@ -119,6 +128,17 @@ class Node(BaseModel):
     # one). /join compares it: same token = idempotent re-join, different
     # token while still heartbeating = a DUPLICATE executor -> refused 409.
     instance_token: str = ""
+    # #879: the worker's own health measurements, reported in every
+    # join/heartbeat (None = older worker that omits the field — the health
+    # rules never fire on absent data, exact #892 semantics). cpu_load_pct
+    # is the 0..1 busy fraction since the last beat; lane_count is the live
+    # spawn count the local executor tracks (across BOTH executors when a
+    # duplicate exists — #899's persisted refresh re-attaches those);
+    # duplicate_executor is the survivor's own observation that another
+    # instance wrote spawn records it did not admit.
+    cpu_load_pct: Optional[float] = None
+    lane_count: Optional[int] = None
+    duplicate_executor: Optional[bool] = None
 
 
 # ===========================================================================
@@ -174,6 +194,27 @@ class Task(BaseModel):
     # cardinality guard read live issues from the STORE, never from a
     # process-local map alone.
     issues: List[str] = Field(default_factory=list)
+    # #894: the lane's decision BALLOT (question + options + class + asked_at,
+    # and the owner's answer once it lands). Set when a headless lane escalates
+    # (clarify/needs-decision): the task flips to `blocked` WITH this record so
+    # the hosted gateway can render it to the owner's phone and POST the tap
+    # back to /answer, which stores the answer and unblocks the SAME lane
+    # session. Shape + validation: hermes_cluster.core.ballot. None = no
+    # ballot outstanding.
+    ballot: Optional[Dict[str, Any]] = None
+    # #911: the cancel's re-queue INTENT, recorded at cancel time and
+    # persisted on the row (restart-safe, like every grouping guard).
+    #   False — intentional cancel (consolidation, duplicate, folded into
+    #           another MR): the grouper must NOT re-bundle these members
+    #           (the measured re-emission: a consolidation cancel re-spawned
+    #           4 of 5 members 50 minutes later).
+    #   True  — "reschedule this work" (disk-full drain, dead node): the
+    #           next cycle re-groups the members (the pre-#911 behavior,
+    #           now opt-IN).
+    #   None  — never cancelled through an intent-aware path (legacy rows,
+    #           pre-migration): treated as True (release) so history is not
+    #           rewritten and old drains never strand.
+    cancel_requeue: Optional[bool] = None
 
     model_config = {"populate_by_name": True}
 
@@ -735,6 +776,12 @@ class HeartbeatRequest(BaseModel):
     # payload means "no disk info" — the main keeps its exact pre-#892
     # heartbeat semantics (unconditionally online) for those.
     disk_free_gb: Optional[float] = None
+    # #879: worker health self-report (see Node). Absent = no info; each
+    # rule is inert on its absent field, so an older worker's payload is
+    # byte-for-byte pre-#879 behaviour.
+    cpu_load_pct: Optional[float] = None
+    lane_count: Optional[int] = None
+    duplicate_executor: Optional[bool] = None
 
 
 class JoinRequest(BaseModel):
@@ -743,6 +790,10 @@ class JoinRequest(BaseModel):
     endpoint: str = ""
     max_concurrent: int = 0  # 0 = unlimited; scheduler honours this ceiling
     disk_free_gb: Optional[float] = None  # #892, same absent-means-unknown rule
+    # #879: health self-report rides the join too (a join is a fresh report).
+    cpu_load_pct: Optional[float] = None
+    lane_count: Optional[int] = None
+    duplicate_executor: Optional[bool] = None
     # #899: per-process identity of the executor that is joining. A second
     # /join for the same node name carrying a DIFFERENT token while the
     # previous instance is still heartbeating (< offline_after) is refused
@@ -764,6 +815,17 @@ class UpdateCapabilitiesRequest(BaseModel):
     capabilities: List[str]
 
 
+class SetDrainedRequest(BaseModel):
+    """#907: PATCH /api/v1/nodes/{id}/drain — operator quarantine.
+
+    The supported way to take a node out of rotation. Stripping its
+    capabilities is NOT: an empty ``requires`` matches every node whatever it
+    advertises, and the node's next re-join rewrites the list from its own
+    local config.
+    """
+    drained: bool
+
+
 class SubmitTaskRequest(BaseModel):
     title: str
     # #872 (deeper half): the task's BRIEF, in its own column. When present it
@@ -782,6 +844,14 @@ class SubmitTaskRequest(BaseModel):
     priority: Optional[int] = Field(default=None, ge=0, le=5)
     lane_key: str = ""  # stateful lane identity (e.g. "shared/claude-plugins#feat/x")
     role: str = "author"  # "author" | "reviewer"
+    # #905: task IDs that must reach a terminal-completed state before this
+    # task may run — the verdict-gated landing contract (#902). Until now the
+    # field existed on the Task model and every GET payload, but NOT here, so
+    # Pydantic silently dropped it from POST /api/v1/tasks and a landing task
+    # "waiting on the reviewer" went straight to ready and stranded the PR.
+    # Validation of the ids (they must exist) lives in the create handler:
+    # a 422 on a dangling dep beats a task that can never be promoted.
+    depends_on: List[str] = []
 
 
 class CompleteTaskRequest(BaseModel):
@@ -812,6 +882,52 @@ class FailTaskRequest(BaseModel):
 
 class CancelTaskRequest(BaseModel):
     reason: str = "cancelled"
+    # #911: re-queue INTENT, recorded on the task row at cancel time.
+    #   true  — "reschedule this work": the next grouped-intake cycle
+    #           re-bundles the members (disk-full drains, dead-node
+    #           recoveries — the pre-#911 behavior, now opt-IN).
+    #   absent/false — intentional cancel (consolidation, duplicate,
+    #           folded into another MR): the grouper must NOT re-mint a
+    #           bundle for the members, because the cancel says they are
+    #           already carried elsewhere. The measured defect: a
+    #           consolidation cancel released its five members and the
+    #           grouper re-spawned four of them 50 minutes later (#911).
+    requeue: Optional[bool] = None
+
+
+class BlockTaskRequest(BaseModel):
+    """Body for POST /tasks/{id}/block (#894) — a lane's decision escalation.
+
+    The executor posts this when a headless worker hits clarify/needs-decision:
+    the ballot (question + options + explicit class) is recorded on the task
+    and the task flips to blocked, ready for the gateway relay to render it to
+    the owner's phone.
+    """
+    question: str
+    options: List[str] = []
+    # "technical" (default — the safe guess is the owner's DM) or "product"
+    # (routed to the Bdaya Business group). Owner ruling 2026-09-14: the
+    # ballot MUST carry its class so the relay never guesses.
+    cls: Optional[str] = Field(default=None, alias="class")
+    lane_key: str = ""
+    # #912: where the FORMAL (decision_create-tier) ballot for this same
+    # question lives: "group[/sub]/project#<iid>" + optional decision id.
+    # Absent = no formal side yet (the answer response then carries a loud
+    # needs-actuation directive); malformed = 422 at block time.
+    decision_ref: Optional[str] = None
+    decision_id: Optional[str] = None
+
+    model_config = {"populate_by_name": True}
+
+
+class AnswerTaskRequest(BaseModel):
+    """Body for POST /tasks/{id}/answer (#894) — the owner's decision.
+
+    `answer` is the chosen option text (or free text from "Other");
+    `answered_by` records the owner's chat identity for the audit trail.
+    """
+    answer: str
+    answered_by: str = ""
 
 
 class SetDependenciesRequest(BaseModel):

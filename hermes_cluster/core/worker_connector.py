@@ -31,9 +31,10 @@ import time
 from pathlib import Path
 from typing import Dict, List, Optional
 from urllib.request import Request, urlopen
-from urllib.error import URLError
+from urllib.error import HTTPError, URLError
 
 from .disk_preflight import disk_free_gb
+from .health_selfreport import CpuSampler, cpu_load_pct
 
 logger = logging.getLogger(__name__)
 
@@ -90,6 +91,14 @@ def _signed_post(
     try:
         with urlopen(req, timeout=timeout) as resp:
             return json.loads(resp.read().decode())
+    except HTTPError as e:
+        # #879: distinguish an answered HTTP error from a transport failure —
+        # the caller must tell a 409 (a duplicate executor exists; an
+        # operator must stop one) apart from "main unreachable" (keep
+        # heartbeating quietly). The sentinel dict carries the status code;
+        # normal payloads never have a "__http_error__" key.
+        logger.warning("signed POST %s answered HTTP %s", path, e.code)
+        return {"__http_error__": e.code}
     except URLError as e:
         logger.warning("signed POST %s failed: %s", path, e)
         return None
@@ -100,6 +109,63 @@ def _signed_post(
 
 _connector_started = False
 _connector_lock = threading.Lock()
+
+# The connector must be STOPPABLE. `_loop` below is `while True:`, so without
+# these a started thread ends only when the PROCESS ends: a worker cannot be
+# reconfigured without a restart, and two connectors can be alive at once
+# (#899's duplicate-executor incident). The stop event is also the only way a
+# test can end a connector it started — a daemon thread survives the test that
+# made it and keeps posting into whatever `_signed_post` is patched to next.
+_connector_stop = threading.Event()
+_connector_thread: Optional[threading.Thread] = None
+
+def _beat_wait(interval: float) -> bool:
+    """Wait one beat. Returns True if a stop was requested during the wait.
+
+    This is a NAMED SEAM, and both of its properties matter:
+
+      * production gets an INTERRUPTIBLE wait. `time.sleep(interval)` is not
+        interruptible, so a stop had to wait out the whole beat -- with the
+        app's default 10s beat that outlived a 5s join and the thread
+        survived the shutdown that asked it to stop (measured: CI run
+        35004484899, `worker-connector-test-worker` still alive).
+      * the connector tests drive this loop by replacing the wait with one
+        that raises SystemExit after N cycles. They used to patch
+        `time.sleep` -- an implementation detail -- which is why the loop
+        could not switch to an interruptible primitive without breaking
+        them. They now patch this function, which is what they always meant.
+    """
+    return _connector_stop.wait(interval)
+
+
+def stop_worker_connector(timeout: float = 5.0) -> bool:
+    """Stop the running connector and wait for its thread to finish.
+
+    Returns True if a thread was running and has now exited, False if there
+    was nothing to stop. Idempotent, and safe to call when the connector was
+    never started — a shutdown path that raises is a shutdown path nobody
+    calls. Clears `_connector_started` so a later start is not a silent
+    no-op that logs "already running" and beats nothing.
+    """
+    global _connector_started, _connector_thread
+
+    _connector_stop.set()
+    thread = _connector_thread
+    joined = False
+    if thread is not None and thread.is_alive():
+        thread.join(timeout)
+        joined = not thread.is_alive()
+        if not joined:
+            logger.warning(
+                "worker connector did not stop within %.1fs — thread %s is "
+                "still alive", timeout, thread.name)
+    elif thread is not None:
+        joined = True
+
+    with _connector_lock:
+        _connector_started = False
+    _connector_thread = None
+    return joined
 
 
 def run_probe(name: str, spec: dict) -> bool:
@@ -140,6 +206,7 @@ def start_worker_connector(
     capability_probes: Optional[Dict[str, dict]] = None,
     disk_probe_path: str = "",
     instance_token: str = "",
+    health_fn=None,
 ) -> None:
     """Start the outbound worker connector thread.
 
@@ -177,6 +244,18 @@ def start_worker_connector(
             one; the survivor keeps heartbeating regardless). Empty (older
             launch path) omits the field — pre-#899 tokenless join
             semantics are preserved.
+        live/health observation: ``health_fn`` — callable returning
+            ``(live_spawns_list_or_None, duplicate_executor_bool)`` sourced
+            from the local AgentExecutor (``live_spawns()`` plus the #899
+            duplicate-observation flag). Sampled every beat into the
+            ``lane_count`` / ``duplicate_executor`` payload fields next to a
+            CPU busy-fraction reading; the MAIN thresholds them (against the
+            node's declared max_concurrent / node.max_cpu_load) and degrades
+            the node. Without this the duplicate-executor incident class
+            (100% CPU, every lane doubled) stayed invisible: the connector
+            thread keeps beating healthy while the node burns. None = no
+            executor wired yet (the CPU reading still rides; absent fields
+            are the older-worker contract the main honours).
     """
     global _connector_started
     with _connector_lock:
@@ -198,6 +277,35 @@ def start_worker_connector(
 
     def _disk_report() -> Optional[float]:
         return disk_free_gb(_disk_probe_target())
+
+    # #879: shared CPU sampler for the beat cadence (the delta window is the
+    # heartbeat interval; first measure() primes it and reports None).
+    _cpu_sampler = CpuSampler()
+
+    def _health_fields() -> dict:
+        """Sample the #879 self-report; every field is omitted when unknown
+        (older-worker contract: absent field = no information = rule inert).
+        Never raises — a failed probe must not take the heartbeat down."""
+        out: Dict[str, object] = {}
+        try:
+            pct = cpu_load_pct(_cpu_sampler)
+        except Exception:
+            pct = None
+        if pct is not None:
+            out["cpu_load_pct"] = pct
+        if health_fn is not None:
+            try:
+                spawns, dup = health_fn()
+                if spawns is not None:
+                    out["lane_count"] = len(spawns)
+                # Always send the bool once wired: an OMITTED field means
+                # "unknown" to the main and keeps the last stored value —
+                # the watchdog would then re-degrade on the stale True long
+                # after the duplicate drained. False clears it.
+                out["duplicate_executor"] = bool(dup)
+            except Exception:
+                logger.debug("health probe failed", exc_info=True)
+        return out
 
     token = _resolve_peer_token(peer_token)
     if not token:
@@ -280,6 +388,9 @@ def start_worker_connector(
                 disk_gb = _disk_report()
                 if disk_gb is not None:
                     join_data["disk_free_gb"] = disk_gb
+                # #879: the join carries the same health self-report as the
+                # beat (a join is a fresh report).
+                join_data.update(_health_fields())
                 result = _signed_post(
                     cluster_endpoint, "/api/v1/nodes/join", join_data, token, node_id
                 )
@@ -290,6 +401,19 @@ def start_worker_connector(
                         registered_id,
                     )
                 else:
+                    if isinstance(result, dict) and \
+                            result.get("__http_error__") == 409:
+                        # #879/#899: main refused this join — a live sibling
+                        # holds the node id. This instance is the DUPLICATE
+                        # (or the sibling is wedged); either way an operator
+                        # must stop one. Loud, and retried forever so the
+                        # first one's death is still picked up.
+                        logger.error(
+                            "worker connector: join REFUSED 409 — another "
+                            "live executor holds node id %s (#899). One of "
+                            "the two must be stopped; the main also sees the "
+                            "survivor's duplicate_executor self-report.",
+                            node_id)
                     logger.warning(
                         "worker connector: join failed, will retry in %.1fs",
                         heartbeat_interval,
@@ -305,6 +429,10 @@ def start_worker_connector(
                 disk_gb = _disk_report()
                 if disk_gb is not None:
                     hb_data["disk_free_gb"] = disk_gb
+                # #879: and the health self-report (CPU busy fraction, live
+                # lane count, duplicate-executor observation) — same omit-
+                # when-unknown contract, same degrade-and-restore policy.
+                hb_data.update(_health_fields())
                 # #897: act on the beat's ANSWER. A restarted main whose store
                 # lost this node answers {"status":"unknown_node"}; dropping
                 # registered_id sends the loop through the (idempotent) join
@@ -323,7 +451,12 @@ def start_worker_connector(
                         "— re-joining next cycle", registered_id)
                     registered_id = None
 
-            time.sleep(heartbeat_interval)
+            if _beat_wait(heartbeat_interval):
+                logger.info("worker connector stopping: node=%s", node_id)
+                return
 
+    global _connector_thread
+    _connector_stop.clear()
     thread = threading.Thread(target=_loop, daemon=True, name=f"worker-connector-{node_id}")
+    _connector_thread = thread
     thread.start()

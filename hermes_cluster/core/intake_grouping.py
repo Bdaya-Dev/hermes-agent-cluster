@@ -63,6 +63,13 @@ Grouping rules (each cites its doctrine home)
   once the current bundle task is terminal (one lane, many sittings, one MR
   per sitting). Which issues join is decided by area co-bundling (§area
   packing below) and band order, never by issue number.
+* ACCUMULATION WINDOW (LFP-1 completion): ``accumulate_window_s > 0`` holds
+  a band>0 lane's waiting candidates UNBUNDLED until the OLDEST has aged
+  past the window, so a bundle is a time-boxed accumulation instead of
+  "whatever one planning pass happened to see". Without it, steady-state
+  arrivals between sittings each mint a single-issue lane — the 1:1 shape
+  #762 was filed to kill. Band 0 (#886) and cap-full batches never wait;
+  unknown age fails OPEN. Default 0 = off (pre-window shape preserved).
 * PROOF IS NOT DILUTED: the bundle brief tells the lane each issue still
   needs its own scoped proof and disposition, and the MR ``Refs`` — never
   ``Closes`` — every issue (VP-1 close gate fires on merge otherwise).
@@ -92,6 +99,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 from pydantic import BaseModel, Field, field_validator
@@ -130,6 +138,28 @@ class GroupingConfig(BaseModel):
         default_factory=lambda: list(DEFAULT_SKIP_LABEL_PATTERNS))
     # GitLab link types whose source blocks the target.
     blocker_link_types: List[str] = Field(default_factory=lambda: ["is_blocked_by", "blocked_by"])
+    # ACCUMULATION WINDOW (LFP-1 completion, lane cluster-lfp1-accumulation):
+    # seconds a band>0 lane's waiting candidates keep accumulating into ONE
+    # bundle before a sitting is minted. Grouping without a window bundles
+    # only what the planning pass sees at one instant: in steady state
+    # (issues arriving one or two per poll cycle) every lane reaps its
+    # sitting and then mints a single-issue sitting for the one arrival —
+    # the 1:1 issue-per-lane shape #762 exists to kill. A window makes the
+    # bundle a time-boxed accumulation instead. Exemptions (each pinned in
+    # tests): 0 = OFF reproduces pre-window behavior byte-for-byte; band 0
+    # (business team, #886) never waits; a batch already at
+    # ``max_bundle_size`` goes now (the owner sitting target is met). Age
+    # anchors on GitLab's issue ``created_at``, so enabling this NEVER
+    # strands a standing backlog behind the window and a main restart
+    # cannot reset the clock.
+    accumulate_window_s: int = 0
+
+    @field_validator("accumulate_window_s")
+    @classmethod
+    def _check_window(cls, v: int) -> int:
+        if v < 0:
+            raise ValueError("accumulate_window_s must be >= 0 (0 = window off)")
+        return v
 
     @field_validator("max_bundle_size")
     @classmethod
@@ -209,6 +239,71 @@ def _area_cluster(issue: Dict[str, Any]) -> str:
         if l.startswith("area::"):
             return l
     return ""
+
+
+def parse_gitlab_time(value: Any) -> Optional[datetime]:
+    """GitLab payload timestamp (UTC ISO, ``...Z`` or offset, sometimes
+    naive) as an aware UTC datetime; None when missing/unparseable.
+
+    FAIL-OPEN by design: an unknown age must never silently stall intake
+    behind the accumulation window — the caller treats None as "old enough,
+    release the bundle" (the pre-window behavior).
+    """
+    if not isinstance(value, str) or not value.strip():
+        return None
+    s = value.strip()
+    if s.endswith(("Z", "z")):
+        s = s[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(s)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def oldest_candidate_age_s(issues: Iterable[Dict[str, Any]],
+                           now: Optional[datetime] = None) -> Optional[float]:
+    """Seconds since the OLDEST parseable ``created_at`` among the issues,
+    or None when no issue carries one (fail open)."""
+    ages: List[float] = []
+    for iss in issues:
+        dt = parse_gitlab_time(iss.get("created_at"))
+        if dt is None:
+            continue
+        ref = now or datetime.now(timezone.utc)
+        ages.append(max(0.0, (ref - dt).total_seconds()))
+    return max(ages) if ages else None
+
+
+def should_accumulate(*, batch_size: int, top_band: int,
+                      oldest_age_s: Optional[float],
+                      config: GroupingConfig) -> bool:
+    """True = HOLD this batch back and keep accumulating (no sitting minted
+    yet). The three exemptions are each load-bearing (pinned in
+    tests_v3/test_intake_accumulation_lfp1.py):
+
+    * window OFF (0, the default) -> never hold: byte-for-byte the pre-
+      window #762 behavior;
+    * band 0 (business team, #886) -> never hold: Sami/emad stay instant —
+      the same exception the cardinality guard already carries;
+    * batch already at ``max_bundle_size`` -> never hold: the owner's
+      per-sitting target (30-40) is met; waiting longer only delays a full
+      sitting while surplus arrivals ride the NEXT window anyway;
+    * unknown age (no parseable created_at anywhere in the batch) ->
+      never hold (fail OPEN: bad data must not stall intake — #895/#903
+      lesson).
+    """
+    if config.accumulate_window_s <= 0:
+        return False
+    if top_band == 0:
+        return False
+    if batch_size >= config.max_bundle_size:
+        return False
+    if oldest_age_s is None:
+        return False
+    return oldest_age_s < config.accumulate_window_s
 
 
 def filter_candidates(
@@ -305,6 +400,19 @@ def bundle_plan_for_repo(
             return None                     # one queued sitting at a time
         if any(b == 0 for _, b in queued):
             return None                     # band-0 bundle already queued
+    # ACCUMULATION WINDOW (LFP-1 completion): band>0 lanes keep accumulating
+    # until the OLDEST waiting candidate has aged past the window (or the
+    # batch is already cap-size). Without this, grouping only bundles what
+    # ONE planning pass sees: in steady state every arrival mints its own
+    # single-issue sitting, and the review-gate cost #762 amortizes lands
+    # right back at 1:1. Stateless by design — the age anchor is GitLab's
+    # own issue created_at, so a restart cannot reset the clock and a
+    # standing backlog is already old.
+    if should_accumulate(batch_size=len(candidates), top_band=top_band,
+                         oldest_age_s=oldest_candidate_age_s(
+                             [iss for _, iss, _ in candidates]),
+                         config=config):
+        return None
     batch, reason = pack_repo_candidates(lane_key, candidates, config)
     if not batch:
         return None
@@ -323,6 +431,23 @@ def bundle_title(bundle: BundlePlan) -> str:
         return f"[lane:{bundle.lane_key}][##{bundle.iids[0]}]"
     joined = "-".join(str(i) for i in bundle.iids)
     return f"[lane:{bundle.lane_key}][##{bundle.iids[0]}…{bundle.iids[-1]} x{len(bundle.iids)}]"
+
+
+def _parse_github_pr_url(mr_url: str) -> Optional[Tuple[str, int]]:
+    """#902: ``(owner/repo, number)`` if the artifact is a GitHub PR, else None.
+
+    The CLOSE-THE-LOOP branch of the reviewer brief keys on this: a GitLab
+    MR lands with `bdaya-glab mr land`; a GitHub PR is landed by a
+    SUBMITTED LANDING TASK, because the read-only (#882) reviewer has no
+    landing verb there and the GitLab shape strands the PR Draft+unmerged
+    (measured: infra PR #308, 2026-09-14)."""
+    m = re.search(
+        r"https?://(?:www\.)?github\.com/([\w.-]+/[\w.-]+)/pull/(\d+)",
+        mr_url or "",
+    )
+    if not m:
+        return None
+    return m.group(1), int(m.group(2))
 
 
 def reviewer_handoff_brief(bundle: BundlePlan, mr_url: str, head_sha: str,
@@ -346,8 +471,22 @@ def reviewer_handoff_brief(bundle: BundlePlan, mr_url: str, head_sha: str,
     fixed issue and CLOSE it yourself (needs-human stays a hard stop)."""
     issues = ", ".join(f"#{i}" for i in bundle.iids)
     rev_key = reviewer_lane_key or f"{bundle.lane_key}-rev"
+    # #902: the CLOSE-THE-LOOP PASS branch must match the artifact's host. A
+    # read-only (#882) reviewer on a GITHUB PR has no `bdaya-glab mr land`
+    # verb and cannot `gh pr merge` — the GitLab-shaped instruction left it
+    # with no valid action, so it APPROVEd and stopped, the PR sat Draft, and
+    # the lead hand-dispatched the landing. GitHub PRs therefore close the
+    # loop by SUBMITTING A LANDING TASK (role='author', requires=
+    # ['github-write']) — never by landing it themselves, and never by
+    # "submitting the reviewer task" (that step IS this lane).
+    gh = _parse_github_pr_url(mr_url)
+    title = (
+        f"[lane:{rev_key}][REVIEW {bundle.lane_key} PR #{gh[1]}]"
+        if gh else
+        f"[lane:{rev_key}][REVIEW {bundle.lane_key} MR !{mr_url.rstrip('/').split('/')[-1]}]"
+    )
     return (
-        f"[lane:{rev_key}][REVIEW {bundle.lane_key} MR !{mr_url.rstrip('/').split('/')[-1]}]\n"
+        f"{title}\n"
         f"\n"
         f"## INDEPENDENT REVIEW (shared/claude-plugins#893) — fresh context, reviewer role\n"
         f"\n"
@@ -378,11 +517,36 @@ def reviewer_handoff_brief(bundle: BundlePlan, mr_url: str, head_sha: str,
         f"The note is the durable oracle the landing gate reads.\n"
         f"\n"
         f"CLOSE THE LOOP (#893) — after posting the note:\n"
-        f"  * On PASS at head: YOU land the MR yourself:\n"
-        f"    `bdaya-glab mr land --project <p> --mr <n> --sha {head_sha}`\n"
-        f"    (sha pinned; the tool refuses a stale head). Reviewer != author\n"
-        f"    and this lane is fresh-context, so RV-1 holds — a `needs-human`\n"
-        f"    label is a hard stop: NEVER land past it.\n"
+        + (
+            # #902: GitHub PR branch. The reviewer is read-only (#882) and
+            # `bdaya-glab` has no GitHub landing verb — PASS closes the loop
+            # by SUBMITTING A LANDING TASK, never by landing it itself, and
+            # never by "submitting the reviewer task" (that step is this lane).
+            f"  * On PASS at head (GitHub PR — you do NOT land it yourself:\n"
+            f"    you are read-only #882 and `bdaya-glab mr land` has no GitHub\n"
+            f"    verb): submit a LANDING task via `kanban_cluster_submit` —\n"
+            f"    role='author', lane_key='{gh[0].split('/')[-1]}#land-{gh[1]}',\n"
+            f"    requires=['github-write'], priority=5, depends_on=[<THIS reviewer\n"
+            f"    task's id>] (#905: the create handler holds a dep-tagged task\n"
+            f"    pending until every dependency completes — the landing cannot run\n"
+            f"    before your verdict is filed), and its title/brief IS:\n"
+            f"    `gh pr view {gh[1]} --repo {gh[0]} --json headRefOid` MUST equal\n"
+            f"    {head_sha} (STOP + NEEDS-CHANGES follow-up if the head moved) →\n"
+            f"    `gh pr ready {gh[1]} --repo {gh[0]}` → `gh pr merge {gh[1]}\n"
+            f"    --repo {gh[0]} --merge` → post-merge verify per the PR body's\n"
+            f"    own proof section, then the folded VP-1 note + issue close per\n"
+            f"    the next bullet run on the deployed surface it names. Submit\n"
+            f"    it EXACTLY ONCE (#898 dedupe applies) — never resubmit, never\n"
+            f"    park for the lead. Nothing in this brief ever tells you to\n"
+            f"    'submit the reviewer task': that step is the task you are now\n"
+            f"    completing.\n"
+            if gh else
+            f"  * On PASS at head: YOU land the MR yourself:\n"
+            f"    `bdaya-glab mr land --project <p> --mr <n> --sha {head_sha}`\n"
+            f"    (sha pinned; the tool refuses a stale head). Reviewer != author\n"
+            f"    and this lane is fresh-context, so RV-1 holds — a `needs-human`\n"
+            f"    label is a hard stop: NEVER land past it.\n"
+        ) +
         f"  * FOLDED VP-1 (owner ruling 2026-09-14 — the separate live-verify\n"
         f"    lane is RETIRED; you are the live verifier): for every listed\n"
         f"    user-facing issue, before its close — (1) RE-RUN the issue's\n"
@@ -480,8 +644,15 @@ def bundle_brief(bundle: BundlePlan) -> str:
         f"         never overridden), the posting instruction\n"
         f"         (`bdaya-glab mr note` via `npx -y -p\n"
         f"         @shared/bdaya-gitlab@latest`), and the CLOSE-THE-LOOP rule:\n"
-        f"         on PASS at head the REVIEWER lane lands the MR itself with\n"
-        f"         `bdaya-glab mr land --project <p> --mr <n> --sha <head>`\n"
+        f"         on PASS at head the REVIEWER lane lands a GITLAB MR itself\n"
+        f"         with `bdaya-glab mr land --project <p> --mr <n> --sha <head>`;\n"
+        f"         on a GITHUB PR the reviewer cannot land (#882 read-only, no\n"
+        f"         `bdaya-glab` verb) and instead SUBMITS a landing task\n"
+        f"         (role='author', requires=['github-write'], lane_key\n"
+        f"         `<repo>#land-<n>`, priority 5) whose brief verifies\n"
+        f"         headRefOid==reviewed sha, then `gh pr ready` +\n"
+        f"         `gh pr merge --merge` — the #902 fix that stopped\n"
+        f"         PASSed GitHub PRs sitting Draft with no valid action;\n"
         f"         (reviewer != author, fresh context, so RV-1\n"
         f"         holds; a `needs-human` label is a hard stop — never land past\n"
         f"         it); on NEEDS-CHANGES the reviewer submits a follow-up author\n"

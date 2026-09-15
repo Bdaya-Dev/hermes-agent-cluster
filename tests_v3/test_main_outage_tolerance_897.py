@@ -100,20 +100,40 @@ class _PostScript:
 
 def _run_connector_briefly(patched_post, interval=0.02, seconds=1.0):
     """Start the real connector thread with _signed_post patched; let it
-    cycle; stop it. (The module's _connector_started idempotency guard is
-    reset around the run — threads are daemons, nothing leaks past assert.)"""
+    cycle; then ACTUALLY stop it.
+
+    The previous version of this docstring claimed "threads are daemons,
+    nothing leaks past assert". That is false: a daemon thread is killed at
+    PROCESS exit, not at test exit. Restoring the patched `_signed_post` on
+    the way out of the `with` block does not stop the thread -- it only
+    changes what the still-running thread posts into, which from here on is
+    whatever the NEXT test monkeypatched.
+
+    That leak failed test_join_409_is_loud_and_retried on PR#70's CI run
+    34999417891: this test's heartbeats, carrying this test's node id
+    ("node_pc_worker"), landed in that test's capture AND consumed its
+    one-shot fake sleep, so its loop took SystemExit after one join instead
+    of two. tests_v3/test_connector_thread_leak.py reproduces that directly
+    and guards the stop path called below.
+    """
     from hermes_cluster.core import worker_connector as wc
 
-    with patch.object(wc, "_connector_started", False), \
-         patch.object(wc, "_signed_post", patched_post):
-        wc.start_worker_connector(
-            node_id="pc_worker",
-            cluster_endpoint="http://main.invalid:8787",
-            capabilities=["tooling"],
-            peer_token="test-token-not-secret",
-            heartbeat_interval=interval,
-        )
-        time.sleep(seconds)
+    try:
+        with patch.object(wc, "_connector_started", False),              patch.object(wc, "_signed_post", patched_post):
+            wc.start_worker_connector(
+                node_id="pc_worker",
+                cluster_endpoint="http://main.invalid:8787",
+                capabilities=["tooling"],
+                peer_token="test-token-not-secret",
+                heartbeat_interval=interval,
+            )
+            time.sleep(seconds)
+            # Stop INSIDE the patch scope: the loop takes one more pass as it
+            # winds down, and those posts belong to this test's capture.
+            wc.stop_worker_connector(timeout=5.0)
+    finally:
+        # Belt and braces: a failed assert above must not leak either.
+        wc.stop_worker_connector(timeout=5.0)
     return patched_post.calls
 
 

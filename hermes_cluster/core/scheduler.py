@@ -110,7 +110,22 @@ def node_at_capacity(node: Node, active_count: int) -> bool:
 
 
 def node_can_run(task_requires: List[str], node: Node) -> bool:
-    """True when *node* declares every capability *task_requires*."""
+    """True when *node* declares every capability *task_requires*.
+
+    A DRAINED node can run nothing at all (#907), including a task with an
+    EMPTY ``requires``. Draining used to be attempted by stripping a node's
+    capabilities, which fails twice over: an empty ``requires`` matches every
+    node regardless of what it advertises, and the worker's next re-join
+    overwrites the stripped list from its own local config
+    (``node_manager.register_node`` -> ``update_capabilities``). Measured
+    2026-09-15: a node that could not write results at all kept being handed
+    unconstrained work, and the operator's strip silently reverted, orphaning
+    the 9 tasks that required the maintenance-only capability it had used.
+    Drain is therefore a node FLAG the scheduler honours before any capability
+    matching, not a capability trick.
+    """
+    if getattr(node, "drained", False):
+        return False
     if not task_requires:
         return True
     return all(cap in node.capabilities for cap in task_requires)

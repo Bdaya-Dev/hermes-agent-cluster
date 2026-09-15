@@ -96,6 +96,7 @@ from ..core.scheduler import (
     FairScheduler,
     lane_blocked_ready_ids,
 )
+from ..core.ballot import parse_ballot_column
 from ..core.lane_affinity import AffinityScheduler
 
 logger = logging.getLogger(__name__)
@@ -120,7 +121,11 @@ CREATE TABLE IF NOT EXISTS nodes (
     max_concurrent INTEGER DEFAULT 0,
     disk_free_gb DOUBLE PRECISION,
     status_reason TEXT DEFAULT '',
-    instance_token TEXT DEFAULT ''
+    instance_token TEXT DEFAULT '',
+    drained BOOLEAN DEFAULT FALSE,
+    cpu_load_pct DOUBLE PRECISION,
+    lane_count INTEGER,
+    duplicate_executor BOOLEAN
 );
 
 CREATE TABLE IF NOT EXISTS tasks (
@@ -141,7 +146,15 @@ CREATE TABLE IF NOT EXISTS tasks (
     result TEXT,
     -- #762 grouped intake: bundle brief + restart-safe membership.
     description TEXT DEFAULT '',
-    issues TEXT DEFAULT '[]'
+    issues TEXT DEFAULT '[]',
+    -- #894: the lane's decision ballot (JSON TEXT): question/options/class/
+    -- asked_at/answer/answered_at/answered_by. See hermes_cluster.core.ballot.
+    ballot TEXT,
+    -- #911: the cancel's re-queue intent (NULL = never cancelled through an
+    -- intent-aware path -> legacy release semantics). Fresh CREATEs carry it
+    -- (the importer runs _SCHEMA_SQL only, not the connect() migration list);
+    -- existing DBs get it from the ALTER below.
+    cancel_requeue BOOLEAN
 );
 
 -- Stateful lanes: one row per lane_key, keyed to the hermes session it owns.
@@ -361,6 +374,19 @@ class PostgresClusterStore:
             # instance token per node id.
             await conn.execute(
                 "ALTER TABLE nodes ADD COLUMN IF NOT EXISTS instance_token TEXT DEFAULT ''")
+            # #907: operator drain. Kept OUT of the /join upsert's column list
+            # on purpose, so a worker re-join cannot clear it — the failure a
+            # capability-strip drain had, where the next heartbeat undid it.
+            await conn.execute(
+                "ALTER TABLE nodes ADD COLUMN IF NOT EXISTS drained BOOLEAN DEFAULT FALSE")
+            # #879: worker health self-report. NULL = never reported (older
+            # worker) → the health rules never fire (same drift as #892 disk).
+            await conn.execute(
+                "ALTER TABLE nodes ADD COLUMN IF NOT EXISTS cpu_load_pct DOUBLE PRECISION")
+            await conn.execute(
+                "ALTER TABLE nodes ADD COLUMN IF NOT EXISTS lane_count INTEGER")
+            await conn.execute(
+                "ALTER TABLE nodes ADD COLUMN IF NOT EXISTS duplicate_executor BOOLEAN")
             await conn.execute(
                 "ALTER TABLE tasks ADD COLUMN IF NOT EXISTS attempts INTEGER DEFAULT 0")
             # #874: the lane deliverable, so a result outlives the node that made it.
@@ -373,6 +399,15 @@ class PostgresClusterStore:
                 "ALTER TABLE tasks ADD COLUMN IF NOT EXISTS description TEXT DEFAULT ''")
             await conn.execute(
                 "ALTER TABLE tasks ADD COLUMN IF NOT EXISTS issues TEXT DEFAULT '[]'")
+            # #894: the lane's decision ballot (JSON TEXT) — idempotent for
+            # hosted DBs created before this column existed.
+            await conn.execute(
+                "ALTER TABLE tasks ADD COLUMN IF NOT EXISTS ballot TEXT")
+            # #911: the cancel's re-queue intent (NULL = never cancelled
+            # through an intent-aware path -> legacy release semantics).
+            await conn.execute(
+                "ALTER TABLE tasks ADD COLUMN IF NOT EXISTS "
+                "cancel_requeue BOOLEAN")
         logger.info("PostgresClusterStore: connected, schema ensured")
         return self
 
@@ -475,8 +510,9 @@ class PostgresClusterStore:
     async def register_node(self, node: Node) -> None:
         await self._fetch(
             """INSERT INTO nodes (id, name, capabilities, status, last_heartbeat, load, max_concurrent,
-                 disk_free_gb, status_reason, instance_token)
-               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                 disk_free_gb, status_reason, instance_token,
+                 cpu_load_pct, lane_count, duplicate_executor)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
                ON CONFLICT (id) DO UPDATE SET
                  name = EXCLUDED.name,
                  capabilities = EXCLUDED.capabilities,
@@ -486,12 +522,18 @@ class PostgresClusterStore:
                  max_concurrent = EXCLUDED.max_concurrent,
                  disk_free_gb = EXCLUDED.disk_free_gb,
                  status_reason = EXCLUDED.status_reason,
-                 instance_token = EXCLUDED.instance_token""",
+                 instance_token = EXCLUDED.instance_token,
+                 cpu_load_pct = EXCLUDED.cpu_load_pct,
+                 lane_count = EXCLUDED.lane_count,
+                 duplicate_executor = EXCLUDED.duplicate_executor""",
             node.id, node.name, _json_dumps(node.capabilities),
             node.status.value, _aware(node.last_heartbeat), float(node.load),
             int(node.max_concurrent),
             node.disk_free_gb, getattr(node, "status_reason", ""),
             getattr(node, "instance_token", ""),
+            getattr(node, "cpu_load_pct", None),
+            getattr(node, "lane_count", None),
+            getattr(node, "duplicate_executor", None),
         )
         if self._on_node_online:
             try:
@@ -509,26 +551,39 @@ class PostgresClusterStore:
 
     async def update_heartbeat(self, node_id: str, load: float = 0.0,
                                disk_free_gb: Optional[float] = None,
-                               status_reason: str = "") -> None:
+                               status_reason: str = "",
+                               cpu_load_pct: Optional[float] = None,
+                               lane_count: Optional[int] = None,
+                               duplicate_executor: Optional[bool] = None) -> None:
         # #892: status follows the caller's verdict — NodeManager passes
         # status_reason when the reported disk is below the floor; the beat
         # refreshes the clock WITHOUT forcing online (the unconditional force
         # is what kept the full-disk node schedulable during the 2026-09-14
         # incident). Empty reason = the pre-#892 force-online. disk_free_gb
         # None (older worker) leaves the stored column untouched.
+        # #879: same rule for the health self-report fields — a None report
+        # keeps the stored column (an absent field is "no information").
         status = NodeStatus.degraded.value if status_reason else NodeStatus.online.value
-        if disk_free_gb is None:
-            await self._fetch(
-                "UPDATE nodes SET last_heartbeat = $1, status = $2, load = $3, "
-                "status_reason = $4 WHERE id = $5",
-                _utcnow(), status, load, status_reason, node_id,
-            )
-        else:
-            await self._fetch(
-                "UPDATE nodes SET last_heartbeat = $1, status = $2, load = $3, "
-                "disk_free_gb = $4, status_reason = $5 WHERE id = $6",
-                _utcnow(), status, load, float(disk_free_gb), status_reason, node_id,
-            )
+        sets = ["last_heartbeat = $1", "status = $2", "load = $3",
+                "status_reason = $4"]
+        params = [_utcnow(), status, load, status_reason]
+        if disk_free_gb is not None:
+            sets.append(f"disk_free_gb = ${len(params) + 1}")
+            params.append(float(disk_free_gb))
+        if cpu_load_pct is not None:
+            sets.append(f"cpu_load_pct = ${len(params) + 1}")
+            params.append(float(cpu_load_pct))
+        if lane_count is not None:
+            sets.append(f"lane_count = ${len(params) + 1}")
+            params.append(int(lane_count))
+        if duplicate_executor is not None:
+            sets.append(f"duplicate_executor = ${len(params) + 1}")
+            params.append(bool(duplicate_executor))
+        params.append(node_id)
+        await self._fetch(
+            f"UPDATE nodes SET {', '.join(sets)} WHERE id = ${len(params)}",
+            *params,
+        )
 
     async def update_capabilities(self, node_id: str, caps: List[str]) -> None:
         # ONE atomic statement (round-2 review of 1043352). The previous
@@ -590,6 +645,38 @@ class PostgresClusterStore:
             max(0, int(max_concurrent)), node_id,
         )
 
+    async def set_drained(self, node_id: str, drained: bool) -> None:
+        """Drain or un-drain a node (#907) — OPERATOR state, never worker state.
+
+        A drained node is handed NOTHING by the scheduler, including a task
+        with an empty ``requires``. It lives in its own column rather than in
+        ``capabilities`` because the /join upsert rewrites capabilities from
+        whatever the worker declares locally, so a drain expressed there is
+        erased by the node's next check-in.
+
+        Takes ``HERMES_SCHEDULE_LOCK``, unlike its sibling updaters
+        (``update_capabilities`` / ``update_max_concurrent`` /
+        ``update_instance_token``), which do not. Those tolerate a one-tick
+        race: a scheduler pass that read the node a moment earlier hands it
+        work under slightly stale capabilities, and the next tick corrects
+        itself. Drain cannot tolerate it, because the whole guarantee it sells
+        is "this node receives NOTHING" — a single task leaked into the
+        window is the guarantee being false, and an operator drains precisely
+        when a node must stop, usually because work landing there is already
+        failing. Serializing against the scheduler makes the guarantee true
+        rather than nearly-true; the cost is one advisory lock on an operator
+        action taken by hand.
+        """
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                await conn.execute(
+                    "SELECT pg_advisory_xact_lock($1)", HERMES_SCHEDULE_LOCK,
+                )
+                await conn.execute(
+                    "UPDATE nodes SET drained = $1 WHERE id = $2",
+                    bool(drained), node_id,
+                )
+
     async def update_instance_token(self, node_id: str, instance_token: str) -> None:
         """#899: record which executor instance currently owns this node id
         (a re-join re-declares it; the /join gate reads it). SyncPostgresStore
@@ -638,6 +725,16 @@ class PostgresClusterStore:
             # #899: a DB created before the drift ALTER lacks the column —
             # '' = older-worker join semantics.
             instance_token=row["instance_token"] if "instance_token" in keys else "",
+            # #907: a DB created before the drift ALTER lacks the column —
+            # NOT drained is the safe default (a node keeps working; the
+            # opposite default would silently dark the whole fleet).
+            drained=bool(row["drained"]) if "drained" in keys else False,
+            # #879: health self-report — absent column or NULL = never
+            # reported; the rules stay inert (older-worker semantics).
+            cpu_load_pct=row["cpu_load_pct"] if "cpu_load_pct" in keys else None,
+            lane_count=row["lane_count"] if "lane_count" in keys else None,
+            duplicate_executor=(row["duplicate_executor"]
+                                if "duplicate_executor" in keys else None),
         )
 
     # -------------------------------------------------------------------
@@ -654,30 +751,37 @@ class PostgresClusterStore:
         role: str = "author",
         description: str = "",
         issues: Optional[List[str]] = None,
+        depends_on: Optional[List[str]] = None,
     ) -> Task:
         now = _utcnow()
-        # One transaction: insert-if-absent then promote pending->ready
-        # (no dependencies at creation, mirroring the SQLite store). These
-        # MUST be sequential statements — sibling data-modifying CTEs in one
-        # query do not see each other's rows on Postgres. The status-guarded
-        # UPDATE keeps concurrent create/demote writers correct.
+        deps = list(depends_on or [])
+        # One transaction: insert-if-absent then promote pending->ready —
+        # but ONLY when the row has no dependencies (#905: the hosted main is
+        # the Postgres store; a landing task created with depends_on=[reviewer]
+        # must stay pending until the reviewer completes, and
+        # trigger_pending_tasks is the single promotion gate). These MUST be
+        # sequential statements — sibling data-modifying CTEs in one query do
+        # not see each other's rows on Postgres. The status-guarded UPDATE
+        # keeps concurrent create/demote writers correct.
         async with self._txn() as conn:
             await conn.execute(
                 """INSERT INTO tasks
                    (id, title, requires, depends_on, priority, status,
                     created_at, updated_at, version, lane_key, role,
                     description, issues)
-                   VALUES ($1, $2, $3, '[]', $4, $5, $6, $6, 1, $7, $8, $9, $10)
+                   VALUES ($1, $2, $3, $4, $5, $6, $7, $7, 1, $8, $9, $10, $11)
                    ON CONFLICT (id) DO NOTHING""",
-                task_id, title, _json_dumps(requires), priority,
+                task_id, title, _json_dumps(requires), _json_dumps(deps),
+                priority,
                 TaskStatus.pending.value, now, lane_key, role,
                 description, _json_dumps(list(issues or [])),
             )
-            await conn.execute(
-                """UPDATE tasks SET status = $1, updated_at = $2
-                   WHERE id = $3 AND status = $4""",
-                TaskStatus.ready.value, now, task_id, TaskStatus.pending.value,
-            )
+            if not deps:
+                await conn.execute(
+                    """UPDATE tasks SET status = $1, updated_at = $2
+                       WHERE id = $3 AND status = $4""",
+                    TaskStatus.ready.value, now, task_id, TaskStatus.pending.value,
+                )
             row = await conn.fetchrow("SELECT * FROM tasks WHERE id = $1", task_id)
         return self._row_to_task(row)
 
@@ -703,19 +807,24 @@ class PostgresClusterStore:
                        (id, title, requires, depends_on, priority, status,
                         created_at, updated_at, version, lane_key, role,
                         description, issues)
-                       VALUES ($1, $2, $3, '[]', $4, $5, $6, $6, 1, $7, $8, $9, $10)
+                       VALUES ($1, $2, $3, $4, $5, $6, $7, $7, 1, $8, $9, $10, $11)
                        ON CONFLICT (id) DO NOTHING""",
                     plan["task_id"], plan["title"],
                     _json_dumps(list(plan.get("requires") or [])),
+                    _json_dumps(list(plan.get("depends_on") or [])),
                     plan.get("priority", 3),
                     TaskStatus.pending.value, now,
                     plan.get("lane_key", ""), plan.get("role", "author"),
                     plan.get("description", ""),
                     _json_dumps(list(plan.get("issues") or [])),
                 )
-            # Promote ONLY this batch's rows (no dependencies at creation,
-            # mirroring create_task's status-guarded UPDATE).
-            ids = [plan["task_id"] for plan in plans]
+            # Promote ONLY this batch's dependency-free rows (see the SQLite
+            # twin: an unconditional promote of every batch id dropped the
+            # pending hold on plans that DO carry depends_on, #905).
+            # Mirrors create_task's status-guarded UPDATE.
+            ids = [plan["task_id"] for plan in plans
+                   if not plan.get("depends_on")]
+            all_ids = [plan["task_id"] for plan in plans]
             if ids:
                 await conn.execute(
                     f"""UPDATE tasks SET status = $1, updated_at = $2
@@ -724,7 +833,7 @@ class PostgresClusterStore:
                     TaskStatus.pending.value,
                 )
             rows = await conn.fetch(
-                "SELECT * FROM tasks WHERE id = ANY($1::text[])", ids)
+                "SELECT * FROM tasks WHERE id = ANY($1::text[])", all_ids)
         return [self._row_to_task(r) for r in rows]
 
     async def get_task(self, task_id: str) -> Optional[Task]:
@@ -792,6 +901,43 @@ class PostgresClusterStore:
             """UPDATE tasks SET status = $1, updated_at = $2, version = version + 1
                WHERE id = $3 AND status = $4""",
             TaskStatus.pending.value, _utcnow(), task_id, TaskStatus.blocked.value,
+        )
+        return n > 0
+
+    async def set_task_ballot(self, task_id: str, ballot: Optional[dict]) -> bool:
+        """Record a decision ballot on the task (#894). None clears it."""
+        import json as _json
+        payload = None if ballot is None else _json.dumps(ballot, default=str)
+        n = await self._exec_status_rowcount(
+            """UPDATE tasks SET ballot = $1, updated_at = $2, version = version + 1
+               WHERE id = $3""",
+            payload, _utcnow(), task_id,
+        )
+        return n > 0
+
+    async def set_task_cancel_requeue(self, task_id: str,
+                                      requeue: bool) -> bool:
+        """Record the cancel re-queue INTENT on the task row (#911).
+
+        The /cancel handler writes this BEFORE the status flip (the
+        ballot-before-blocked ordering rule from #894: a reader that sees
+        the state must never miss the record that authorized it).
+        """
+        n = await self._exec_status_rowcount(
+            """UPDATE tasks SET cancel_requeue = $1, updated_at = $2,
+               version = version + 1 WHERE id = $3""",
+            bool(requeue), _utcnow(), task_id,
+        )
+        return n > 0
+
+    async def unblock_to_ready(self, task_id: str) -> bool:
+        """#894: /answer path — blocked (with an answered ballot) goes back to
+        ``ready`` so lane affinity re-dispatches it to the SAME worker.
+        Guarded single statement mirrors unblock_task."""
+        n = await self._exec_status_rowcount(
+            """UPDATE tasks SET status = $1, updated_at = $2, version = version + 1
+               WHERE id = $3 AND status = $4""",
+            TaskStatus.ready.value, _utcnow(), task_id, TaskStatus.blocked.value,
         )
         return n > 0
 
@@ -920,6 +1066,12 @@ class PostgresClusterStore:
             description=(row["description"] or "") if "description" in row.keys() else "",
             issues=(_json_loads(row["issues"])
                     if "issues" in row.keys() and row["issues"] else []),
+            ballot=(parse_ballot_column(row["ballot"])
+                    if "ballot" in row.keys() else None),
+            cancel_requeue=(row["cancel_requeue"]
+                            if "cancel_requeue" in row.keys()
+                            and row["cancel_requeue"] is not None
+                            else None),
         )
 
     # -------------------------------------------------------------------

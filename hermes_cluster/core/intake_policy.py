@@ -41,6 +41,10 @@ env-var wiring, so an unconfigured main node does not change behavior)::
           lane_branch: "env/dev"   # default target branch of the lane key
           lane_branches: {"hermes-agent-cluster": "main"}  # repo -> branch
           max_bundle_size: 40      # owner intent 30-40 issues/sitting
+          accumulate_window_s: 0   # band>0 bundles keep accumulating until
+                                   # the OLDEST waiting issue has aged this
+                                   # many seconds (0 = off, today's shape;
+                                   # band-0 and cap-full batches never wait)
         allowed_endpoints: []      # FILE-SEED ONLY (see below) — extra hosts
 
 Label semantics: a scope with an empty/absent ``label`` ingests EVERY open

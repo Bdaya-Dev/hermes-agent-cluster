@@ -417,6 +417,11 @@ def handle_cluster_submit(args: dict, **kwargs) -> str:
     for opt in ("role", "lane_key"):
         if args.get(opt):
             payload[opt] = args[opt]
+    # #905: depends_on rides the same submit — the verdict-gated landing task
+    # (#902) is created by a lane through THIS tool; a server that honors the
+    # field but a client that never forwards it leaves the gate unusable.
+    if args.get("depends_on"):
+        payload["depends_on"] = list(args["depends_on"])
     result = _api_call("POST", "/api/v1/tasks", payload)
     if isinstance(result, dict) and not result.get("error"):
         # #898: a deduped reviewer submit returned an EXISTING live task —
@@ -460,9 +465,67 @@ def handle_cluster_complete(args: dict, **kwargs) -> str:
 
 
 def handle_cluster_status(args: dict, **kwargs) -> str:
-    """Get cluster status."""
+    """Get cluster status.
+
+    Includes the Alibaba Token Plan metering summary (per-seat credits,
+    surplus, cycle end) so a lane or the Telegram bot can answer "how many
+    credits are left" from one call. Best-effort: an older main without
+    /api/v1/metering/alibaba, or a metering-disabled main, never breaks the
+    status surface — the key is simply absent or carries the error.
+    """
     result = _api_call("GET", "/api/v1/summary")
+    metering = _api_call("GET", "/api/v1/metering/alibaba")
+    if isinstance(metering, dict) and "error" not in metering:
+        # Trim to the answer lanes need: seats + totals + freshness, not the
+        # full last_errors instrument map.
+        result["metering"] = {
+            k: metering.get(k)
+            for k in ("enabled", "credits_available", "credits_remaining_total",
+                      "alert_below", "seats", "fetched_at", "last_error",
+                      "alert_active")
+        }
     return json.dumps(result, indent=2)
+
+
+def handle_cluster_block(args: dict, **kwargs) -> str:
+    """#894: park THIS task blocked on an owner decision ballot.
+
+    A lane that hits a decision it cannot make headless may either write the
+    escalation side-file (the executor's reap files the ballot) or call this
+    directly — same endpoint, same record.
+    """
+    task_id = args.get("task_id")
+    if not task_id:
+        return json.dumps({"error": "task_id is required"})
+    body = {
+        "question": args.get("question") or "",
+        "options": args.get("options") or [],
+    }
+    if args.get("class"):
+        body["class"] = args["class"]
+    # #912: carry the FORMAL ballot's address when one exists for this
+    # question — the answer then comes back with a decision_resolve directive.
+    if args.get("decision_ref"):
+        body["decision_ref"] = str(args["decision_ref"])
+    if args.get("decision_id"):
+        body["decision_id"] = str(args["decision_id"])
+    result = _api_call("POST", f"/api/v1/tasks/{task_id}/block", body)
+    return json.dumps(result)
+
+
+def handle_cluster_answer(args: dict, **kwargs) -> str:
+    """#894: record the owner's answer to a task's ballot and unblock it.
+
+    Normal flow is the Telegram relay; this tool exists for an operator (or a
+    lead session) answering from the cluster side.
+    """
+    task_id = args.get("task_id")
+    if not task_id:
+        return json.dumps({"error": "task_id is required"})
+    body = {"answer": args.get("answer") or "",
+            "answered_by": str(args.get("answered_by") or "")}
+    result = _api_call("POST", f"/api/v1/tasks/{task_id}/answer", body)
+    return json.dumps(result)
 
 
 def handle_cluster_config(args: dict, **kwargs) -> str:
@@ -525,6 +588,7 @@ SCHEMAS = {
                 "priority": {"type": "integer", "description": "Priority band, ascending sort: 0=most urgent, 1..5 documented bands (default 3)", "default": 3},
                 "role": {"type": "string", "enum": ["author", "reviewer"], "description": "Lane role: reviewer lanes spawn fresh-context on the reviewer tier"},
                 "lane_key": {"type": "string", "description": "Stateful lane identity, e.g. '<repo>!<mr_iid>' for a reviewer lane"},
+                "depends_on": {"type": "array", "items": {"type": "string"}, "description": "Task IDs that must COMPLETE before this task may run (#905). The create handler honors it — the task stays pending (not dispatchable) until every dependency completes; unknown ids are a 422."},
             },
             "required": ["title"],
         },
@@ -562,8 +626,48 @@ SCHEMAS = {
     },
     "kanban_cluster_status": {
         "name": "kanban_cluster_status",
-        "description": "Get cluster status summary.",
+        "description": ("Get cluster status summary, including the Alibaba "
+                        "Token Plan metering block (per-seat credits "
+                        "total/surplus/cycle_end + alert state) when the main "
+                        "exposes it — answers 'how many credits are left'."),
         "parameters": {"type": "object", "properties": {}},
+    },
+    "kanban_cluster_block": {
+        "name": "kanban_cluster_block",
+        "description": ("#894: park a task blocked on an owner decision ballot "
+                        "(question + options + class 'technical'|'product'). "
+                        "The hosted gateway relays the ballot to the owner's "
+                        "phone; the answer unblocks the task and resumes the "
+                        "same lane session. Preferred path for a cluster lane "
+                        "is the escalation side-file named in its brief — use "
+                        "this tool directly only from a lead/operator context."),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "task_id": {"type": "string", "description": "The blocked task."},
+                "question": {"type": "string", "description": "The decision, phrased for a phone."},
+                "options": {"type": "array", "items": {"type": "string"},
+                            "description": "The choices (rendered as native buttons + 'Other')."},
+                "class": {"type": "string", "description": "'technical' (default, owner DM) or 'product' (business group)."},
+                "decision_ref": {"type": "string", "description": "#912: the FORMAL ballot's address this question mirrors: 'group[/sub]/project#<iid>' (a decision_create-tier ballot). Malformed -> 422; omit only when no formal side exists."},
+                "decision_id": {"type": "string", "description": "#912: the formal ballot's id ('D14') when decision_ref names one."},
+            },
+            "required": ["task_id", "question"],
+        },
+    },
+    "kanban_cluster_answer": {
+        "name": "kanban_cluster_answer",
+        "description": ("#894: record the owner's answer to a task's ballot and "
+                        "unblock the task (re-dispatches to resume the lane)."),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "task_id": {"type": "string", "description": "The blocked task."},
+                "answer": {"type": "string", "description": "The chosen option text or free text."},
+                "answered_by": {"type": "string", "description": "Who answered (identity for the audit trail)."},
+            },
+            "required": ["task_id", "answer"],
+        },
     },
     "kanban_cluster_config": {
         "name": "kanban_cluster_config",
@@ -581,6 +685,8 @@ HANDLERS = {
     "kanban_cluster_heartbeat": handle_cluster_heartbeat,
     "kanban_cluster_complete": handle_cluster_complete,
     "kanban_cluster_status": handle_cluster_status,
+    "kanban_cluster_block": handle_cluster_block,
+    "kanban_cluster_answer": handle_cluster_answer,
     "kanban_cluster_config": handle_cluster_config,
 }
 

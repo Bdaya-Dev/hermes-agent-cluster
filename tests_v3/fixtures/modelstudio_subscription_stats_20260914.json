@@ -1,0 +1,17 @@
+{
+  "Data": {
+    "Items": [
+      {
+        "AssignedSeats": 2,
+        "SeatCredits": 458334.0,
+        "SeatRefreshTime": 1791450000000,
+        "SeatRemainingCredits": 191307.22449352,
+        "SeatType": "max",
+        "TotalSeats": 2
+      }
+    ],
+    "SubscriptionEndTime": 1791450000000,
+    "SubscriptionStartTime": 1788858000000
+  },
+  "Success": true
+}

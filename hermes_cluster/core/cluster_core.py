@@ -249,6 +249,9 @@ class ClusterCore:
         watchdog_offline_after: float = 30.0,
         # #892: node.min_free_disk_gb floor (None -> default 5.0, 0 -> rule off)
         min_free_disk_gb: Optional[float] = None,
+        # #879: node.max_cpu_load ceiling (None/0 -> rule off; lane-backlog
+        # and duplicate-executor rules stay always-on).
+        max_cpu_load: Optional[float] = None,
         # Lease timing
         lease_ttl_seconds: int = 60,
         lease_scan_rate_seconds: float = 10.0,
@@ -261,6 +264,8 @@ class ClusterCore:
         self.max_concurrent = max(0, int(max_concurrent))
         from .disk_preflight import effective_min_free_gb
         self._min_free_disk_gb = effective_min_free_gb(min_free_disk_gb)
+        # #879: main-side CPU ceiling for the watchdog's health rule.
+        self._max_cpu_load = float(max_cpu_load or 0.0)
         self.config_path = config_path
         self.started_at = datetime.utcnow()
 
@@ -320,6 +325,12 @@ class ClusterCore:
                         # #892: fire the disk rule on the last reported reading;
                         # None (older worker) keeps the staleness-only behaviour.
                         disk_free_gb=getattr(n, "disk_free_gb", None),
+                        # #879: fire the health rules on the last REPORTED
+                        # self-report; None per field keeps that rule inert.
+                        cpu_load_pct=getattr(n, "cpu_load_pct", None),
+                        lane_count=getattr(n, "lane_count", None),
+                        max_concurrent=int(getattr(n, "max_concurrent", 0) or 0),
+                        duplicate_executor=getattr(n, "duplicate_executor", None),
                     )
                     for n in nodes
                 ]
@@ -366,6 +377,9 @@ class ClusterCore:
             # #892: disk floor (node.min_free_disk_gb; None -> default 5.0,
             # 0 -> rule off — same resolution as the NodeManager path).
             min_free_disk_gb=self._min_free_disk_gb,
+            # #879: health self-report ceiling (node.max_cpu_load; 0/absent
+            # disables the CPU rule; the other two rules stay armed).
+            max_cpu_load=self._max_cpu_load,
         )
 
         # Lease timing

@@ -2,6 +2,7 @@
 
 from .nodes import router as nodes_router
 from .tasks import router as tasks_router
+from .tasks import ballots_router
 from .leases import router as leases_router
 from .sync import router as sync_router
 from .recovery import router as recovery_router
@@ -16,10 +17,14 @@ from .setup import router as setup_router
 
 from .cluster import router as cluster_router
 from .intake import router as intake_router
+from .metering import router as metering_router
+from .capabilities import router as capabilities_router
+from .lanes import router as lanes_router
 
 __all__ = [
     "nodes_router",
     "tasks_router",
+    "ballots_router",
     "leases_router",
     "sync_router",
     "recovery_router",
@@ -33,4 +38,5 @@ __all__ = [
     "setup_router",
     "cluster_router",
     "intake_router",
+    "lanes_router",
 ]

@@ -22,6 +22,7 @@ from .state import ClusterState
 from .routers import (
     nodes_router,
     tasks_router,
+    ballots_router,
     leases_router,
     sync_router,
     recovery_router,
@@ -35,6 +36,9 @@ from .routers import (
     setup_router,
     cluster_router,
     intake_router,
+    metering_router,
+    capabilities_router,
+    lanes_router,
 )
 from .routers import nodes as nodes_mod
 from .routers import tasks as tasks_mod
@@ -51,6 +55,9 @@ from .routers import visualization as visualization_mod
 from .routers import setup as setup_mod
 from .routers import cluster as cluster_mod
 from .routers import intake as intake_mod
+from .routers import metering as metering_mod
+from .routers import capabilities as capabilities_mod
+from .routers import lanes as lanes_mod
 import logging
 logger = logging.getLogger(__name__)
 
@@ -78,6 +85,10 @@ def create_app(
     # instance lock and hands its token down; "" = no identity declared
     # (older/manual launch — pre-#899 idempotent join semantics).
     instance_token: str = "",
+    # #879: node.max_cpu_load ceiling (YAML only, same discipline as #892).
+    # None/absent = 0 = CPU rule disabled; lane-backlog vs the node's declared
+    # max_concurrent and the duplicate-executor self-report stay armed.
+    node_max_cpu_load: Optional[float] = None,
 ) -> FastAPI:
     """Create and configure the FastAPI application.
 
@@ -174,7 +185,10 @@ def create_app(
     from .recovery.manager import RecoveryManager
 
     # Create managers (ClusterState implements the same API as ClusterStore)
-    _node_manager = NodeManager(state, min_free_disk_gb=node_min_free_disk_gb)
+    _node_manager = NodeManager(state, min_free_disk_gb=node_min_free_disk_gb,
+                                # #879: main-side CPU ceiling for the health
+                                # self-report rules (0/absent = rule off).
+                                max_cpu_load=node_max_cpu_load)
     _lease_manager = LeaseManager(state)
     _recovery_manager = RecoveryManager(state)
 
@@ -203,6 +217,10 @@ def create_app(
     # start an outbound connector that signs and POSTs join+heartbeat
     # to the main node. Without this, the worker only updates its local
     # store and the main never sees it.
+    # #879: pre-bind so the connector's lazy health probe sees "no executor
+    # yet" (fields omitted) instead of an unbound name when the executor
+    # block below is skipped (agent_executor not configured).
+    _agent_executor = None
     if node_role == "worker" and cluster_endpoint:
         from .core.worker_connector import start_worker_connector
         from .core.disk_preflight import effective_min_free_gb
@@ -217,6 +235,21 @@ def create_app(
         _disk_probe_path = str(
             (agent_executor_config or {}).get("working_dir", "") or ""
         )
+
+        # #879: lazy health probe — the executor is created AFTER the
+        # connector below, and the closure re-reads it every beat. None
+        # fields (executor not yet up, or a probe error) mean "no lane
+        # observation": the CPU reading still rides, and absent lane fields
+        # keep the main's lane/duplicate rules inert (older-worker contract).
+        def _health_probe():
+            try:
+                ex = _agent_executor
+                if ex is None:
+                    return None, False
+                return ex.live_spawns(), ex.duplicate_executor_observed()
+            except Exception:
+                return None, False
+
         start_worker_connector(
             node_id=state.node_id,
             cluster_endpoint=cluster_endpoint,
@@ -227,11 +260,13 @@ def create_app(
             disk_probe_path=_disk_probe_path,
             # #899: declare this process's instance identity at /join.
             instance_token=instance_token,
+            # #879: the executor's live spawns + duplicate observation ride
+            # every join/heartbeat as lane_count/duplicate_executor.
+            health_fn=_health_probe,
         )
 
     # Agent executor: when role=worker and agent_executor is configured+enabled,
     # start the poll loop that claims leased tasks and spawns bdaya workers.
-    _agent_executor = None
     if node_role == "worker" and cluster_endpoint and agent_executor_config:
         from .core.agent_executor import AgentExecutor, AgentExecutorConfig
         ae_cfg_dict = agent_executor_config or {}
@@ -288,11 +323,36 @@ def create_app(
     config_mod.init(state)
     visualization_mod.init(state)
     cluster_mod.init(state)
+    capabilities_mod.init(state)
     intake_mod.init(state)
+    lanes_mod.init(state)
+
+    # --- Alibaba Token Plan metering poller (main-side, same process as the
+    # intake poller). Gated: the thread only exists while metering.enabled is
+    # true in the runtime store (boot seed or a runtime PUT — the intake
+    # poller is gated the same way on its token env). A default-off node
+    # starts NO thread, no network, no SM read (and keeps test/CI processes
+    # clean — CI run 34828677799 exited 139 with an always-on idle daemon).
+    _metering_poller = None
+    if node_role == "main":
+        from .core.metering import MeteringPoller, _seed_metering_from_config_file
+        _seed_metering_from_config_file(state)
+        _metering_poller = MeteringPoller(state=state, hook_manager=hook_manager)
+        state._metering_poller = _metering_poller
+        if _metering_poller.ensure_started():
+            logger.info("Alibaba metering poller started "
+                        "(metering.enabled: true in runtime config)")
+    metering_mod.set_poller(_metering_poller)
+    # Turning metering on/off at runtime: PUT /api/v1/config carries the
+    # `metering` section (ConfigJSON extra=allow) -> post-save hook arms or
+    # disarms the loop without a redeploy.
+    config_mod.set_post_save_callback(
+        (lambda: _metering_poller.ensure_started()) if _metering_poller else None)
 
     # Register routers
     app.include_router(nodes_router)
     app.include_router(tasks_router)
+    app.include_router(ballots_router)
     app.include_router(leases_router)
     app.include_router(sync_router)
     app.include_router(recovery_router)
@@ -305,7 +365,10 @@ def create_app(
     app.include_router(visualization_router)
     app.include_router(setup_router)
     app.include_router(cluster_router)
+    app.include_router(capabilities_router)
+    app.include_router(lanes_router)
     app.include_router(intake_router)
+    app.include_router(metering_router)
 
     # Health endpoint (outside /api/v1)
     @app.get("/health")
@@ -377,15 +440,34 @@ def create_app(
             # is not.
             logger.exception("startup reschedule failed (continuing)")
 
+        # #906: the metering supervisor starts HERE (uvicorn lifespan), not in
+        # create_app() — bare app objects in tests/CI stay thread-free, while
+        # the running server reconciles metering.enabled -> poller live/armed
+        # every tick, without relying on a PUT through /api/v1/config.
+        if _metering_poller is not None:
+            _metering_poller.start_supervisor()
+
     # Shutdown handler — stop all background threads
     @app.on_event("shutdown")
     async def shutdown():
+        if _metering_poller is not None:
+            _metering_poller.stop_supervisor()
         _node_manager.stop_heartbeat_sender()
         _node_manager.stop_watchdog()
         _lease_manager.stop()
         _recovery_manager.stop_auto_recovery()
         if _agent_executor:
             _agent_executor.stop()
+        # The worker connector is a background loop like every other one
+        # above, and was the only one this handler did not stop — it had no
+        # stop path to call. Without it a worker's join/heartbeat thread
+        # outlives the app that started it: a reconfigure leaves the old
+        # connector beating beside the new one (two live executors for one
+        # node id is #899's incident), and in-process app tests leak a
+        # thread into every later test.
+        if node_role == "worker" and cluster_endpoint:
+            from .core.worker_connector import stop_worker_connector
+            stop_worker_connector()
 
     # Dashboard static file serving
     if static_dir:

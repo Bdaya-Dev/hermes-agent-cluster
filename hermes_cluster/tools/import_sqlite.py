@@ -46,6 +46,21 @@ TABLES = [
     "task_spawns",
 ]
 
+# SQLite has no boolean type: a flag is stored as INTEGER 0/1, while the
+# Postgres column is a real BOOLEAN. asyncpg is strict and refuses an int for a
+# BOOLEAN parameter ("a boolean is required (got type int)"), so the import
+# aborts on the first node row. Caught by CI on #907 — the local suite SKIPS
+# these tests without a Postgres, so a green local run says nothing about this
+# path. Any future boolean column must be added here.
+_BOOL_COLUMNS = {
+    "nodes": ["drained", "duplicate_executor"],
+    # #911: the cancel re-queue intent — SQLite INTEGER 0/1 vs Postgres
+    # BOOLEAN, same coercion requirement as every flag above (the module
+    # comment: any future boolean column must be added here). NULL (no
+    # intent recorded) passes through as None untouched.
+    "tasks": ["cancel_requeue"],
+}
+
 # ISO-datetime TEXT columns in SQLite -> TIMESTAMPTZ in Postgres.
 _DT_COLUMNS = {
     "nodes": ["last_heartbeat"],
@@ -142,6 +157,7 @@ async def import_sqlite(db_path: str, dsn: str) -> Dict[str, int]:
             columns = list(rows[0].keys())
             sql = _upsert_sql(table, columns)
             dt_cols = set(_DT_COLUMNS.get(table, []))
+            bool_cols = set(_BOOL_COLUMNS.get(table, []))
             batch: List[tuple] = []
             for row in rows:
                 vals: List[Any] = []
@@ -149,6 +165,9 @@ async def import_sqlite(db_path: str, dsn: str) -> Dict[str, int]:
                     v = row[c]
                     if c in dt_cols:
                         vals.append(_parse_dt(v))
+                    elif c in bool_cols:
+                        # NULL stays NULL (column default applies); 0/1 -> bool.
+                        vals.append(None if v is None else bool(v))
                     elif table == "sync_log" and c == "timestamp":
                         # BIGINT epoch in both backends — pass through.
                         vals.append(int(v or 0))

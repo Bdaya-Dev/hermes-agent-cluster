@@ -44,6 +44,7 @@ from ..core.scheduler import (
     FairScheduler,
     lane_blocked_ready_ids,
 )
+from ..core.ballot import parse_ballot_column
 from ..core.lane_affinity import AffinityScheduler
 
 logger = logging.getLogger(__name__)
@@ -107,7 +108,11 @@ CREATE TABLE IF NOT EXISTS nodes (
     max_concurrent INTEGER DEFAULT 0,
     disk_free_gb REAL,
     status_reason TEXT DEFAULT '',
-    instance_token TEXT DEFAULT ''
+    instance_token TEXT DEFAULT '',
+    drained INTEGER DEFAULT 0,
+    cpu_load_pct REAL,
+    lane_count INTEGER,
+    duplicate_executor INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS tasks (
@@ -126,7 +131,14 @@ CREATE TABLE IF NOT EXISTS tasks (
     result TEXT,
     -- #762 grouped intake: bundle brief + restart-safe membership.
     description TEXT DEFAULT '',
-    issues TEXT DEFAULT '[]'
+    issues TEXT DEFAULT '[]',
+    -- #894: the lane's decision ballot (JSON: question/options/class/
+    -- asked_at/answer/answered_at/answered_by). Set on escalation, read by
+    -- the gateway relay, filled by POST /tasks/{id}/answer.
+    ballot TEXT,
+    -- #911: the cancel's re-queue intent (NULL = never cancelled through an
+    -- intent-aware path -> legacy release semantics; 0 = hold, 1 = release).
+    cancel_requeue INTEGER
 );
 
 -- Stateful lanes: one row per lane_key, keyed to the hermes session it owns.
@@ -338,6 +350,12 @@ class ClusterStore:
             # #762 grouped intake: bundle brief + membership columns.
             ("tasks", "description", "ALTER TABLE tasks ADD COLUMN description TEXT DEFAULT ''"),
             ("tasks", "issues", "ALTER TABLE tasks ADD COLUMN issues TEXT DEFAULT '[]'"),
+            # #894: the lane's decision ballot (JSON TEXT) on old DBs.
+            ("tasks", "ballot", "ALTER TABLE tasks ADD COLUMN ballot TEXT"),
+            # #911: the cancel's re-queue intent (NULL = never cancelled
+            # through an intent-aware path -> legacy release semantics).
+            ("tasks", "cancel_requeue",
+             "ALTER TABLE tasks ADD COLUMN cancel_requeue INTEGER"),
         ):
             try:
                 cols = [r[1] for r in self._conn.execute(f"PRAGMA table_info({table})")]
@@ -368,6 +386,26 @@ class ClusterStore:
                 self._conn.execute(
                     "ALTER TABLE nodes ADD COLUMN instance_token TEXT DEFAULT ''"
                 )
+            # #907: operator drain. A separate column, NOT a capability strip:
+            # register_node's re-join path rewrites `capabilities` from the
+            # worker's own config, so a drain expressed there is erased on the
+            # next heartbeat. Nothing on the registration path writes this.
+            if "drained" not in node_cols:
+                self._conn.execute(
+                    "ALTER TABLE nodes ADD COLUMN drained INTEGER DEFAULT 0"
+                )
+            # #879: worker health self-report (join/heartbeat payloads).
+            # Nullable: NULL = never reported (older worker) → the health
+            # rules never fire, exactly like disk_free_gb above.
+            if "cpu_load_pct" not in node_cols:
+                self._conn.execute(
+                    "ALTER TABLE nodes ADD COLUMN cpu_load_pct REAL")
+            if "lane_count" not in node_cols:
+                self._conn.execute(
+                    "ALTER TABLE nodes ADD COLUMN lane_count INTEGER")
+            if "duplicate_executor" not in node_cols:
+                self._conn.execute(
+                    "ALTER TABLE nodes ADD COLUMN duplicate_executor INTEGER")
         except Exception as e:
             logger.warning("nodes.max_concurrent migration skipped: %s", e)
         # PR#16 (stateful lanes): lanes table + idle-reap activity clock.
@@ -425,15 +463,39 @@ class ClusterStore:
         now = datetime.utcnow()
         with self._tx() as conn:
             conn.execute(
-                """INSERT OR REPLACE INTO nodes
+                # #907: ON CONFLICT, not INSERT OR REPLACE. REPLACE deletes
+                # the row and re-inserts it, which resets every column the
+                # INSERT omits — including `drained`, handing work straight
+                # back to a node the operator had drained. The SET list below
+                # is exactly the worker-owned columns; drain is operator state
+                # and must survive anything a worker does.
+                """INSERT INTO nodes
                    (id, name, capabilities, status, last_heartbeat, load, max_concurrent,
-                    disk_free_gb, status_reason, instance_token)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    disk_free_gb, status_reason, instance_token,
+                    cpu_load_pct, lane_count, duplicate_executor)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(id) DO UPDATE SET
+                     name = excluded.name,
+                     capabilities = excluded.capabilities,
+                     status = excluded.status,
+                     last_heartbeat = excluded.last_heartbeat,
+                     load = excluded.load,
+                     max_concurrent = excluded.max_concurrent,
+                     disk_free_gb = excluded.disk_free_gb,
+                     status_reason = excluded.status_reason,
+                     instance_token = excluded.instance_token,
+                     cpu_load_pct = excluded.cpu_load_pct,
+                     lane_count = excluded.lane_count,
+                     duplicate_executor = excluded.duplicate_executor""",
                 (node.id, node.name, _json_dumps(node.capabilities),
                  node.status.value, _dt_to_str(node.last_heartbeat), node.load,
                  node.max_concurrent, node.disk_free_gb,
                  getattr(node, "status_reason", ""),
-                 getattr(node, "instance_token", "")),
+                 getattr(node, "instance_token", ""),
+                 getattr(node, "cpu_load_pct", None),
+                 getattr(node, "lane_count", None),
+                 (None if getattr(node, "duplicate_executor", None) is None
+                  else int(bool(node.duplicate_executor)))),
             )
         if self._on_node_online:
             try:
@@ -455,7 +517,10 @@ class ClusterStore:
 
     def update_heartbeat(self, node_id: str, load: float = 0.0,
                          disk_free_gb: Optional[float] = None,
-                         status_reason: str = "") -> None:
+                         status_reason: str = "",
+                         cpu_load_pct: Optional[float] = None,
+                         lane_count: Optional[int] = None,
+                         duplicate_executor: Optional[bool] = None) -> None:
         now = datetime.utcnow()
         # #892: status follows the caller's verdict — NodeManager passes
         # status_reason when the reported disk is below the floor, and the
@@ -464,21 +529,29 @@ class ClusterStore:
         # schedulable through the 2026-09-14 incident). An empty reason keeps
         # the old force-online semantics; disk_free_gb None (older worker)
         # keeps whatever the stored column holds.
+        # #879: the reason may also come from the health self-report, and the
+        # raw observations are recorded the same way — a None report field
+        # keeps the stored column (an older worker's beat says nothing).
         status = NodeStatus.degraded.value if status_reason else NodeStatus.online.value
+        sets = ["last_heartbeat = ?", "status = ?", "load = ?",
+                "status_reason = ?"]
+        params = [_dt_to_str(now), status, load, status_reason]
+        if disk_free_gb is not None:
+            sets.append("disk_free_gb = ?")
+            params.append(float(disk_free_gb))
+        if cpu_load_pct is not None:
+            sets.append("cpu_load_pct = ?")
+            params.append(float(cpu_load_pct))
+        if lane_count is not None:
+            sets.append("lane_count = ?")
+            params.append(int(lane_count))
+        if duplicate_executor is not None:
+            sets.append("duplicate_executor = ?")
+            params.append(int(bool(duplicate_executor)))
+        params.append(node_id)
         with self._tx() as conn:
-            if disk_free_gb is None:
-                conn.execute(
-                    "UPDATE nodes SET last_heartbeat = ?, status = ?, load = ?, "
-                    "status_reason = ? WHERE id = ?",
-                    (_dt_to_str(now), status, load, status_reason, node_id),
-                )
-            else:
-                conn.execute(
-                    "UPDATE nodes SET last_heartbeat = ?, status = ?, load = ?, "
-                    "disk_free_gb = ?, status_reason = ? WHERE id = ?",
-                    (_dt_to_str(now), status, load, float(disk_free_gb),
-                     status_reason, node_id),
-                )
+            conn.execute(
+                f"UPDATE nodes SET {', '.join(sets)} WHERE id = ?", params)
 
     def update_capabilities(self, node_id: str, caps: List[str]) -> None:
         with self._lock:
@@ -498,6 +571,23 @@ class ClusterStore:
                 self._on_capability_change(node_id, old_caps, caps)
             except Exception:
                 pass
+
+    def set_drained(self, node_id: str, drained: bool) -> None:
+        """Drain or un-drain a node (#907) — OPERATOR state, never worker state.
+
+        A drained node is handed NOTHING by the scheduler, including tasks with
+        an empty ``requires``. Deliberately separate from ``capabilities``:
+        ``register_node``'s re-join path refreshes capabilities from whatever
+        the worker declares locally, so a drain expressed as a capability strip
+        is erased the moment the worker checks in — which is exactly what
+        happened on 2026-09-15 to a node that could not write lane results.
+        Nothing on the worker's registration path touches this column.
+        """
+        with self._tx() as conn:
+            conn.execute(
+                "UPDATE nodes SET drained = ? WHERE id = ?",
+                (1 if drained else 0, node_id),
+            )
 
     def update_max_concurrent(self, node_id: str, max_concurrent: int) -> None:
         """Update a node's concurrency ceiling (re-join may re-declare it)."""
@@ -568,6 +658,20 @@ class ClusterStore:
             # join = pre-#899 idempotent semantics).
             instance_token=(row["instance_token"]
                             if "instance_token" in row.keys() else ""),
+            # #907: operator drain. Absent column (pre-migration row read
+            # mid-flight) reads as NOT drained — the safe default is that a
+            # node keeps working, never that the fleet silently goes dark.
+            drained=bool(row["drained"]) if "drained" in row.keys() else False,
+            # #879: health self-report columns; absent (pre-migration) or
+            # NULL (never reported) read as None — rules stay inert.
+            cpu_load_pct=(row["cpu_load_pct"]
+                          if "cpu_load_pct" in row.keys() else None),
+            lane_count=(row["lane_count"]
+                        if "lane_count" in row.keys() else None),
+            duplicate_executor=(
+                bool(row["duplicate_executor"])
+                if ("duplicate_executor" in row.keys()
+                    and row["duplicate_executor"] is not None) else None),
         )
 
     # -------------------------------------------------------------------
@@ -584,34 +688,38 @@ class ClusterStore:
         role: str = "author",
         description: str = "",
         issues: Optional[List[str]] = None,
+        depends_on: Optional[List[str]] = None,
     ) -> Task:
         now = datetime.utcnow()
+        deps = list(depends_on or [])
         with self._tx() as conn:
             conn.execute(
                 """INSERT OR IGNORE INTO tasks
                    (id, title, requires, depends_on, priority, status, created_at, updated_at, version, lane_key, role, description, issues)
-                   VALUES (?, ?, ?, '[]', ?, ?, ?, ?, 1, ?, ?, ?, ?)""",
-                (task_id, title, _json_dumps(requires), priority,
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?)""",
+                (task_id, title, _json_dumps(requires), _json_dumps(deps), priority,
                  TaskStatus.pending.value, _dt_to_str(now), _dt_to_str(now),
                  lane_key, role, description, _json_dumps(list(issues or []))),
             )
-        # Promote to ready immediately if no dependencies (matching ClusterState behavior)
-        # The original in-memory store returns by reference so the caller
-        # sees the promotion after trigger_pending_tasks(). SQLite returns
-        # a copy, so we must promote here for API compatibility.
-        # create_task always creates with empty depends_on, so promote immediately
-        with self._tx() as conn:
-            conn.execute(
-                """UPDATE tasks SET status = ?, updated_at = ?
-                   WHERE id = ? AND status = ?""",
-                (TaskStatus.ready.value, _dt_to_str(datetime.utcnow()),
-                 task_id, TaskStatus.pending.value),
-            )
+        # Promote to ready immediately when there are no dependencies (matching
+        # ClusterState behavior). #905: with deps, the row stays pending —
+        # trigger_pending_tasks() is the single gate that promotes it once
+        # every dependency completes. The store returns a copy, so the
+        # dep-free promote happens here for API compatibility.
+        if not deps:
+            with self._tx() as conn:
+                conn.execute(
+                    """UPDATE tasks SET status = ?, updated_at = ?
+                       WHERE id = ? AND status = ?""",
+                    (TaskStatus.ready.value, _dt_to_str(datetime.utcnow()),
+                     task_id, TaskStatus.pending.value),
+                )
         return self.get_task(task_id) or Task(
             id=task_id, title=title, requires=requires, priority=priority,
             status=TaskStatus.pending, created_at=now, updated_at=now, version=1,
             lane_key=lane_key, role=role,
             description=description, issues=list(issues or []),
+            depends_on=deps,
         )
 
     def create_tasks_batch(self, plans: List[Dict[str, Any]]) -> List[Task]:
@@ -635,27 +743,33 @@ class ClusterStore:
                 conn.execute(
                     """INSERT OR IGNORE INTO tasks
                        (id, title, requires, depends_on, priority, status, created_at, updated_at, version, lane_key, role, description, issues)
-                       VALUES (?, ?, ?, '[]', ?, ?, ?, ?, 1, ?, ?, ?, ?)""",
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?)""",
                     (plan["task_id"], plan["title"],
                      _json_dumps(list(plan.get("requires") or [])),
+                     _json_dumps(list(plan.get("depends_on") or [])),
                      plan.get("priority", 3),
                      TaskStatus.pending.value, now_s, now_s,
                      plan.get("lane_key", ""), plan.get("role", "author"),
                      plan.get("description", ""),
                      _json_dumps(list(plan.get("issues") or []))),
                 )
-            # Promote ONLY this batch's rows (no dependencies at creation,
-            # mirroring create_task's per-id guarded UPDATE — a global
+            # Promote ONLY this batch's dependency-free rows (#905: an
+            # unconditional promote of every batch id silently dropped the
+            # pending hold on plans that DO carry depends_on — the in-memory
+            # twin honors them; the persistent stores must not skew).
+            # Mirrors create_task's status-guarded UPDATE — a global
             # status-filter UPDATE would wrongly promote dependency-held
-            # pending tasks created by other callers).
-            ids = [plan["task_id"] for plan in plans]
+            # pending tasks created by other callers.
+            ids = [plan["task_id"] for plan in plans
+                   if not plan.get("depends_on")]
             placeholders = ",".join("?" for _ in ids)
-            conn.execute(
-                f"""UPDATE tasks SET status = ?, updated_at = ?
-                    WHERE id IN ({placeholders}) AND status = ?""",
-                [TaskStatus.ready.value, now_s] + ids
-                + [TaskStatus.pending.value],
-            )
+            if ids:
+                conn.execute(
+                    f"""UPDATE tasks SET status = ?, updated_at = ?
+                        WHERE id IN ({placeholders}) AND status = ?""",
+                    [TaskStatus.ready.value, now_s] + ids
+                    + [TaskStatus.pending.value],
+                )
         out: List[Task] = []
         for plan in plans:
             task = self.get_task(plan["task_id"])
@@ -751,6 +865,48 @@ class ClusterStore:
                 """UPDATE tasks SET status = ?, updated_at = ?, version = version + 1
                    WHERE id = ? AND status = ?""",
                 (TaskStatus.pending.value, _dt_to_str(now), task_id, TaskStatus.blocked.value),
+            )
+            return result.rowcount > 0
+
+    def set_task_ballot(self, task_id: str, ballot: Optional[dict]) -> bool:
+        """Record a decision ballot on the task (#894). None clears it."""
+        import json as _json
+        now = datetime.utcnow()
+        payload = None if ballot is None else _json.dumps(ballot, default=str)
+        with self._tx() as conn:
+            result = conn.execute(
+                "UPDATE tasks SET ballot = ?, updated_at = ?, version = version + 1 WHERE id = ?",
+                (payload, _dt_to_str(now), task_id),
+            )
+            return result.rowcount > 0
+
+    def set_task_cancel_requeue(self, task_id: str, requeue: bool) -> bool:
+        """Record the cancel re-queue INTENT on the task row (#911).
+
+        The /cancel handler writes this BEFORE the status flip (the
+        ballot-before-blocked ordering rule from #894: a reader that sees
+        the state must never miss the record that authorized it).
+        """
+        now = datetime.utcnow()
+        with self._tx() as conn:
+            result = conn.execute(
+                "UPDATE tasks SET cancel_requeue = ?, updated_at = ?, "
+                "version = version + 1 WHERE id = ?",
+                (1 if requeue else 0, _dt_to_str(now), task_id),
+            )
+            return result.rowcount > 0
+
+    def unblock_to_ready(self, task_id: str) -> bool:
+        """#894: /answer path — blocked (with an answered ballot) goes back to
+        ``ready``, not ``pending``: lane affinity then re-dispatches it to the
+        SAME worker holding the lane session. Guarded single statement like
+        unblock_task."""
+        now = datetime.utcnow()
+        with self._tx() as conn:
+            result = conn.execute(
+                """UPDATE tasks SET status = ?, updated_at = ?, version = version + 1
+                   WHERE id = ? AND status = ?""",
+                (TaskStatus.ready.value, _dt_to_str(now), task_id, TaskStatus.blocked.value),
             )
             return result.rowcount > 0
 
@@ -900,6 +1056,11 @@ class ClusterStore:
             description=(row["description"] or "") if "description" in keys else "",
             issues=(_json_loads(row["issues"])
                     if "issues" in keys and row["issues"] else []),
+            ballot=(parse_ballot_column(row["ballot"])
+                    if "ballot" in keys else None),
+            cancel_requeue=(row["cancel_requeue"] if "cancel_requeue" in keys
+                            and row["cancel_requeue"] is not None
+                            else None),
         )
 
     # -------------------------------------------------------------------
