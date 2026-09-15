@@ -29,6 +29,11 @@ from ..core.ballot import (
     validate_answer,
 )
 from ..state import ClusterState
+from ..core.landing_gate import (
+    authoring_lanes,
+    hold_reason as landing_hold_reason,
+    landing_artifact,
+)
 
 router = APIRouter(prefix="/api/v1/tasks", tags=["tasks"])
 
@@ -242,6 +247,39 @@ async def submit_task(req: SubmitTaskRequest):
             if (t.role == "reviewer" and t.lane_key == req.lane_key
                     and t.status in _LIVE_REVIEWER):
                 return {**t.model_dump(), "deduped": True}
+
+    # #913 spec 2 (identity, refused at the boundary — a held-but-created
+    # landing still costs a row; a self-landing is never even creatable):
+    # a landing task may not be submitted ON the reviewer lane of its
+    # artifact (a reviewer lands nothing) nor on a lane that AUTHORED it
+    # (carries the artifact in `issues`) — RV-1 mechanically. A lead-
+    # authored MR has neither lane on the board, so both checks pass
+    # vacuously there — and the verdict gate (hold_reason at every
+    # promotion) is what stops the rejected-review auto-spawn.
+    _pending_landing = None
+    _probe = Task(id="_probe", title=req.title, requires=req.requires,
+                  lane_key=req.lane_key or "", role=req.role or "author")
+    _pending_landing = landing_artifact(_probe)
+    if _pending_landing is not None:
+        _repo, _n = _pending_landing
+        _target = f"{_repo}!{_n}"
+        _lane = (req.lane_key or "").strip()
+        if _lane and _lane == _target:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"landing refused (#913): lane {_lane!r} is the "
+                    f"reviewer lane of {_target} — a reviewer never lands "
+                    "what it reviewed (RV-1). Use '<repo>#land-<n>'."))
+        if _lane and _lane in authoring_lanes(_state.get_all_tasks(),
+                                              _repo, _n):
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"landing refused (#913): lane {_lane!r} authored "
+                    f"{_target} (carries it in issues) — author != lander "
+                    "(RV-1 is not negotiable). A dedicated lander lane "
+                    "'<repo>#land-<n>' on a reviewer's PASS at the head."))
 
     # #907: a capability NO registered node advertises can never be matched by
     # scheduler.node_can_run, so the task is accepted and then queues FOREVER —
@@ -737,7 +775,14 @@ async def get_trigger_chain(task_id: str):
 
 
 def _trigger_downstream(task_id: str):
-    """When a task completes, check if any dependent tasks can now be promoted."""
+    """When a task completes, check if any dependent tasks can now be promoted.
+
+    #913: promotion of a LANDING dependent runs the verdict gate FIRST —
+    completion of the reviewer is an EVENT, not a PASS. The store's
+    trigger_pending_tasks applies the same rule on every sweep; this path
+    (the auto-spawn boundary) must not bypass it, which is exactly how the
+    measured landers reached ready on rejected reviews.
+    """
     dependents = _state.get_dependents(task_id)
     for dep_id in dependents:
         dep_task = _state.get_task(dep_id)
@@ -749,8 +794,18 @@ def _trigger_downstream(task_id: str):
             and d.status == TaskStatus.completed
             for d_id in dep_task.depends_on
         )
-        if all_done:
-            _state.set_task_status(dep_id, TaskStatus.ready)
+        if not all_done:
+            continue
+        reason = landing_hold_reason(_state.get_all_tasks(), dep_task)
+        if reason is not None:
+            # Held, not promoted: stay pending with the violated gate
+            # recorded (#913). The sweep re-evaluates after every event,
+            # so a later fresh-PASS round at the named sha releases it.
+            if (dep_task.fail_reason or "") != reason:
+                _state.set_task_status(
+                    dep_id, TaskStatus.pending, fail_reason=reason)
+            continue
+        _state.set_task_status(dep_id, TaskStatus.ready)
     # Then schedule any newly ready tasks
     _state.schedule_pending()
 

@@ -39,6 +39,7 @@ from ..core.scheduler import (
     lane_blocked_ready_ids,
 )
 from ..core.lane_affinity import AffinityScheduler
+from ..core.landing_gate import hold_reason as landing_hold_reason
 
 
 def _generate_id(prefix: str = "") -> str:
@@ -787,26 +788,39 @@ class ClusterState:
             )
 
     def trigger_pending_tasks(self) -> int:
-        """Promote pending tasks with all dependencies met to ready. Returns count promoted."""
+        """Promote pending tasks with all dependencies met to ready. Returns count promoted.
+
+        #913: a LANDING task (lane '<repo>#land-<n>' or 'LAND'-titled) is
+        promoted ONLY if the board's latest reviewer verdict on its artifact
+        is an un-superseded PASS pinning a sha the landing names — a
+        rejected or verdict-less review never auto-spawns a merge. The hold
+        records WHY in fail_reason; operators keep the ungated /advance.
+        """
         promoted = 0
         with self._tasks_lock:
+            snapshot = list(self._tasks.values())
             for task in self._tasks.values():
                 if task.status != TaskStatus.pending:
                     continue
                 if not task.depends_on:
-                    task.status = TaskStatus.ready
-                    task.updated_at = datetime.utcnow()
-                    promoted += 1
+                    ready = True
                 else:
-                    all_done = all(
+                    ready = all(
                         self._tasks.get(dep_id) is not None
                         and self._tasks[dep_id].status == TaskStatus.completed
                         for dep_id in task.depends_on
                     )
-                    if all_done:
-                        task.status = TaskStatus.ready
+                if not ready:
+                    continue
+                reason = landing_hold_reason(snapshot, task)
+                if reason is not None:
+                    if task.fail_reason != reason:
+                        task.fail_reason = reason
                         task.updated_at = datetime.utcnow()
-                        promoted += 1
+                    continue
+                task.status = TaskStatus.ready
+                task.updated_at = datetime.utcnow()
+                promoted += 1
         return promoted
 
     def schedule_pending(self) -> int:
