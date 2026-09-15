@@ -63,6 +63,13 @@ Grouping rules (each cites its doctrine home)
   once the current bundle task is terminal (one lane, many sittings, one MR
   per sitting). Which issues join is decided by area co-bundling (§area
   packing below) and band order, never by issue number.
+* ACCUMULATION WINDOW (LFP-1 completion): ``accumulate_window_s > 0`` holds
+  a band>0 lane's waiting candidates UNBUNDLED until the OLDEST has aged
+  past the window, so a bundle is a time-boxed accumulation instead of
+  "whatever one planning pass happened to see". Without it, steady-state
+  arrivals between sittings each mint a single-issue lane — the 1:1 shape
+  #762 was filed to kill. Band 0 (#886) and cap-full batches never wait;
+  unknown age fails OPEN. Default 0 = off (pre-window shape preserved).
 * PROOF IS NOT DILUTED: the bundle brief tells the lane each issue still
   needs its own scoped proof and disposition, and the MR ``Refs`` — never
   ``Closes`` — every issue (VP-1 close gate fires on merge otherwise).
@@ -92,6 +99,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 from pydantic import BaseModel, Field, field_validator
@@ -130,6 +138,28 @@ class GroupingConfig(BaseModel):
         default_factory=lambda: list(DEFAULT_SKIP_LABEL_PATTERNS))
     # GitLab link types whose source blocks the target.
     blocker_link_types: List[str] = Field(default_factory=lambda: ["is_blocked_by", "blocked_by"])
+    # ACCUMULATION WINDOW (LFP-1 completion, lane cluster-lfp1-accumulation):
+    # seconds a band>0 lane's waiting candidates keep accumulating into ONE
+    # bundle before a sitting is minted. Grouping without a window bundles
+    # only what the planning pass sees at one instant: in steady state
+    # (issues arriving one or two per poll cycle) every lane reaps its
+    # sitting and then mints a single-issue sitting for the one arrival —
+    # the 1:1 issue-per-lane shape #762 exists to kill. A window makes the
+    # bundle a time-boxed accumulation instead. Exemptions (each pinned in
+    # tests): 0 = OFF reproduces pre-window behavior byte-for-byte; band 0
+    # (business team, #886) never waits; a batch already at
+    # ``max_bundle_size`` goes now (the owner sitting target is met). Age
+    # anchors on GitLab's issue ``created_at``, so enabling this NEVER
+    # strands a standing backlog behind the window and a main restart
+    # cannot reset the clock.
+    accumulate_window_s: int = 0
+
+    @field_validator("accumulate_window_s")
+    @classmethod
+    def _check_window(cls, v: int) -> int:
+        if v < 0:
+            raise ValueError("accumulate_window_s must be >= 0 (0 = window off)")
+        return v
 
     @field_validator("max_bundle_size")
     @classmethod
@@ -209,6 +239,71 @@ def _area_cluster(issue: Dict[str, Any]) -> str:
         if l.startswith("area::"):
             return l
     return ""
+
+
+def parse_gitlab_time(value: Any) -> Optional[datetime]:
+    """GitLab payload timestamp (UTC ISO, ``...Z`` or offset, sometimes
+    naive) as an aware UTC datetime; None when missing/unparseable.
+
+    FAIL-OPEN by design: an unknown age must never silently stall intake
+    behind the accumulation window — the caller treats None as "old enough,
+    release the bundle" (the pre-window behavior).
+    """
+    if not isinstance(value, str) or not value.strip():
+        return None
+    s = value.strip()
+    if s.endswith(("Z", "z")):
+        s = s[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(s)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def oldest_candidate_age_s(issues: Iterable[Dict[str, Any]],
+                           now: Optional[datetime] = None) -> Optional[float]:
+    """Seconds since the OLDEST parseable ``created_at`` among the issues,
+    or None when no issue carries one (fail open)."""
+    ages: List[float] = []
+    for iss in issues:
+        dt = parse_gitlab_time(iss.get("created_at"))
+        if dt is None:
+            continue
+        ref = now or datetime.now(timezone.utc)
+        ages.append(max(0.0, (ref - dt).total_seconds()))
+    return max(ages) if ages else None
+
+
+def should_accumulate(*, batch_size: int, top_band: int,
+                      oldest_age_s: Optional[float],
+                      config: GroupingConfig) -> bool:
+    """True = HOLD this batch back and keep accumulating (no sitting minted
+    yet). The three exemptions are each load-bearing (pinned in
+    tests_v3/test_intake_accumulation_lfp1.py):
+
+    * window OFF (0, the default) -> never hold: byte-for-byte the pre-
+      window #762 behavior;
+    * band 0 (business team, #886) -> never hold: Sami/emad stay instant —
+      the same exception the cardinality guard already carries;
+    * batch already at ``max_bundle_size`` -> never hold: the owner's
+      per-sitting target (30-40) is met; waiting longer only delays a full
+      sitting while surplus arrivals ride the NEXT window anyway;
+    * unknown age (no parseable created_at anywhere in the batch) ->
+      never hold (fail OPEN: bad data must not stall intake — #895/#903
+      lesson).
+    """
+    if config.accumulate_window_s <= 0:
+        return False
+    if top_band == 0:
+        return False
+    if batch_size >= config.max_bundle_size:
+        return False
+    if oldest_age_s is None:
+        return False
+    return oldest_age_s < config.accumulate_window_s
 
 
 def filter_candidates(
@@ -305,6 +400,19 @@ def bundle_plan_for_repo(
             return None                     # one queued sitting at a time
         if any(b == 0 for _, b in queued):
             return None                     # band-0 bundle already queued
+    # ACCUMULATION WINDOW (LFP-1 completion): band>0 lanes keep accumulating
+    # until the OLDEST waiting candidate has aged past the window (or the
+    # batch is already cap-size). Without this, grouping only bundles what
+    # ONE planning pass sees: in steady state every arrival mints its own
+    # single-issue sitting, and the review-gate cost #762 amortizes lands
+    # right back at 1:1. Stateless by design — the age anchor is GitLab's
+    # own issue created_at, so a restart cannot reset the clock and a
+    # standing backlog is already old.
+    if should_accumulate(batch_size=len(candidates), top_band=top_band,
+                         oldest_age_s=oldest_candidate_age_s(
+                             [iss for _, iss, _ in candidates]),
+                         config=config):
+        return None
     batch, reason = pack_repo_candidates(lane_key, candidates, config)
     if not batch:
         return None
