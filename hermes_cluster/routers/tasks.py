@@ -58,6 +58,51 @@ def _lane_target(lane_key: str):
     return m.group(1) if m else None
 
 
+def _schedulable_nodes() -> list:
+    """Nodes the scheduler would actually consider handing work to (#907).
+
+    DRAINED nodes are excluded deliberately: a capability that ONLY a drained
+    node advertises cannot be served, and accepting a task for it would
+    reproduce the very stall this guard exists to stop.
+    """
+    return [
+        node
+        for node in (_state.get_all_nodes() if _state else [])
+        if not getattr(node, "drained", False)
+    ]
+
+
+def _known_capabilities() -> set:
+    """The whole capability vocabulary the fleet can serve right now (#907)."""
+    known = set()
+    for node in _schedulable_nodes():
+        known.update(node.capabilities or [])
+    return known
+
+
+def _unsatisfiable_capabilities(requires) -> set:
+    """The requested capabilities no schedulable node advertises (#907).
+
+    The carve-out is keyed on "are there any schedulable NODES", never on "is
+    the known vocabulary non-empty" — with NO schedulable node there is no
+    vocabulary to check against, so refusing would reject every submit while
+    the cluster is coming up (or while the operator has the whole fleet
+    drained), which is a worse failure than queueing: the scheduler holds
+    those tasks harmlessly until a node joins or is un-drained.
+
+    Once even ONE schedulable node exists, its advertised set IS the
+    vocabulary — including the empty set, which correctly refuses a task no
+    node could take. Keying on the vocabulary instead let a fleet whose only
+    node was drained accept anything at all.
+    """
+    req = set(requires or [])
+    if not req:
+        return set()
+    if not _schedulable_nodes():
+        return set()
+    return req - _known_capabilities()
+
+
 def _brief_names_target(title: str, target: str) -> bool:
     """True if the brief mentions the target as a NUMBER, not a substring.
 
@@ -197,6 +242,31 @@ async def submit_task(req: SubmitTaskRequest):
             if (t.role == "reviewer" and t.lane_key == req.lane_key
                     and t.status in _LIVE_REVIEWER):
                 return {**t.model_dump(), "deduped": True}
+
+    # #907: a capability NO registered node advertises can never be matched by
+    # scheduler.node_can_run, so the task is accepted and then queues FOREVER —
+    # silently, with idle workers. Measured 2026-09-15: lanes asked for
+    # 'merge', 'land', 'flutter', 'invora', 'author' (and an operator's own
+    # 'pc-maint' after the node re-registered without it). One of them was
+    # bayader-flutter!221's LANDING task: a reviewed client MR sat unclaimable
+    # and never merged while the cluster ran at 4/22. A lane naming a
+    # capability the fleet cannot serve is stating a real need the fleet does
+    # not meet — that must be a LOUD refusal at submit, never a silent queue.
+    unknown = _unsatisfiable_capabilities(req.requires)
+    if unknown:
+        known = _known_capabilities()
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"unsatisfiable capability (#907): no registered node advertises "
+                f"{', '.join(sorted(unknown))}. This task would queue forever "
+                f"instead of running. Known capabilities: "
+                f"{', '.join(sorted(known)) if known else '(none — every schedulable node advertises nothing)'}. "
+                f"Either request one of those, or teach a node to advertise the "
+                f"capability you need — do NOT relabel the task with a capability "
+                f"that merely schedules."
+            ),
+        )
 
     task_id = _generate_task_id()
     # Default only when the caller said nothing (None). 0 is a legal band —

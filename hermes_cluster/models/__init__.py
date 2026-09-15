@@ -105,6 +105,15 @@ class Node(BaseModel):
     last_heartbeat: datetime = Field(default_factory=datetime.utcnow)
     load: float = 0.0  # 0.0 - 1.0
     max_concurrent: int = 0  # max simultaneously-assigned tasks; 0 = unlimited
+    # #907: operator drain. True = the scheduler sends this node NOTHING, even
+    # a task with an empty `requires`. It is OWNER state, not worker state: a
+    # worker re-join refreshes heartbeat/capabilities/capacity and must leave
+    # this flag alone, because the machine being unfit to run work is exactly
+    # the thing the worker itself cannot be trusted to report (measured
+    # 2026-09-15: a node that could not write any lane result kept heartbeating
+    # healthy, and a capability-strip meant to fence it was reverted by the
+    # node's own next registration).
+    drained: bool = False
     # #892 factory resilience: free GB on the volume holding the worker's
     # lanes/HERMES_HOME, reported in every join/heartbeat. None = the worker
     # did not report it (older worker) — the main's disk rules never fire on
@@ -762,6 +771,17 @@ class JoinResponse(BaseModel):
 
 class UpdateCapabilitiesRequest(BaseModel):
     capabilities: List[str]
+
+
+class SetDrainedRequest(BaseModel):
+    """#907: PATCH /api/v1/nodes/{id}/drain — operator quarantine.
+
+    The supported way to take a node out of rotation. Stripping its
+    capabilities is NOT: an empty ``requires`` matches every node whatever it
+    advertises, and the node's next re-join rewrites the list from its own
+    local config.
+    """
+    drained: bool
 
 
 class SubmitTaskRequest(BaseModel):

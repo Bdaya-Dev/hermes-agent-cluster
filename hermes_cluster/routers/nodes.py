@@ -7,6 +7,7 @@ from ..models import (
     JoinResponse,
     HeartbeatRequest,
     UpdateCapabilitiesRequest,
+    SetDrainedRequest,
     Node,
     TaskStatus,
 )
@@ -116,3 +117,33 @@ async def update_capabilities(node_id: str, req: UpdateCapabilitiesRequest):
         "capabilities": req.capabilities,
         "status": "updated",
     }
+
+
+@router.patch("/{node_id}/drain")
+async def set_drained(node_id: str, req: SetDrainedRequest):
+    """Take a node out of rotation, or put it back (#907).
+
+    This is the ONLY supported quarantine. The two things an operator reaches
+    for instead both fail silently:
+
+    * **Stripping capabilities** — a task with an empty ``requires`` matches
+      every node regardless of what it advertises, so the node keeps getting
+      unconstrained work; and the worker's next re-join rewrites the list from
+      its own local config (``node_manager.register_node`` ->
+      ``update_capabilities``), so the strip reverts on the next heartbeat.
+      Measured 2026-09-15: it also orphaned the 9 queued tasks that required
+      the capability which was stripped.
+    * **Marking it offline** — the watchdog flips it back on the next
+      heartbeat, because liveness is worker-reported and drain is not.
+
+    Un-draining re-triggers scheduling immediately so queued work moves the
+    moment the node is cleared, rather than waiting for the next tick.
+    """
+    node = _state.get_node(node_id)
+    if not node:
+        raise HTTPException(status_code=404, detail="node not found")
+    _state.set_drained(node_id, req.drained)
+    if not req.drained:
+        _state.trigger_pending_tasks()
+        _state.schedule_pending()
+    return {"node_id": node_id, "drained": req.drained, "status": "updated"}

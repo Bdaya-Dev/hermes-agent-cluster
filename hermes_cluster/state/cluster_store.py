@@ -108,7 +108,8 @@ CREATE TABLE IF NOT EXISTS nodes (
     max_concurrent INTEGER DEFAULT 0,
     disk_free_gb REAL,
     status_reason TEXT DEFAULT '',
-    instance_token TEXT DEFAULT ''
+    instance_token TEXT DEFAULT '',
+    drained INTEGER DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS tasks (
@@ -375,6 +376,14 @@ class ClusterStore:
                 self._conn.execute(
                     "ALTER TABLE nodes ADD COLUMN instance_token TEXT DEFAULT ''"
                 )
+            # #907: operator drain. A separate column, NOT a capability strip:
+            # register_node's re-join path rewrites `capabilities` from the
+            # worker's own config, so a drain expressed there is erased on the
+            # next heartbeat. Nothing on the registration path writes this.
+            if "drained" not in node_cols:
+                self._conn.execute(
+                    "ALTER TABLE nodes ADD COLUMN drained INTEGER DEFAULT 0"
+                )
         except Exception as e:
             logger.warning("nodes.max_concurrent migration skipped: %s", e)
         # PR#16 (stateful lanes): lanes table + idle-reap activity clock.
@@ -432,10 +441,26 @@ class ClusterStore:
         now = datetime.utcnow()
         with self._tx() as conn:
             conn.execute(
-                """INSERT OR REPLACE INTO nodes
+                # #907: ON CONFLICT, not INSERT OR REPLACE. REPLACE deletes
+                # the row and re-inserts it, which resets every column the
+                # INSERT omits — including `drained`, handing work straight
+                # back to a node the operator had drained. The SET list below
+                # is exactly the worker-owned columns; drain is operator state
+                # and must survive anything a worker does.
+                """INSERT INTO nodes
                    (id, name, capabilities, status, last_heartbeat, load, max_concurrent,
                     disk_free_gb, status_reason, instance_token)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(id) DO UPDATE SET
+                     name = excluded.name,
+                     capabilities = excluded.capabilities,
+                     status = excluded.status,
+                     last_heartbeat = excluded.last_heartbeat,
+                     load = excluded.load,
+                     max_concurrent = excluded.max_concurrent,
+                     disk_free_gb = excluded.disk_free_gb,
+                     status_reason = excluded.status_reason,
+                     instance_token = excluded.instance_token""",
                 (node.id, node.name, _json_dumps(node.capabilities),
                  node.status.value, _dt_to_str(node.last_heartbeat), node.load,
                  node.max_concurrent, node.disk_free_gb,
@@ -506,6 +531,23 @@ class ClusterStore:
             except Exception:
                 pass
 
+    def set_drained(self, node_id: str, drained: bool) -> None:
+        """Drain or un-drain a node (#907) — OPERATOR state, never worker state.
+
+        A drained node is handed NOTHING by the scheduler, including tasks with
+        an empty ``requires``. Deliberately separate from ``capabilities``:
+        ``register_node``'s re-join path refreshes capabilities from whatever
+        the worker declares locally, so a drain expressed as a capability strip
+        is erased the moment the worker checks in — which is exactly what
+        happened on 2026-09-15 to a node that could not write lane results.
+        Nothing on the worker's registration path touches this column.
+        """
+        with self._tx() as conn:
+            conn.execute(
+                "UPDATE nodes SET drained = ? WHERE id = ?",
+                (1 if drained else 0, node_id),
+            )
+
     def update_max_concurrent(self, node_id: str, max_concurrent: int) -> None:
         """Update a node's concurrency ceiling (re-join may re-declare it)."""
         value = max(0, int(max_concurrent))
@@ -575,6 +617,10 @@ class ClusterStore:
             # join = pre-#899 idempotent semantics).
             instance_token=(row["instance_token"]
                             if "instance_token" in row.keys() else ""),
+            # #907: operator drain. Absent column (pre-migration row read
+            # mid-flight) reads as NOT drained — the safe default is that a
+            # node keeps working, never that the fleet silently goes dark.
+            drained=bool(row["drained"]) if "drained" in row.keys() else False,
         )
 
     # -------------------------------------------------------------------
