@@ -1,4 +1,4 @@
-"""Landing-verdict gate (#913) — the board-side supersede check.
+"""Landing-verdict gate (#914) — the board-side supersede check.
 
 A LANDING task (lane_key ``<repo>#land-<n>``, or a title that leads with
 'LAND') exists to merge artifact ``<repo>!<n>`` on the strength of a
@@ -225,29 +225,29 @@ def hold_reason(all_tasks: List, task) -> Optional[str]:
     # Spec 2 re-check (submit refuses these; the sweep re-checks because
     # authorship membership can be recorded after the landing's submit).
     if lane == target:
-        return (f"landing held (#913): the lander lane {lane!r} is the "
+        return (f"landing held (#914): the lander lane {lane!r} is the "
                 f"reviewer lane of {target} — a reviewer never lands what "
                 f"it reviewed (RV-1)")
     if lane and lane in authoring_lanes(all_tasks, repo, n,
                                         exclude_task_id=getattr(task, "id", "")):
-        return (f"landing held (#913): lane {lane!r} authored {target} "
+        return (f"landing held (#914): lane {lane!r} authored {target} "
                 f"(carries it in issues) — author != lander (RV-1)")
 
     verdict, vsha, rid = latest_reviewer_verdict(all_tasks, repo, n)
     if verdict is None:
-        return (f"landing held (#913): no completed reviewer verdict on "
+        return (f"landing held (#914): no completed reviewer verdict on "
                 f"{target} carries a verdict word — 'completed' is not a "
                 f"pass (#871); re-review or cite the PASS note's sha")
     if verdict != "PASS":
-        return (f"landing held (#913): the LATEST reviewer verdict on "
+        return (f"landing held (#914): the LATEST reviewer verdict on "
                 f"{target} is {verdict} (task {rid}) — a rejected review "
                 f"is never overridden by a landing brief's claim")
     if not vsha:
-        return (f"landing held (#913): the PASS on {target} (task {rid}) "
+        return (f"landing held (#914): the PASS on {target} (task {rid}) "
                 f"pins no head sha — a sha-less verdict certifies no head")
     named = {s.lower() for s in _SHA_RE.findall(title)}
     if vsha not in named:
-        return (f"landing held (#913): reviewer PASS pins sha {vsha} "
+        return (f"landing held (#914): reviewer PASS pins sha {vsha} "
                 f"({target}, task {rid}) but the landing names "
                 f"{', '.join(sorted(named)) or '(no sha)'} — a verdict at "
                 f"one head does not certify another (stale/merge-forward "

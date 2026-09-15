@@ -1342,7 +1342,7 @@ class ClusterStore:
     def trigger_pending_tasks(self) -> int:
         """Promote pending tasks with all dependencies met to ready.
 
-        #913: a LANDING task is promoted only when the board's latest
+        #914: a LANDING task is promoted only when the board's latest
         reviewer verdict on its artifact is an un-superseded PASS at a sha
         the landing names; a held landing records WHY in fail_reason and
         stays pending (operator override: POST /tasks/{id}/advance).
@@ -1369,7 +1369,7 @@ class ClusterStore:
                             break
                 if not ok:
                     continue
-                # #913 verdict gate: consult the board only for tasks that
+                # #914 verdict gate: consult the board only for tasks that
                 # even look like landings (cheap title/lane pre-check).
                 full = conn.execute(
                     "SELECT * FROM tasks WHERE id = ?", (row["id"],)

@@ -1,4 +1,4 @@
-"""#913 (P0 safety) — a landing task auto-spawned on a REJECTED review: no
+"""#914 (P0 safety) — a landing task auto-spawned on a REJECTED review: no
 supersede check, no author!=lander check.
 
 The protocol (#893/#902): an author lane produces a diff, hands to a
@@ -128,7 +128,7 @@ def test_rejected_review_holds_the_landing(client):
     lid = _land(client, rid)
     t = _task(client, lid)
     assert t["status"] == TaskStatus.pending.value, (
-        "landing auto-spawned on a REJECTED review — #913: completion was "
+        "landing auto-spawned on a REJECTED review — #914: completion was "
         f"read as a pass; status={t['status']}")
     reason = (t.get("fail_reason") or "").lower()
     assert "needs-changes" in reason or "reject" in reason, (
@@ -162,7 +162,7 @@ def test_stale_sha_landing_held(client):
                 title="LAND repo!2 — MUST equal cafe00019999 → merge")
     t = _task(client, lid)
     assert t["status"] == TaskStatus.pending.value, (
-        "a PASS at one sha does not certify a landing at another (#913)")
+        "a PASS at one sha does not certify a landing at another (#914)")
     assert "sha" in (t.get("fail_reason") or "").lower()
 
 
@@ -225,7 +225,7 @@ def test_landing_on_the_reviewer_lane_is_refused(client):
                 depends_on=[rid])
     assert r.status_code == 409, (
         "main must refuse a landing task submitted on the reviewer lane of "
-        "the same artifact (#913)")
+        "the same artifact (#914)")
 
 
 def test_landing_on_the_authoring_lane_is_refused(client):
@@ -241,7 +241,7 @@ def test_landing_on_the_authoring_lane_is_refused(client):
                 lane_key="repo#env/dev", requires=["github-write"],
                 depends_on=[rid])
     assert r.status_code == 409, (
-        "the authoring lane of an artifact cannot be its landing lane (#913)")
+        "the authoring lane of an artifact cannot be its landing lane (#914)")
 
 
 # ---------------------------------------------------------------------------

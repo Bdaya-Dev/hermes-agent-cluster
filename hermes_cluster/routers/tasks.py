@@ -248,7 +248,7 @@ async def submit_task(req: SubmitTaskRequest):
                     and t.status in _LIVE_REVIEWER):
                 return {**t.model_dump(), "deduped": True}
 
-    # #913 spec 2 (identity, refused at the boundary — a held-but-created
+    # #914 spec 2 (identity, refused at the boundary — a held-but-created
     # landing still costs a row; a self-landing is never even creatable):
     # a landing task may not be submitted ON the reviewer lane of its
     # artifact (a reviewer lands nothing) nor on a lane that AUTHORED it
@@ -268,7 +268,7 @@ async def submit_task(req: SubmitTaskRequest):
             raise HTTPException(
                 status_code=409,
                 detail=(
-                    f"landing refused (#913): lane {_lane!r} is the "
+                    f"landing refused (#914): lane {_lane!r} is the "
                     f"reviewer lane of {_target} — a reviewer never lands "
                     "what it reviewed (RV-1). Use '<repo>#land-<n>'."))
         if _lane and _lane in authoring_lanes(_state.get_all_tasks(),
@@ -276,7 +276,7 @@ async def submit_task(req: SubmitTaskRequest):
             raise HTTPException(
                 status_code=409,
                 detail=(
-                    f"landing refused (#913): lane {_lane!r} authored "
+                    f"landing refused (#914): lane {_lane!r} authored "
                     f"{_target} (carries it in issues) — author != lander "
                     "(RV-1 is not negotiable). A dedicated lander lane "
                     "'<repo>#land-<n>' on a reviewer's PASS at the head."))
@@ -777,7 +777,7 @@ async def get_trigger_chain(task_id: str):
 def _trigger_downstream(task_id: str):
     """When a task completes, check if any dependent tasks can now be promoted.
 
-    #913: promotion of a LANDING dependent runs the verdict gate FIRST —
+    #914: promotion of a LANDING dependent runs the verdict gate FIRST —
     completion of the reviewer is an EVENT, not a PASS. The store's
     trigger_pending_tasks applies the same rule on every sweep; this path
     (the auto-spawn boundary) must not bypass it, which is exactly how the
@@ -799,7 +799,7 @@ def _trigger_downstream(task_id: str):
         reason = landing_hold_reason(_state.get_all_tasks(), dep_task)
         if reason is not None:
             # Held, not promoted: stay pending with the violated gate
-            # recorded (#913). The sweep re-evaluates after every event,
+            # recorded (#914). The sweep re-evaluates after every event,
             # so a later fresh-PASS round at the named sha releases it.
             if (dep_task.fail_reason or "") != reason:
                 _state.set_task_status(

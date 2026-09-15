@@ -790,7 +790,7 @@ class ClusterState:
     def trigger_pending_tasks(self) -> int:
         """Promote pending tasks with all dependencies met to ready. Returns count promoted.
 
-        #913: a LANDING task (lane '<repo>#land-<n>' or 'LAND'-titled) is
+        #914: a LANDING task (lane '<repo>#land-<n>' or 'LAND'-titled) is
         promoted ONLY if the board's latest reviewer verdict on its artifact
         is an un-superseded PASS pinning a sha the landing names — a
         rejected or verdict-less review never auto-spawns a merge. The hold

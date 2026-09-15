@@ -1346,7 +1346,7 @@ class PostgresClusterStore:
                     by_id.get(d) == TaskStatus.completed.value for d in depends
                 )
             if ok:
-                # #913: a landing task promotes only on the board's latest
+                # #914: a landing task promotes only on the board's latest
                 # un-superseded PASS at a sha it names; held landings stay
                 # pending with the violated gate in fail_reason.
                 row_full = await self._row(
