@@ -35,6 +35,7 @@ from ..core.landing_gate import (
     hold_reason as landing_hold_reason,
     landing_artifact,
 )
+from ..core.reviewer_gate import reviewer_completion_veto
 
 router = APIRouter(prefix="/api/v1/tasks", tags=["tasks"])
 
@@ -465,6 +466,45 @@ async def complete_task(task_id: str, req: Optional[CompleteTaskRequest] = None)
     stored = False
     if req is not None and req.result is not None:
         stored = _state.set_task_result(task_id, req.result)
+
+    # #919: a reviewer completion is refused at the SOURCE when the delivered
+    # result carries no verdict — status=completed must never stand as
+    # evidence a review happened (the lead's census: 17/58 verdict-less; the
+    # !180 stall). The refusal is main's own #870 machinery — lease already
+    # revoked above, attempts bumped, back to `ready` for another delivery —
+    # and the cap (task_retry_limit) consumes it as `failed` with the typed
+    # reason. Landing-shaped rows and non-reviewer roles never reach the veto
+    # (reviewer_completion_veto exempts both; the false-positive class is
+    # worse than the bug, #870 doctrine).
+    veto = reviewer_completion_veto(task, req.result if req else None)
+    if veto:
+        if _lease_manager:
+            lease = _lease_manager.get_by_task(task_id)
+            if lease:
+                _lease_manager.revoke(lease.id)
+        requeued = False
+        try:
+            requeued = _state.requeue_task(task_id, reason=veto)
+        except Exception:
+            logger.exception("requeue_task failed for %s — consuming instead",
+                             task_id)
+        if requeued:
+            try:
+                _state.schedule_pending()
+            except Exception:
+                logger.exception("schedule_pending after #919 requeue of %s failed",
+                                 task_id)
+            logger.warning("task %s: reviewer completion refused (#919), "
+                           "re-queued: %s", task_id, veto[:160])
+            return {"status": "requeued", "requeued": True,
+                    "refused": "reviewer_no_verdict", "reason": veto}
+        _state.set_task_status(task_id, TaskStatus.failed, fail_reason=veto)
+        logger.error("task %s consumed as FAILED at the retry cap (#919): "
+                     "%s", task_id, veto[:160])
+        return {"status": "failed", "refused": "reviewer_no_verdict",
+                "reason": veto,
+                "blocked": _cascade_cancel_dependents(
+                    task_id, f"parent {task_id} failed (#919)")}
 
     _state.set_task_status(task_id, TaskStatus.completed)
     # Auto-transition downstream tasks

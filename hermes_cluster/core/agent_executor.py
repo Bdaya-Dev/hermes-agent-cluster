@@ -843,6 +843,14 @@ class AgentExecutor:
                 "`lane_key='<repo>#land-<mr_iid>'`, title naming the MR URL, the verified head "
                 "sha, and your PASS. On NEEDS-CHANGES: do not submit landing; the verdict note "
                 "is the hand-back.",
+                "- Your result.md MUST CARRY THE VERDICT WORD on its own line — one of PASS / "
+                "NEEDS-CHANGES / NEEDS-HUMAN / INCOMPLETE-ROSTER / NOT-READY (e.g. `Reviewer "
+                "verdict: PASS`). The main node now REFUSES a reviewer completion whose delivered "
+                "result carries none (shared/claude-plugins#919: 17 of 58 completed reviewers "
+                "carried no verdict — status=completed was lying about a review that never "
+                "reported); a verdict-less completion is re-queued, costing a full delivery for "
+                "nothing. A blocker is a verdict too when the roster genuinely lacks the "
+                "capability: write `Reviewer verdict: INCOMPLETE-ROSTER` with what is missing.",
                 "",
             ]
         if deliverable_path:

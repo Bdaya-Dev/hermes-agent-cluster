@@ -125,7 +125,12 @@ def test_completed_reviewer_is_replaced_by_a_fresh_submit(client):
     client.post(f"/api/v1/tasks/{t1['id']}/claim",
                 json={"node_id": client.post("/api/v1/nodes/join",
                       json={"node_name": "w", "capabilities": ["review"]}).json()["node_id"]})
-    client.post(f"/api/v1/tasks/{t1['id']}/complete", json={"result": "PASS"})
+    # #919: a reviewer completion now requires verdict grammar (the same
+    # vocabulary #914's landing gate parses) — a bare "PASS" is exactly the
+    # verdict-less shape the gate refuses. The test's subject (terminal
+    # predecessor must not block the next hand-off) is unchanged.
+    client.post(f"/api/v1/tasks/{t1['id']}/complete",
+                json={"result": "Reviewer verdict: PASS\nSHA: deadbeef1234\n"})
     r2 = _submit(client, title="review claude-plugins#main MR !935 round 2")
     assert r2.status_code == 200
     assert r2.json()["id"] != t1["id"], (
