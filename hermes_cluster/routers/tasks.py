@@ -109,6 +109,35 @@ def _unsatisfiable_capabilities(requires) -> set:
     return req - _known_capabilities()
 
 
+def _reviewer_needs_github_write(req) -> bool:
+    """#913: a reviewer task whose brief names a GitHub PR must carry
+    github-write.
+
+    Measured 2026-09-15T18:45Z: two reviewer tasks carrying only
+    requires=['review'] were scheduled onto node_windows_pc_worker (it
+    advertises review, NOT github-write, and its gh token was invalid).
+    Both placements were legitimate per the capability vocabulary — the
+    brief only asked for review — and both lost the verdict: the whole
+    deliverable of a reviewer on a GitHub PR is a POSTED comment, and a
+    node that cannot post produces no comment. A merge gate reading PR
+    notes then sees nothing, which is indistinguishable from a review
+    that never ran. #894 already made the LANDING leg require the write
+    capability (#902); the review leg — the same PR, the same posting
+    dependency — was left unprotected.
+
+    Detection reuses the #902 landing parser (_parse_github_pr_url via
+    intake_grouping) on the title, which IS the brief: one parser, two
+    gates, no second URL grammar to drift. GitLab MRs keep plain
+    ['review']: their posting surface is the bdaya-glab typed layer,
+    reachable with the GitLab PAT every node carries. A brief with no
+    artifact URL cannot be classified — permissive, never a guess.
+    """
+    if (req.role or "").strip().lower() != "reviewer":
+        return False
+    from ..core.intake_grouping import _parse_github_pr_url
+    return _parse_github_pr_url(req.title or "") is not None
+
+
 def _brief_names_target(title: str, target: str) -> bool:
     """True if the brief mentions the target as a NUMBER, not a substring.
 
@@ -305,6 +334,27 @@ async def submit_task(req: SubmitTaskRequest):
                     f"{_target} (carries it in issues) — author != lander "
                     "(RV-1 is not negotiable). A dedicated lander lane "
                     "'<repo>#land-<n>' on a reviewer's PASS at the head."))
+
+    # #913: a reviewer for a GitHub PR must carry the capability its verdict
+    # posts with — see _reviewer_needs_github_write for the measured failure.
+    # Refused at SUBMIT (the same loud-at-the-boundary discipline as #907's
+    # unsatisfiable-capability and #872's brief/target guards): silently
+    # scheduling the task onto a node that cannot post is what cost both
+    # verdicts.
+    if _reviewer_needs_github_write(req) and \
+            "github-write" not in set(req.requires or []):
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "github-PR reviewer without github-write (#913): the whole "
+                "deliverable of this task is a PR comment posted via gh, but "
+                "requires only advertises "
+                f"{sorted(set(req.requires or [])) or '(nothing)'}. Add "
+                "'github-write' to requires — a reviewer placed on a node "
+                "that cannot post produces NO verdict note, which a merge "
+                "gate cannot distinguish from a review that never ran."
+            ),
+        )
 
     # #907: a capability NO registered node advertises can never be matched by
     # scheduler.node_can_run, so the task is accepted and then queues FOREVER —

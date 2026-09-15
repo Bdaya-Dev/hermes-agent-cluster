@@ -551,11 +551,21 @@ def reviewer_handoff_brief(bundle: BundlePlan, mr_url: str, head_sha: str,
         f"    verdict NEEDS-HUMAN, and it is NEVER overridden — not by you,\n"
         f"    not by the author.\n"
         f"\n"
-        f"Post your verdict: an MR note pinned to the head sha, via\n"
-        f"`bdaya-glab mr note` (npx -y -p @shared/bdaya-gitlab@latest ...).\n"
-        f"The note is the durable oracle the landing gate reads.\n"
-        f"\n"
-        f"CLOSE THE LOOP (#893) — after posting the note:\n"
+        + (
+            f"Post your verdict: a PR comment pinned to the head sha, via\n"
+            f"`gh pr comment {gh[1] if gh else '?'} --repo {gh[0] if gh else '?'} --body-file <verdict.md>`.\n"
+            f"The comment is the durable oracle the landing gate reads; if the\n"
+            f"posting call fails, your task FAILED — say so and exit nonzero,\n"
+            f"NEVER record a PASS no gate can see (#913).\n"
+            if gh else
+            f"Post your verdict: an MR note pinned to the head sha, via\n"
+            f"`bdaya-glab mr note` (npx -y -p @shared/bdaya-gitlab@latest ...).\n"
+            f"The note is the durable oracle the landing gate reads; if the\n"
+            f"posting call fails, your task FAILED — say so and exit nonzero,\n"
+            f"NEVER record a PASS no gate can see (#913).\n"
+        )
+        + "\n"
+        + "CLOSE THE LOOP (#893) — after posting the note:\n"
         + (
             # #902: GitHub PR branch. The reviewer is read-only (#882) and
             # `bdaya-glab` has no GitHub landing verb — PASS closes the loop
@@ -670,7 +680,12 @@ def bundle_brief(bundle: BundlePlan) -> str:
         f"         `markPullRequestReadyForReview` on GitHub);\n"
         f"      4. THEN — and only then — do NOT park for the lead: call the\n"
         f"         `kanban_cluster_submit` tool to create your OWN reviewer task —\n"
-        f"         `role='reviewer'`, `requires=['review']`,\n"
+        f"         `role='reviewer'`, `requires=['review']` — PLUS the posting\n"
+        f"         capability the verdict must ride: a GitHub-PR artifact needs\n"
+        f"         `requires=['review','github-write']` (#913: a reviewer whose\n"
+        f"         node cannot post produces no verdict note, indistinguishable\n"
+        f"         from no review — the main REFUSES a GitHub-PR reviewer task\n"
+        f"         without github-write),\n"
         f"         `lane_key='{bundle.lane_key}-rev'`, priority = this task's\n"
         f"         priority ({bundle.priority}), and the title = the full\n"
         f"         INDEPENDENT REVIEW brief rendered by\n"
