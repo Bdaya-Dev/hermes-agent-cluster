@@ -897,6 +897,42 @@ class AgentExecutor:
             self._token, self._node_id,
         )
 
+    def _report_lane_placement(self, lane_key: str, session_id: str,
+                               role: str, task_id: str) -> None:
+        """#909: mirror a lane placement into MAIN's lanes table.
+
+        The #858 affinity scheduler pins on MAIN's `lanes` rows — but
+        record_lane() only wrote the worker-LOCAL store, so every lane pin
+        was '' at choose time and deliveries bounced across nodes (30 of
+        375 lane_keys measured; 22 bounce-transitions AFTER #858 deployed),
+        silently cold-starting fresh sessions away from the lane's clone.
+
+        Best-effort by contract: a main outage must NEVER block or fail a
+        spawn/reap — _signed_request already swallows transport errors into
+        None; the guard here is only that the endpoint/token exist. The body
+        node_id is our own id; main normalizes the spellings and refuses a
+        mismatch against the authenticated X-Peer-Node (we can't pin to
+        someone else's machine).
+        """
+        if not lane_key or not self._cluster_endpoint or not self._token:
+            return
+        try:
+            _signed_request(
+                self._cluster_endpoint, "POST", "/api/v1/lanes/report",
+                {
+                    "lane_key": lane_key,
+                    "node_id": self._node_id,
+                    "session_id": session_id or "",
+                    "profile": self._config.hermes_profile or "",
+                    "role": role or "author",
+                    "last_task_id": task_id or "",
+                },
+                self._token, self._node_id,
+            )
+        except Exception:
+            logger.warning("lane %s placement report to main failed", lane_key,
+                           exc_info=True)
+
     def _spawn_bdaya_worker(self, task: dict) -> None:
         """Spawn a bdaya-dispatch worker for the given task."""
         task_id = task.get("id", "")
@@ -1510,6 +1546,9 @@ class AgentExecutor:
                     node=self._node_id,
                     last_task_id=spawn.task_id,
                 )
+                # #909: mirror to MAIN so the affinity scheduler has data.
+                self._report_lane_placement(spawn.lane_key, spawn.session_id,
+                                            spawn.role, spawn.task_id)
         except Exception:
             logger.exception("failed to persist spawn record for task %s", spawn.task_id)
 
@@ -2494,6 +2533,11 @@ class AgentExecutor:
                 node=self._node_id,
                 last_task_id=task_id,
             )
+            # #909: the captured session id is exactly what main's pin needs
+            # for the NEXT delivery to resume on THIS machine.
+            self._report_lane_placement(spawn.lane_key,
+                                        session_id or spawn.session_id,
+                                        spawn.role, task_id)
             if session_id and session_id != spawn.session_id:
                 spawn.session_id = session_id
                 logger.info(

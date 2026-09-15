@@ -24,6 +24,7 @@ from .routers import (
     tasks_router,
     ballots_router,
     leases_router,
+    lanes_router,
     sync_router,
     recovery_router,
     schedule_router,
@@ -42,6 +43,7 @@ from .routers import (
 from .routers import nodes as nodes_mod
 from .routers import tasks as tasks_mod
 from .routers import leases as leases_mod
+from .routers import lanes as lanes_mod
 from .routers import sync as sync_mod
 from .routers import recovery as recovery_mod
 from .routers import schedule as schedule_mod
@@ -308,6 +310,7 @@ def create_app(
     nodes_mod.init(state, node_manager=_node_manager)
     tasks_mod.init(state, lease_manager=_lease_manager)
     leases_mod.init(state)
+    lanes_mod.init(state)
     sync_mod.init(state)
     recovery_mod.init(state, recovery_manager=_recovery_manager)
     schedule_mod.init(state)
@@ -351,6 +354,7 @@ def create_app(
     app.include_router(tasks_router)
     app.include_router(ballots_router)
     app.include_router(leases_router)
+    app.include_router(lanes_router)
     app.include_router(sync_router)
     app.include_router(recovery_router)
     app.include_router(schedule_router)
