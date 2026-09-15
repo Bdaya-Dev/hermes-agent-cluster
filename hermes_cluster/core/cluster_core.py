@@ -515,9 +515,32 @@ class ClusterCore:
         return task
 
     def complete_task(self, task_id: str) -> bool:
-        """Mark a task as completed and trigger downstream tasks."""
+        """Mark a task as completed and trigger downstream tasks.
+
+        #919: the same verdict gate as POST /complete — a reviewer row whose
+        stored result carries no verdict never reaches `completed`; the task
+        is re-queued under the retry cap instead (False: the completion was
+        refused).
+        """
         task = self.store.get_task(task_id)
         if not task:
+            return False
+        from .reviewer_gate import reviewer_completion_veto
+        veto = reviewer_completion_veto(task, getattr(task, "result", None))
+        if veto:
+            requeued = False
+            try:
+                requeued = self.store.requeue_task(task_id, reason=veto)
+            except Exception:
+                logger.exception("requeue_task failed for %s (#919)", task_id)
+            if requeued:
+                logger.warning("task %s: reviewer completion refused (#919), "
+                               "re-queued", task_id)
+                return False
+            self.store.set_task_status(task_id, TaskStatus.failed,
+                                       fail_reason=veto)
+            logger.error("task %s consumed as FAILED at the retry cap (#919)",
+                         task_id)
             return False
         self.store.set_task_status(task_id, TaskStatus.completed)
         # Propagate dependency resolution
