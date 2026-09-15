@@ -123,6 +123,15 @@ class ClusterState:
 
     def register_node(self, node: Node) -> None:
         with self._nodes_lock:
+            # #907: a re-register REPLACES the Node object, so every field the
+            # caller did not carry over is silently reset — including the
+            # operator's `drained` flag, which would hand work straight back to
+            # a quarantined node. Drain is owner state; nothing on a worker's
+            # registration path may clear it. (The SQLite store had the same
+            # bug via INSERT OR REPLACE; both are fixed together.)
+            existing = self._nodes.get(node.id)
+            if existing is not None and getattr(existing, "drained", False):
+                node.drained = True
             self._nodes[node.id] = node
         if self._on_node_online:
             try:
@@ -167,6 +176,21 @@ class ClusterState:
                         self._on_capability_change(node_id, old_caps, caps)
                     except Exception:
                         pass
+
+    def set_drained(self, node_id: str, drained: bool) -> None:
+        """Drain or un-drain a node (#907) — OPERATOR state, never worker state.
+
+        A drained node is handed NOTHING by the scheduler, including a task
+        with an empty ``requires``. It is a field of its own rather than an
+        empty ``capabilities`` list because ``register_node``'s re-join path
+        rewrites capabilities from the worker's local config, so a drain
+        expressed that way is erased by the node's next check-in — measured
+        2026-09-15, which orphaned the 9 tasks requiring the stripped
+        capability.
+        """
+        with self._nodes_lock:
+            if node_id in self._nodes:
+                self._nodes[node_id].drained = bool(drained)
 
     def update_max_concurrent(self, node_id: str, max_concurrent: int) -> None:
         """Update a node's concurrency ceiling (re-join may re-declare it)."""

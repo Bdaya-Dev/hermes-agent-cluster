@@ -121,7 +121,8 @@ CREATE TABLE IF NOT EXISTS nodes (
     max_concurrent INTEGER DEFAULT 0,
     disk_free_gb DOUBLE PRECISION,
     status_reason TEXT DEFAULT '',
-    instance_token TEXT DEFAULT ''
+    instance_token TEXT DEFAULT '',
+    drained BOOLEAN DEFAULT FALSE
 );
 
 CREATE TABLE IF NOT EXISTS tasks (
@@ -365,6 +366,11 @@ class PostgresClusterStore:
             # instance token per node id.
             await conn.execute(
                 "ALTER TABLE nodes ADD COLUMN IF NOT EXISTS instance_token TEXT DEFAULT ''")
+            # #907: operator drain. Kept OUT of the /join upsert's column list
+            # on purpose, so a worker re-join cannot clear it — the failure a
+            # capability-strip drain had, where the next heartbeat undid it.
+            await conn.execute(
+                "ALTER TABLE nodes ADD COLUMN IF NOT EXISTS drained BOOLEAN DEFAULT FALSE")
             await conn.execute(
                 "ALTER TABLE tasks ADD COLUMN IF NOT EXISTS attempts INTEGER DEFAULT 0")
             # #874: the lane deliverable, so a result outlives the node that made it.
@@ -598,6 +604,38 @@ class PostgresClusterStore:
             max(0, int(max_concurrent)), node_id,
         )
 
+    async def set_drained(self, node_id: str, drained: bool) -> None:
+        """Drain or un-drain a node (#907) — OPERATOR state, never worker state.
+
+        A drained node is handed NOTHING by the scheduler, including a task
+        with an empty ``requires``. It lives in its own column rather than in
+        ``capabilities`` because the /join upsert rewrites capabilities from
+        whatever the worker declares locally, so a drain expressed there is
+        erased by the node's next check-in.
+
+        Takes ``HERMES_SCHEDULE_LOCK``, unlike its sibling updaters
+        (``update_capabilities`` / ``update_max_concurrent`` /
+        ``update_instance_token``), which do not. Those tolerate a one-tick
+        race: a scheduler pass that read the node a moment earlier hands it
+        work under slightly stale capabilities, and the next tick corrects
+        itself. Drain cannot tolerate it, because the whole guarantee it sells
+        is "this node receives NOTHING" — a single task leaked into the
+        window is the guarantee being false, and an operator drains precisely
+        when a node must stop, usually because work landing there is already
+        failing. Serializing against the scheduler makes the guarantee true
+        rather than nearly-true; the cost is one advisory lock on an operator
+        action taken by hand.
+        """
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                await conn.execute(
+                    "SELECT pg_advisory_xact_lock($1)", HERMES_SCHEDULE_LOCK,
+                )
+                await conn.execute(
+                    "UPDATE nodes SET drained = $1 WHERE id = $2",
+                    bool(drained), node_id,
+                )
+
     async def update_instance_token(self, node_id: str, instance_token: str) -> None:
         """#899: record which executor instance currently owns this node id
         (a re-join re-declares it; the /join gate reads it). SyncPostgresStore
@@ -646,6 +684,10 @@ class PostgresClusterStore:
             # #899: a DB created before the drift ALTER lacks the column —
             # '' = older-worker join semantics.
             instance_token=row["instance_token"] if "instance_token" in keys else "",
+            # #907: a DB created before the drift ALTER lacks the column —
+            # NOT drained is the safe default (a node keeps working; the
+            # opposite default would silently dark the whole fleet).
+            drained=bool(row["drained"]) if "drained" in keys else False,
         )
 
     # -------------------------------------------------------------------
