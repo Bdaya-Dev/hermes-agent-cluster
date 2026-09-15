@@ -433,6 +433,23 @@ class ClusterState:
             task.version += 1
             return True
 
+    def set_task_cancel_requeue(self, task_id: str, requeue: bool) -> bool:
+        """Record the cancel re-queue INTENT on the task row (#911).
+
+        Called by the /cancel handler BEFORE the status flip so any reader
+        that sees `cancelled` also sees the intent that authorized it.
+        True = release the members to the next grouped cycle; False = hold
+        them back (intentional consolidation cancel).
+        """
+        with self._tasks_lock:
+            task = self._tasks.get(task_id)
+            if task is None:
+                return False
+            task.cancel_requeue = bool(requeue)
+            task.updated_at = datetime.utcnow()
+            task.version += 1
+            return True
+
     def unblock_to_ready(self, task_id: str) -> bool:
         """/answer path (#894): a blocked task with an ANSWERED ballot returns
         to ``ready`` (not ``pending`` like legacy unblock) so its lane-affinity

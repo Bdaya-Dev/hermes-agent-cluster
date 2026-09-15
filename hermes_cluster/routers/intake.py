@@ -731,9 +731,16 @@ def _grouping_view(state: Any) -> Tuple[LaneView, set, set]:
     Blocked = issues held by a NON-TERMINAL task (still queued/running) PLUS
     issues held by a COMPLETED task (the sitting delivered them — the per-
     issue VP-1 disposition closes them on GitLab; re-bundling a completed
-    issue would duplicate work the lane already did). FAILED / CANCELLED
-    tasks release their issues: a dead sitting fixed nothing, and the next
-    cycle re-groups them — never permanently strand on a transient failure.
+    issue would duplicate work the lane already did). FAILED tasks release
+    their issues: a dead sitting fixed nothing, and the next cycle re-groups
+    them — never permanently strand on a transient failure. CANCELLED tasks
+    split on the recorded intent (#911): requeue=True (or NULL, a
+    pre-migration row — legacy release semantics) releases like a failure;
+    requeue=False — an intentional consolidation cancel — HOLDS the
+    membership, because the cancel's reason says the issues are already
+    carried elsewhere and re-bundling them re-spawns the killed sitting
+    (measured twice on 2026-09-15: bayader-flutter#env/dev re-emitted 4 of
+    5 members 50 minutes after the operator's consolidation cancel).
     """
     view = LaneView()
     blocked: set = set()
@@ -756,6 +763,11 @@ def _grouping_view(state: Any) -> Tuple[LaneView, set, set]:
             continue
         if status == TaskStatus.completed.value:
             blocked.update(members)
+            continue
+        if status == TaskStatus.cancelled.value:
+            # #911: the intent decides. False = hold; True/None = release.
+            if getattr(t, "cancel_requeue", None) is False:
+                blocked.update(members)
             continue
         if status not in _ISSUE_HOLDING_STATUSES:
             continue

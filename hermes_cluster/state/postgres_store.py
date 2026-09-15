@@ -398,6 +398,11 @@ class PostgresClusterStore:
             # hosted DBs created before this column existed.
             await conn.execute(
                 "ALTER TABLE tasks ADD COLUMN IF NOT EXISTS ballot TEXT")
+            # #911: the cancel's re-queue intent (NULL = never cancelled
+            # through an intent-aware path -> legacy release semantics).
+            await conn.execute(
+                "ALTER TABLE tasks ADD COLUMN IF NOT EXISTS "
+                "cancel_requeue BOOLEAN")
         logger.info("PostgresClusterStore: connected, schema ensured")
         return self
 
@@ -905,6 +910,21 @@ class PostgresClusterStore:
         )
         return n > 0
 
+    async def set_task_cancel_requeue(self, task_id: str,
+                                      requeue: bool) -> bool:
+        """Record the cancel re-queue INTENT on the task row (#911).
+
+        The /cancel handler writes this BEFORE the status flip (the
+        ballot-before-blocked ordering rule from #894: a reader that sees
+        the state must never miss the record that authorized it).
+        """
+        n = await self._exec_status_rowcount(
+            """UPDATE tasks SET cancel_requeue = $1, updated_at = $2,
+               version = version + 1 WHERE id = $3""",
+            bool(requeue), _utcnow(), task_id,
+        )
+        return n > 0
+
     async def unblock_to_ready(self, task_id: str) -> bool:
         """#894: /answer path — blocked (with an answered ballot) goes back to
         ``ready`` so lane affinity re-dispatches it to the SAME worker.
@@ -1043,6 +1063,10 @@ class PostgresClusterStore:
                     if "issues" in row.keys() and row["issues"] else []),
             ballot=(parse_ballot_column(row["ballot"])
                     if "ballot" in row.keys() else None),
+            cancel_requeue=(row["cancel_requeue"]
+                            if "cancel_requeue" in row.keys()
+                            and row["cancel_requeue"] is not None
+                            else None),
         )
 
     # -------------------------------------------------------------------

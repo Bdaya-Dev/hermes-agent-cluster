@@ -194,6 +194,19 @@ class Task(BaseModel):
     # session. Shape + validation: hermes_cluster.core.ballot. None = no
     # ballot outstanding.
     ballot: Optional[Dict[str, Any]] = None
+    # #911: the cancel's re-queue INTENT, recorded at cancel time and
+    # persisted on the row (restart-safe, like every grouping guard).
+    #   False — intentional cancel (consolidation, duplicate, folded into
+    #           another MR): the grouper must NOT re-bundle these members
+    #           (the measured re-emission: a consolidation cancel re-spawned
+    #           4 of 5 members 50 minutes later).
+    #   True  — "reschedule this work" (disk-full drain, dead node): the
+    #           next cycle re-groups the members (the pre-#911 behavior,
+    #           now opt-IN).
+    #   None  — never cancelled through an intent-aware path (legacy rows,
+    #           pre-migration): treated as True (release) so history is not
+    #           rewritten and old drains never strand.
+    cancel_requeue: Optional[bool] = None
 
     model_config = {"populate_by_name": True}
 
@@ -856,6 +869,17 @@ class FailTaskRequest(BaseModel):
 
 class CancelTaskRequest(BaseModel):
     reason: str = "cancelled"
+    # #911: re-queue INTENT, recorded on the task row at cancel time.
+    #   true  — "reschedule this work": the next grouped-intake cycle
+    #           re-bundles the members (disk-full drains, dead-node
+    #           recoveries — the pre-#911 behavior, now opt-IN).
+    #   absent/false — intentional cancel (consolidation, duplicate,
+    #           folded into another MR): the grouper must NOT re-mint a
+    #           bundle for the members, because the cancel says they are
+    #           already carried elsewhere. The measured defect: a
+    #           consolidation cancel released its five members and the
+    #           grouper re-spawned four of them 50 minutes later (#911).
+    requeue: Optional[bool] = None
 
 
 class BlockTaskRequest(BaseModel):

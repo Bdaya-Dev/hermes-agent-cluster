@@ -349,6 +349,10 @@ class ClusterStore:
             ("tasks", "issues", "ALTER TABLE tasks ADD COLUMN issues TEXT DEFAULT '[]'"),
             # #894: the lane's decision ballot (JSON TEXT) on old DBs.
             ("tasks", "ballot", "ALTER TABLE tasks ADD COLUMN ballot TEXT"),
+            # #911: the cancel's re-queue intent (NULL = never cancelled
+            # through an intent-aware path -> legacy release semantics).
+            ("tasks", "cancel_requeue",
+             "ALTER TABLE tasks ADD COLUMN cancel_requeue INTEGER"),
         ):
             try:
                 cols = [r[1] for r in self._conn.execute(f"PRAGMA table_info({table})")]
@@ -873,6 +877,22 @@ class ClusterStore:
             )
             return result.rowcount > 0
 
+    def set_task_cancel_requeue(self, task_id: str, requeue: bool) -> bool:
+        """Record the cancel re-queue INTENT on the task row (#911).
+
+        The /cancel handler writes this BEFORE the status flip (the
+        ballot-before-blocked ordering rule from #894: a reader that sees
+        the state must never miss the record that authorized it).
+        """
+        now = datetime.utcnow()
+        with self._tx() as conn:
+            result = conn.execute(
+                "UPDATE tasks SET cancel_requeue = ?, updated_at = ?, "
+                "version = version + 1 WHERE id = ?",
+                (1 if requeue else 0, _dt_to_str(now), task_id),
+            )
+            return result.rowcount > 0
+
     def unblock_to_ready(self, task_id: str) -> bool:
         """#894: /answer path — blocked (with an answered ballot) goes back to
         ``ready``, not ``pending``: lane affinity then re-dispatches it to the
@@ -1035,6 +1055,9 @@ class ClusterStore:
                     if "issues" in keys and row["issues"] else []),
             ballot=(parse_ballot_column(row["ballot"])
                     if "ballot" in keys else None),
+            cancel_requeue=(row["cancel_requeue"] if "cancel_requeue" in keys
+                            and row["cancel_requeue"] is not None
+                            else None),
         )
 
     # -------------------------------------------------------------------
