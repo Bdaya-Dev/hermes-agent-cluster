@@ -30,16 +30,29 @@ class WatchdogEvent:
 class HeartbeatNode:
     """Minimal node info needed by the watchdog."""
 
-    __slots__ = ("id", "last_heartbeat", "status", "disk_free_gb")
+    __slots__ = ("id", "last_heartbeat", "status", "disk_free_gb",
+                 "cpu_load_pct", "lane_count", "max_concurrent",
+                 "duplicate_executor")
 
     def __init__(self, node_id: str, last_heartbeat: datetime, status: str,
-                 disk_free_gb: Optional[float] = None):
+                 disk_free_gb: Optional[float] = None,
+                 cpu_load_pct: Optional[float] = None,
+                 lane_count: Optional[int] = None,
+                 max_concurrent: int = 0,
+                 duplicate_executor: Optional[bool] = None):
         self.id = node_id
         self.last_heartbeat = last_heartbeat
         self.status = status
         # #892: free GB as last reported by this worker (None = never reported
         # / older worker → the disk rule never fires for this node).
         self.disk_free_gb = disk_free_gb
+        # #879: health self-report as last observed by this node (each None =
+        # never reported → that rule never fires; max_concurrent 0 = unlimited
+        # → the lane rule stays inert).
+        self.cpu_load_pct = cpu_load_pct
+        self.lane_count = lane_count
+        self.max_concurrent = max_concurrent
+        self.duplicate_executor = duplicate_executor
 
 
 class WatchdogRegistry:
@@ -81,12 +94,17 @@ class Watchdog:
         offline_after: float = 30.0,
         callback: Optional[Callable[[WatchdogEvent], None]] = None,
         min_free_disk_gb: float = 0.0,
+        max_cpu_load: float = 0.0,
     ):
         self._registry = registry
         self._check_interval = check_interval
         self._degraded_after = degraded_after
         self._offline_after = offline_after
         self._min_free_disk_gb = float(min_free_disk_gb or 0.0)
+        # #879: main-side CPU ceiling consulted on each check against the
+        # node's LAST REPORTED cpu_load_pct (0 = rule disabled; lane-backlog
+        # and duplicate-executor rules are threshold-free and always armed).
+        self._max_cpu_load = float(max_cpu_load or 0.0)
         self._callback = callback
         self._running = False
         self._stop_event = threading.Event()
@@ -152,6 +170,7 @@ class Watchdog:
 
     def _check(self) -> List[WatchdogEvent]:
         from .disk_preflight import is_below_floor  # local: keep import cheap
+        from .health_selfreport import health_reason  # #879, same pattern
 
         now = datetime.utcnow()
         nodes = self._registry.get_all_heartbeat_nodes()
@@ -177,7 +196,22 @@ class Watchdog:
                     f"(node.min_free_disk_gb, shared/claude-plugins#892)"
                 )
             else:
-                new_status = "online"
+                # #879: fresh heartbeat, healthy disk — but the worker's last
+                # health self-report may still condemn it (saturated CPU,
+                # duplicate executor, lane backlog). Without this branch the
+                # watchdog's own online force would UNDO the degradation the
+                # heartbeat path applied, within one check interval.
+                h_reason = health_reason(
+                    getattr(node, "cpu_load_pct", None), self._max_cpu_load,
+                    getattr(node, "lane_count", None),
+                    int(getattr(node, "max_concurrent", 0) or 0),
+                    getattr(node, "duplicate_executor", None),
+                )
+                if h_reason:
+                    new_status = "degraded"
+                    reason = h_reason
+                else:
+                    new_status = "online"
 
             if new_status != node.status:
                 self._registry.update_node_status(node.id, new_status, reason)

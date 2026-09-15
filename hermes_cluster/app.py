@@ -85,6 +85,10 @@ def create_app(
     # instance lock and hands its token down; "" = no identity declared
     # (older/manual launch — pre-#899 idempotent join semantics).
     instance_token: str = "",
+    # #879: node.max_cpu_load ceiling (YAML only, same discipline as #892).
+    # None/absent = 0 = CPU rule disabled; lane-backlog vs the node's declared
+    # max_concurrent and the duplicate-executor self-report stay armed.
+    node_max_cpu_load: Optional[float] = None,
 ) -> FastAPI:
     """Create and configure the FastAPI application.
 
@@ -181,7 +185,10 @@ def create_app(
     from .recovery.manager import RecoveryManager
 
     # Create managers (ClusterState implements the same API as ClusterStore)
-    _node_manager = NodeManager(state, min_free_disk_gb=node_min_free_disk_gb)
+    _node_manager = NodeManager(state, min_free_disk_gb=node_min_free_disk_gb,
+                                # #879: main-side CPU ceiling for the health
+                                # self-report rules (0/absent = rule off).
+                                max_cpu_load=node_max_cpu_load)
     _lease_manager = LeaseManager(state)
     _recovery_manager = RecoveryManager(state)
 
@@ -210,6 +217,10 @@ def create_app(
     # start an outbound connector that signs and POSTs join+heartbeat
     # to the main node. Without this, the worker only updates its local
     # store and the main never sees it.
+    # #879: pre-bind so the connector's lazy health probe sees "no executor
+    # yet" (fields omitted) instead of an unbound name when the executor
+    # block below is skipped (agent_executor not configured).
+    _agent_executor = None
     if node_role == "worker" and cluster_endpoint:
         from .core.worker_connector import start_worker_connector
         from .core.disk_preflight import effective_min_free_gb
@@ -224,6 +235,21 @@ def create_app(
         _disk_probe_path = str(
             (agent_executor_config or {}).get("working_dir", "") or ""
         )
+
+        # #879: lazy health probe — the executor is created AFTER the
+        # connector below, and the closure re-reads it every beat. None
+        # fields (executor not yet up, or a probe error) mean "no lane
+        # observation": the CPU reading still rides, and absent lane fields
+        # keep the main's lane/duplicate rules inert (older-worker contract).
+        def _health_probe():
+            try:
+                ex = _agent_executor
+                if ex is None:
+                    return None, False
+                return ex.live_spawns(), ex.duplicate_executor_observed()
+            except Exception:
+                return None, False
+
         start_worker_connector(
             node_id=state.node_id,
             cluster_endpoint=cluster_endpoint,
@@ -234,11 +260,13 @@ def create_app(
             disk_probe_path=_disk_probe_path,
             # #899: declare this process's instance identity at /join.
             instance_token=instance_token,
+            # #879: the executor's live spawns + duplicate observation ride
+            # every join/heartbeat as lane_count/duplicate_executor.
+            health_fn=_health_probe,
         )
 
     # Agent executor: when role=worker and agent_executor is configured+enabled,
     # start the poll loop that claims leased tasks and spawns bdaya workers.
-    _agent_executor = None
     if node_role == "worker" and cluster_endpoint and agent_executor_config:
         from .core.agent_executor import AgentExecutor, AgentExecutorConfig
         ae_cfg_dict = agent_executor_config or {}

@@ -109,7 +109,10 @@ CREATE TABLE IF NOT EXISTS nodes (
     disk_free_gb REAL,
     status_reason TEXT DEFAULT '',
     instance_token TEXT DEFAULT '',
-    drained INTEGER DEFAULT 0
+    drained INTEGER DEFAULT 0,
+    cpu_load_pct REAL,
+    lane_count INTEGER,
+    duplicate_executor INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS tasks (
@@ -384,6 +387,18 @@ class ClusterStore:
                 self._conn.execute(
                     "ALTER TABLE nodes ADD COLUMN drained INTEGER DEFAULT 0"
                 )
+            # #879: worker health self-report (join/heartbeat payloads).
+            # Nullable: NULL = never reported (older worker) → the health
+            # rules never fire, exactly like disk_free_gb above.
+            if "cpu_load_pct" not in node_cols:
+                self._conn.execute(
+                    "ALTER TABLE nodes ADD COLUMN cpu_load_pct REAL")
+            if "lane_count" not in node_cols:
+                self._conn.execute(
+                    "ALTER TABLE nodes ADD COLUMN lane_count INTEGER")
+            if "duplicate_executor" not in node_cols:
+                self._conn.execute(
+                    "ALTER TABLE nodes ADD COLUMN duplicate_executor INTEGER")
         except Exception as e:
             logger.warning("nodes.max_concurrent migration skipped: %s", e)
         # PR#16 (stateful lanes): lanes table + idle-reap activity clock.
@@ -449,8 +464,9 @@ class ClusterStore:
                 # and must survive anything a worker does.
                 """INSERT INTO nodes
                    (id, name, capabilities, status, last_heartbeat, load, max_concurrent,
-                    disk_free_gb, status_reason, instance_token)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    disk_free_gb, status_reason, instance_token,
+                    cpu_load_pct, lane_count, duplicate_executor)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                    ON CONFLICT(id) DO UPDATE SET
                      name = excluded.name,
                      capabilities = excluded.capabilities,
@@ -460,12 +476,19 @@ class ClusterStore:
                      max_concurrent = excluded.max_concurrent,
                      disk_free_gb = excluded.disk_free_gb,
                      status_reason = excluded.status_reason,
-                     instance_token = excluded.instance_token""",
+                     instance_token = excluded.instance_token,
+                     cpu_load_pct = excluded.cpu_load_pct,
+                     lane_count = excluded.lane_count,
+                     duplicate_executor = excluded.duplicate_executor""",
                 (node.id, node.name, _json_dumps(node.capabilities),
                  node.status.value, _dt_to_str(node.last_heartbeat), node.load,
                  node.max_concurrent, node.disk_free_gb,
                  getattr(node, "status_reason", ""),
-                 getattr(node, "instance_token", "")),
+                 getattr(node, "instance_token", ""),
+                 getattr(node, "cpu_load_pct", None),
+                 getattr(node, "lane_count", None),
+                 (None if getattr(node, "duplicate_executor", None) is None
+                  else int(bool(node.duplicate_executor)))),
             )
         if self._on_node_online:
             try:
@@ -487,7 +510,10 @@ class ClusterStore:
 
     def update_heartbeat(self, node_id: str, load: float = 0.0,
                          disk_free_gb: Optional[float] = None,
-                         status_reason: str = "") -> None:
+                         status_reason: str = "",
+                         cpu_load_pct: Optional[float] = None,
+                         lane_count: Optional[int] = None,
+                         duplicate_executor: Optional[bool] = None) -> None:
         now = datetime.utcnow()
         # #892: status follows the caller's verdict — NodeManager passes
         # status_reason when the reported disk is below the floor, and the
@@ -496,21 +522,29 @@ class ClusterStore:
         # schedulable through the 2026-09-14 incident). An empty reason keeps
         # the old force-online semantics; disk_free_gb None (older worker)
         # keeps whatever the stored column holds.
+        # #879: the reason may also come from the health self-report, and the
+        # raw observations are recorded the same way — a None report field
+        # keeps the stored column (an older worker's beat says nothing).
         status = NodeStatus.degraded.value if status_reason else NodeStatus.online.value
+        sets = ["last_heartbeat = ?", "status = ?", "load = ?",
+                "status_reason = ?"]
+        params = [_dt_to_str(now), status, load, status_reason]
+        if disk_free_gb is not None:
+            sets.append("disk_free_gb = ?")
+            params.append(float(disk_free_gb))
+        if cpu_load_pct is not None:
+            sets.append("cpu_load_pct = ?")
+            params.append(float(cpu_load_pct))
+        if lane_count is not None:
+            sets.append("lane_count = ?")
+            params.append(int(lane_count))
+        if duplicate_executor is not None:
+            sets.append("duplicate_executor = ?")
+            params.append(int(bool(duplicate_executor)))
+        params.append(node_id)
         with self._tx() as conn:
-            if disk_free_gb is None:
-                conn.execute(
-                    "UPDATE nodes SET last_heartbeat = ?, status = ?, load = ?, "
-                    "status_reason = ? WHERE id = ?",
-                    (_dt_to_str(now), status, load, status_reason, node_id),
-                )
-            else:
-                conn.execute(
-                    "UPDATE nodes SET last_heartbeat = ?, status = ?, load = ?, "
-                    "disk_free_gb = ?, status_reason = ? WHERE id = ?",
-                    (_dt_to_str(now), status, load, float(disk_free_gb),
-                     status_reason, node_id),
-                )
+            conn.execute(
+                f"UPDATE nodes SET {', '.join(sets)} WHERE id = ?", params)
 
     def update_capabilities(self, node_id: str, caps: List[str]) -> None:
         with self._lock:
@@ -621,6 +655,16 @@ class ClusterStore:
             # mid-flight) reads as NOT drained — the safe default is that a
             # node keeps working, never that the fleet silently goes dark.
             drained=bool(row["drained"]) if "drained" in row.keys() else False,
+            # #879: health self-report columns; absent (pre-migration) or
+            # NULL (never reported) read as None — rules stay inert.
+            cpu_load_pct=(row["cpu_load_pct"]
+                          if "cpu_load_pct" in row.keys() else None),
+            lane_count=(row["lane_count"]
+                        if "lane_count" in row.keys() else None),
+            duplicate_executor=(
+                bool(row["duplicate_executor"])
+                if ("duplicate_executor" in row.keys()
+                    and row["duplicate_executor"] is not None) else None),
         )
 
     # -------------------------------------------------------------------

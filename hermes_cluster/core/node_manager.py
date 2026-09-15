@@ -29,6 +29,7 @@ from ..models import (
     TimelineEvent,
 )
 from .disk_preflight import disk_reason, effective_min_free_gb
+from .health_selfreport import health_reason
 from ..state.cluster_store import ClusterStore
 
 
@@ -115,6 +116,7 @@ class NodeManager:
         heartbeat_config: Optional[_HeartbeatConfig] = None,
         watchdog_config: Optional[_WatchdogConfig] = None,
         min_free_disk_gb: Optional[float] = None,
+        max_cpu_load: Optional[float] = None,
     ):
         self._store = store
         self._heartbeat_cfg = heartbeat_config or _HeartbeatConfig()
@@ -125,6 +127,13 @@ class NodeManager:
         # picks online nodes), above → restored. A node that never reports the
         # field (older worker) is never affected.
         self._min_free_disk_gb = effective_min_free_gb(min_free_disk_gb)
+        # #879: main-side CPU ceiling for the worker's REPORTED cpu_load_pct
+        # (node.max_cpu_load in cluster YAML; absent/0 = rule disabled —
+        # unlike disk there is no safe universal default, a build box may
+        # legitimately pin its cores). Lane-backlog and duplicate-executor
+        # are threshold-free and always on: the worker's own max_concurrent
+        # and the #899 409 already define them.
+        self._max_cpu_load = float(max_cpu_load or 0.0)
 
         # Event listeners (protected by _listeners_lock)
         self._listeners_lock = threading.Lock()
@@ -190,6 +199,9 @@ class NodeManager:
         max_concurrent: int = 0,
         disk_free_gb: Optional[float] = None,
         instance_token: str = "",
+        cpu_load_pct: Optional[float] = None,
+        lane_count: Optional[int] = None,
+        duplicate_executor: Optional[bool] = None,
     ) -> Node:
         """Register a new node in the cluster.
 
@@ -273,7 +285,11 @@ class NodeManager:
             # disk-aware heartbeat path (below-floor join = degraded + reason;
             # an above-floor join clears a previous disk degradation, because
             # update_heartbeat re-forces online on an empty reason).
-            self.send_heartbeat(node_id, disk_free_gb=disk_free_gb)
+            # #879: the same routing carries the worker's health self-report.
+            self.send_heartbeat(node_id, disk_free_gb=disk_free_gb,
+                                cpu_load_pct=cpu_load_pct,
+                                lane_count=lane_count,
+                                duplicate_executor=duplicate_executor)
             if caps:
                 self._store.update_capabilities(node_id, caps)
             if max_concurrent:
@@ -286,6 +302,12 @@ class NodeManager:
             return node  # type: ignore
 
         reason = disk_reason(disk_free_gb, self._min_free_disk_gb)
+        # #879: a join is a fresh health report too — degrade at registration.
+        h_reason = health_reason(
+            cpu_load_pct, self._max_cpu_load, lane_count,
+            max(0, int(max_concurrent)), duplicate_executor)
+        if h_reason:
+            reason = f"{reason}; {h_reason}" if reason else h_reason
         node = Node(
             id=node_id,
             name=name or node_id,
@@ -297,6 +319,9 @@ class NodeManager:
             max_concurrent=max(0, int(max_concurrent)),
             disk_free_gb=disk_free_gb,
             instance_token=instance_token or "",
+            cpu_load_pct=cpu_load_pct,
+            lane_count=lane_count,
+            duplicate_executor=duplicate_executor,
         )
         self._store.register_node(node)
         self._cap_cache[node_id] = list(caps)
@@ -348,7 +373,10 @@ class NodeManager:
     # ------------------------------------------------------------------
 
     def send_heartbeat(self, node_id: str, load: float = 0.0,
-                       disk_free_gb: Optional[float] = None) -> None:
+                       disk_free_gb: Optional[float] = None,
+                       cpu_load_pct: Optional[float] = None,
+                       lane_count: Optional[int] = None,
+                       duplicate_executor: Optional[bool] = None) -> None:
         """Send a single heartbeat for a node.
 
         Updates the last_heartbeat timestamp and optionally the load.
@@ -363,6 +391,13 @@ class NodeManager:
                 When the reading sits below the configured floor the store
                 still records it, refreshes the timestamp, but marks the node
                 degraded with a reason instead of forcing it online.
+            cpu_load_pct / lane_count / duplicate_executor: #879 — the
+                worker's health self-report (None = not reported, older
+                workers — every rule inert). Thresholds are MAIN-side:
+                node.max_cpu_load vs cpu_load_pct; the node's declared
+                max_concurrent vs lane_count; the #899 facts as-is. The
+                composed reason degrades the node the same way disk does —
+                refresh the clock, do NOT force online.
         """
         node = self._store.get_node(node_id)
         if node is None:
@@ -373,11 +408,24 @@ class NodeManager:
         load = max(0.0, min(1.0, load))
 
         reason = disk_reason(disk_free_gb, self._min_free_disk_gb)
+        # #879: health degradation joins (or stands in for) the disk reason.
+        h_reason = health_reason(
+            cpu_load_pct, self._max_cpu_load,
+            lane_count,
+            int(getattr(node, "max_concurrent", 0) or 0),
+            duplicate_executor,
+        )
+        if h_reason:
+            reason = f"{reason}; {h_reason}" if reason else h_reason
         self._store.update_heartbeat(node_id, load=load,
                                      disk_free_gb=disk_free_gb,
-                                     status_reason=reason)
+                                     status_reason=reason,
+                                     cpu_load_pct=cpu_load_pct,
+                                     lane_count=lane_count,
+                                     duplicate_executor=duplicate_executor)
         if reason:
-            logger.warning("node %s heartbeat below disk floor: %s", node_id, reason)
+            logger.warning("node %s heartbeat self-reported unhealthy: %s",
+                           node_id, reason)
         self._emit(NodeEvent(
             node_id, "heartbeat",
             f"load={load:.2f}" + (f" disk_free_gb={disk_free_gb:.2f}"
@@ -564,6 +612,11 @@ class NodeManager:
                         # #892: the watchdog's disk rule fires on the LAST
                         # reported reading; None (older worker) disables it.
                         disk_free_gb=getattr(n, "disk_free_gb", None),
+                        # #879: same for the health self-report readings.
+                        cpu_load_pct=getattr(n, "cpu_load_pct", None),
+                        lane_count=getattr(n, "lane_count", None),
+                        max_concurrent=int(getattr(n, "max_concurrent", 0) or 0),
+                        duplicate_executor=getattr(n, "duplicate_executor", None),
                     )
                     for n in nodes
                 ]
@@ -595,6 +648,8 @@ class NodeManager:
             # heartbeat is fresh (the heartbeat path degrades at report time;
             # this closes the window between floor raise and next beat).
             min_free_disk_gb=self._min_free_disk_gb,
+            # #879: same closing-the-window role for the health self-report.
+            max_cpu_load=self._max_cpu_load,
         )
         self._watchdog.start()
 

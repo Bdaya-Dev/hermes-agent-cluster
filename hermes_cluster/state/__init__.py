@@ -149,7 +149,10 @@ class ClusterState:
 
     def update_heartbeat(self, node_id: str, load: float = 0.0,
                          disk_free_gb: Optional[float] = None,
-                         status_reason: str = "") -> None:
+                         status_reason: str = "",
+                         cpu_load_pct: Optional[float] = None,
+                         lane_count: Optional[int] = None,
+                         duplicate_executor: Optional[bool] = None) -> None:
         with self._nodes_lock:
             if node_id in self._nodes:
                 n = self._nodes[node_id]
@@ -159,11 +162,23 @@ class ClusterState:
                 # unconditional force is what kept the full-disk node schedulable
                 # during the 05:32Z incident. disk_free_gb None → stored value
                 # kept (an older worker's beat says nothing about disk).
+                # #879: the reason may now ALSO come from the health
+                # self-report; the rule is identical — a non-empty reason
+                # means degraded, an empty one re-forces online.
                 n.status = (NodeStatus.degraded if status_reason
                             else NodeStatus.online)
                 n.status_reason = status_reason
                 if disk_free_gb is not None:
                     n.disk_free_gb = disk_free_gb
+                # #879: record the raw health observations (None = the beat
+                # carried nothing → keep the last known value, same rule as
+                # disk above).
+                if cpu_load_pct is not None:
+                    n.cpu_load_pct = cpu_load_pct
+                if lane_count is not None:
+                    n.lane_count = lane_count
+                if duplicate_executor is not None:
+                    n.duplicate_executor = bool(duplicate_executor)
                 n.load = load
 
     def update_capabilities(self, node_id: str, caps: List[str]) -> None:

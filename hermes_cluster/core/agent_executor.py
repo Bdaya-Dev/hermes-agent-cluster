@@ -414,6 +414,11 @@ class AgentExecutor:
         self._persisted_ids: set = set()
         self._persisted_refresh_s = _persisted_ids_refresh_interval()
         self._last_persisted_refresh = 0.0
+        # #879: spawn records that appeared after this executor started —
+        # the fingerprint of a duplicate executor for this node id. Drained
+        # as their spawns are reaped, so the health self-report it feeds is
+        # real but self-healing (never a wedge that outlives the problem).
+        self._foreign_spawn_ids: set = set()
         # #897: terminal reports (complete/fail) that could not be delivered
         # because main was unreachable — retried every poll cycle with
         # exponential backoff. Keyed by (verb, task_id); each value holds
@@ -1554,6 +1559,22 @@ class AgentExecutor:
         """
         return set(self._persisted_ids)
 
+    def live_spawns(self) -> List["ActiveSpawn"]:
+        """Snapshot of currently-live tracked spawns (#879 health report).
+
+        Includes the records #899's persisted-refresh RE-ATTACHED from a
+        second executor writing the same store — which is exactly the
+        over-ceiling signal the main thresholds against max_concurrent.
+        """
+        with self._lock:
+            return list(self._active_spawns.values())
+
+    def duplicate_executor_observed(self) -> bool:
+        """True while spawn records written by a SECOND executor for this
+        node id are live in the shared store (#879 health self-report).
+        """
+        return bool(self._foreign_spawn_ids)
+
     def _reconcile_persisted_spawns(self) -> None:
         """Re-load the persisted task->lane map into the in-memory spawn table.
 
@@ -1691,9 +1712,16 @@ class AgentExecutor:
         fresh = {r.get("task_id", "") for r in records} - {""}
         added = fresh - self._persisted_ids
         self._persisted_ids = fresh
-        if not added:
-            return
-        logger.warning(
+        # #879: foreign-record set — spawn ids that appeared AFTER this
+        # executor started (a second executor for the node id wrote them)
+        # and are still in the store. Intersected with `fresh` every cycle,
+        # so once a duplicate is stopped and its lanes drain (each reaped
+        # spawn drops its record) the set empties and the survivor's health
+        # self-report stops flagging it — the degradation is real but
+        # SELF-HEALING, never a wedge that outlives the problem.
+        self._foreign_spawn_ids = (self._foreign_spawn_ids | added) & fresh
+        if added:
+            logger.warning(
             "#899: %d spawn record(s) appeared after this executor started "
             "(%s) — a second executor for node '%s' is writing them; "
             "re-attaching instead of spawning",

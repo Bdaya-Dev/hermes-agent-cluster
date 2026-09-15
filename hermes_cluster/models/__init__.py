@@ -128,6 +128,17 @@ class Node(BaseModel):
     # one). /join compares it: same token = idempotent re-join, different
     # token while still heartbeating = a DUPLICATE executor -> refused 409.
     instance_token: str = ""
+    # #879: the worker's own health measurements, reported in every
+    # join/heartbeat (None = older worker that omits the field — the health
+    # rules never fire on absent data, exact #892 semantics). cpu_load_pct
+    # is the 0..1 busy fraction since the last beat; lane_count is the live
+    # spawn count the local executor tracks (across BOTH executors when a
+    # duplicate exists — #899's persisted refresh re-attaches those);
+    # duplicate_executor is the survivor's own observation that another
+    # instance wrote spawn records it did not admit.
+    cpu_load_pct: Optional[float] = None
+    lane_count: Optional[int] = None
+    duplicate_executor: Optional[bool] = None
 
 
 # ===========================================================================
@@ -744,6 +755,12 @@ class HeartbeatRequest(BaseModel):
     # payload means "no disk info" — the main keeps its exact pre-#892
     # heartbeat semantics (unconditionally online) for those.
     disk_free_gb: Optional[float] = None
+    # #879: worker health self-report (see Node). Absent = no info; each
+    # rule is inert on its absent field, so an older worker's payload is
+    # byte-for-byte pre-#879 behaviour.
+    cpu_load_pct: Optional[float] = None
+    lane_count: Optional[int] = None
+    duplicate_executor: Optional[bool] = None
 
 
 class JoinRequest(BaseModel):
@@ -752,6 +769,10 @@ class JoinRequest(BaseModel):
     endpoint: str = ""
     max_concurrent: int = 0  # 0 = unlimited; scheduler honours this ceiling
     disk_free_gb: Optional[float] = None  # #892, same absent-means-unknown rule
+    # #879: health self-report rides the join too (a join is a fresh report).
+    cpu_load_pct: Optional[float] = None
+    lane_count: Optional[int] = None
+    duplicate_executor: Optional[bool] = None
     # #899: per-process identity of the executor that is joining. A second
     # /join for the same node name carrying a DIFFERENT token while the
     # previous instance is still heartbeating (< offline_after) is refused
