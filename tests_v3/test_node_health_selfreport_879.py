@@ -306,12 +306,15 @@ def _drive_one_connector_cycle(wc, monkeypatch, sent, responses=None):
 
     state = {"first": True}
 
-    def _sleep(_s):
+    def _wait(_interval):
         if state["first"]:
             state["first"] = False   # let one join+beat pass...
-            return
+            return False             # (False = no stop requested)
         raise SystemExit             # ...then stop the loop
-    monkeypatch.setattr(wc.time, "sleep", _sleep)
+    # Patches the loop's named wait seam rather than `time.sleep`: the loop
+    # waits on the stop event now, so a stop does not have to sit out a whole
+    # heartbeat interval. Same intent as before, on the symbol that means it.
+    monkeypatch.setattr(wc, "_beat_wait", _wait)
     wc._connector_started = False
     return holder
 

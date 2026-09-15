@@ -151,45 +151,33 @@ def test_stop_then_start_again_works(monkeypatch):
         f"restart after stop must yield exactly one live connector, got {names}")
 
 
-def test_stop_completes_within_about_one_heartbeat_interval(monkeypatch):
-    """The shutdown BOUND, pinned so it cannot silently regress.
+def test_stop_interrupts_a_long_beat_immediately(monkeypatch):
+    """The loop waits on the stop EVENT, so a stop does not sit out the beat.
 
-    The loop waits with one `time.sleep(heartbeat_interval)` per cycle and
-    checks the stop event either side of it, so a stop is picked up within at
-    most one interval. Two more interruptible designs were tried and both
-    break the existing connector tests, which drive this loop by patching
-    `time.sleep`:
-
-      * `Event.wait(interval)` is interruptible but ignores the patched
-        sleep entirely, so the injected SystemExit never fires and the loop
-        never terminates;
-      * slicing the sleep into 0.1s chunks calls the patched sleep several
-        times per cycle, so a one-shot fake sleep lands mid-cycle and the
-        loop runs fewer iterations than the test scripts expect -- that is
-        what broke test_join_409_is_loud_and_retried when it was tried here.
-
-    So the bound is one interval, not instant. Workers beat in seconds, so
-    this is prompt in practice; a deployment that raises the interval into
-    the minutes is choosing a slower shutdown with it.
+    This is the assertion that would have caught the first version of this
+    fix. That version slept with `time.sleep(interval)` and only checked the
+    event either side, so stopping took up to a full beat -- and the app's
+    default beat is 10s while the stop's join timeout is 5s, so
+    `stop_worker_connector` timed out and the thread SURVIVED the shutdown
+    that asked it to stop (CI run 35004484899).
     """
     from hermes_cluster.core import worker_connector as wc
 
-    interval = 0.5
     monkeypatch.setattr(wc, "_signed_post", _post_ok)
     wc._connector_started = False
     wc.start_worker_connector(
-        node_id="boundcheck", cluster_endpoint="http://main.invalid:8787",
-        capabilities=["tooling"], peer_token="t", heartbeat_interval=interval)
-    time.sleep(0.05)
+        node_id="longbeat", cluster_endpoint="http://main.invalid:8787",
+        capabilities=["tooling"], peer_token="t", heartbeat_interval=300.0)
+    time.sleep(0.1)
 
     t0 = time.monotonic()
     assert wc.stop_worker_connector(timeout=5.0) is True
     elapsed = time.monotonic() - t0
 
     assert not _connector_threads()
-    assert elapsed < interval * 3, (
-        f"stop took {elapsed:.2f}s on a {interval}s beat -- the loop is no "
-        "longer checking the stop event either side of its sleep")
+    assert elapsed < 2.0, (
+        f"stop took {elapsed:.1f}s on a 300s beat -- the loop is sleeping "
+        "through the stop signal instead of waiting on it")
 
 
 def test_worker_app_shutdown_stops_the_connector():

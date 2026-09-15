@@ -116,9 +116,12 @@ def test_heartbeat_payload_sent_with_disk(monkeypatch):
 
     monkeypatch.setattr(wc.threading, "Thread", _T)
 
-    def _sleep(_s):
+    def _wait(_interval):
         raise SystemExit  # run exactly one loop iteration
-    monkeypatch.setattr(wc.time, "sleep", _sleep)
+    # The loop's wait is a named seam (`_beat_wait`) rather than `time.sleep`,
+    # so it can be interruptible in production; driving it is what this patch
+    # always meant to do.
+    monkeypatch.setattr(wc, "_beat_wait", _wait)
     wc._connector_started = False
     wc.start_worker_connector(
         node_id="w", cluster_endpoint="http://main:1", capabilities=["review"],

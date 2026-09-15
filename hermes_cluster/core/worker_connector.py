@@ -119,20 +119,23 @@ _connector_lock = threading.Lock()
 _connector_stop = threading.Event()
 _connector_thread: Optional[threading.Thread] = None
 
-# The beat waits with ONE `time.sleep(heartbeat_interval)` call per cycle and
-# checks the stop event either side of it, rather than waiting on the event
-# itself. Two deliberate consequences:
-#
-#   * `Event.wait` would be interruptible, but the connector tests drive this
-#     loop by patching `time.sleep` (tests_v3/test_disk_preflight_892.py,
-#     test_node_health_selfreport_879.py) — an Event.wait sleeps straight
-#     through their injected stop and the loop never terminates. Slicing the
-#     sleep into chunks fails the same tests from the other side: it calls the
-#     fake sleep several times per cycle, so their one-shot SystemExit lands
-#     mid-cycle and the loop runs half as many iterations as the test scripts.
-#   * so a stop is noticed within at most one heartbeat_interval. That is the
-#     shutdown bound: prompt at the beat intervals workers actually run
-#     (seconds), and bounded by the configured interval at worst.
+def _beat_wait(interval: float) -> bool:
+    """Wait one beat. Returns True if a stop was requested during the wait.
+
+    This is a NAMED SEAM, and both of its properties matter:
+
+      * production gets an INTERRUPTIBLE wait. `time.sleep(interval)` is not
+        interruptible, so a stop had to wait out the whole beat -- with the
+        app's default 10s beat that outlived a 5s join and the thread
+        survived the shutdown that asked it to stop (measured: CI run
+        35004484899, `worker-connector-test-worker` still alive).
+      * the connector tests drive this loop by replacing the wait with one
+        that raises SystemExit after N cycles. They used to patch
+        `time.sleep` -- an implementation detail -- which is why the loop
+        could not switch to an interruptible primitive without breaking
+        them. They now patch this function, which is what they always meant.
+    """
+    return _connector_stop.wait(interval)
 
 
 def stop_worker_connector(timeout: float = 5.0) -> bool:
@@ -448,11 +451,7 @@ def start_worker_connector(
                         "— re-joining next cycle", registered_id)
                     registered_id = None
 
-            if _connector_stop.is_set():
-                logger.info("worker connector stopping: node=%s", node_id)
-                return
-            time.sleep(heartbeat_interval)
-            if _connector_stop.is_set():
+            if _beat_wait(heartbeat_interval):
                 logger.info("worker connector stopping: node=%s", node_id)
                 return
 
