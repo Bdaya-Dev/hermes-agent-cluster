@@ -38,6 +38,7 @@ from .routers import (
     intake_router,
     metering_router,
     capabilities_router,
+    lanes_router,
 )
 from .routers import nodes as nodes_mod
 from .routers import tasks as tasks_mod
@@ -56,6 +57,7 @@ from .routers import cluster as cluster_mod
 from .routers import intake as intake_mod
 from .routers import metering as metering_mod
 from .routers import capabilities as capabilities_mod
+from .routers import lanes as lanes_mod
 import logging
 logger = logging.getLogger(__name__)
 
@@ -295,6 +297,7 @@ def create_app(
     cluster_mod.init(state)
     capabilities_mod.init(state)
     intake_mod.init(state)
+    lanes_mod.init(state)
 
     # --- Alibaba Token Plan metering poller (main-side, same process as the
     # intake poller). Gated: the thread only exists while metering.enabled is
@@ -335,6 +338,7 @@ def create_app(
     app.include_router(setup_router)
     app.include_router(cluster_router)
     app.include_router(capabilities_router)
+    app.include_router(lanes_router)
     app.include_router(intake_router)
     app.include_router(metering_router)
 

@@ -70,8 +70,16 @@ class AffinityScheduler(FairScheduler):
         if not pinned_node_id:
             return self.choose(task_requires, online_nodes, active_counts), False
         # Pinned: the lane's node only — never a load-balanced substitute.
+        # Node-id spelling tolerance (#909): the reporting executor runs as
+        # bare ``<name>`` while the registry is ``node_<name>``, and either
+        # spelling can land in the lanes row. A pin stored under one
+        # spelling must match its twin, or the fix would PARK every lane.
+        def _same(a: str, b: str) -> bool:
+            return (a == b or a.removeprefix("node_") == b
+                    or b.removeprefix("node_") == a)
+
         for node in online_nodes:
-            if node.id != pinned_node_id:
+            if not _same(node.id, pinned_node_id):
                 continue
             if not node_can_run(task_requires, node):
                 # The lane node no longer satisfies the task's capabilities:

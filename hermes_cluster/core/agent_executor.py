@@ -1505,8 +1505,46 @@ class AgentExecutor:
                     node=self._node_id,
                     last_task_id=spawn.task_id,
                 )
+                # #909: main's scheduler is the only one that decides node
+                # placement, and it can only pin a lane to this node if this
+                # node TELLS it the lane is here. The worker-local record
+                # above never reaches main (sync replicates tasks/leases/
+                # nodes only) — that blind spot is the measured bounce
+                # census. Report the placement at spawn (resume sessions
+                # carry their id already) and again at session-capture.
+                self._report_lane_placement(
+                    spawn.lane_key, session_id=spawn.session_id,
+                    last_task_id=spawn.task_id, role=spawn.role,
+                )
         except Exception:
             logger.exception("failed to persist spawn record for task %s", spawn.task_id)
+
+    def _report_lane_placement(self, lane_key: str, session_id: str = "",
+                               last_task_id: str = "", role: str = "author",
+                               ) -> None:
+        """Mirror this node's lane placement to the main (#909).
+
+        Best-effort with the #897 posture: a placement report that cannot be
+        delivered must never block or fail a delivery — the LOCAL record
+        already keeps this node's own FIFO/stray guards honest, and the next
+        report (spawn or session-capture) retries the same upsert. The pin
+        being briefly stale on main is strictly better than it being
+        permanently absent, which is today's defect.
+        """
+        if not lane_key or not self._cluster_endpoint:
+            return
+        _signed_request(
+            self._cluster_endpoint, "POST", "/api/v1/lanes/report",
+            {
+                "lane_key": lane_key,
+                "node_id": self._node_id,
+                "session_id": session_id,
+                "profile": self._config.hermes_profile,
+                "role": role or "author",
+                "last_task_id": last_task_id,
+            },
+            self._token, self._node_id,
+        )
 
     def _persisted_spawn_task_ids(self) -> set:
         """Task ids with a persisted spawn record (live spawns must not re-spawn).
@@ -2465,6 +2503,15 @@ class AgentExecutor:
                 role=spawn.role,
                 node=self._node_id,
                 last_task_id=task_id,
+            )
+            # #909: a WORKER-LOCAL lane record is invisible to the scheduler
+            # that decides placement — main. Mirror the placement (now with
+            # the session id) so its affinity pin stays current; without
+            # this the pin table main reads is always empty and every lane
+            # bounces (the measured 30-of-375).
+            self._report_lane_placement(
+                spawn.lane_key, session_id=session_id or spawn.session_id,
+                last_task_id=task_id, role=spawn.role,
             )
             if session_id and session_id != spawn.session_id:
                 spawn.session_id = session_id
