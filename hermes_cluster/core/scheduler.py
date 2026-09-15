@@ -10,7 +10,8 @@ nodes sat at 0/0).
 Scheduling rule:
 
 1. Only ONLINE nodes are candidates.
-2. A READY task (priority ASC, then created_at ASC) goes to the candidate
+2. A READY task (priority ASC, then created_at DESC -- NEWEST FIRST within
+   a band, owner ruling 2026-09-15) goes to the candidate
    node with the fewest ACTIVE tasks; load ties break by least-recently
    picked (round-robin), so an identical-capability cluster spreads
    2/2/2 instead of N/0/0.

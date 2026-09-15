@@ -1408,8 +1408,13 @@ class PostgresClusterStore:
                     ready_tasks = [
                         self._row_to_task(r)
                         for r in await conn.fetch(
+                            # Band ASC (0 = top), then NEWEST FIRST within
+                            # the band — owner ruling 2026-09-15. Must match
+                            # cluster_store and ClusterState exactly, or the
+                            # three backends serve different queue orders
+                            # (test_store_parity_backends pins this).
                             "SELECT * FROM tasks WHERE status = $1 "
-                            "ORDER BY priority, created_at",
+                            "ORDER BY priority, created_at DESC",
                             TaskStatus.ready.value,
                         )
                         if r["id"] not in leased and r["id"] not in lane_blocked

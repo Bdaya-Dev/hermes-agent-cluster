@@ -127,7 +127,12 @@ class GroupingConfig(BaseModel):
     enabled: bool = False          # kill switch; default OFF keeps legacy behavior
     lane_branch: str = DEFAULT_LANE_BRANCH
     lane_branches: Dict[str, str] = Field(default_factory=dict)  # repo -> branch
-    max_bundle_size: int = 40       # owner intent 30-40 issues per sitting (#762)
+    # Owner ruling 2026-09-15, verbatim: "one MR per repo withing an epic,
+    # with a limit of 30 issues". Was 40 under the earlier "30-40" intent
+    # (#762); the owner has since named the number, so 30 is the ceiling.
+    # A ceiling, not a target — the lane still splits sooner when the
+    # combined diff exceeds one reviewer pass (LFP-1).
+    max_bundle_size: int = 30
     # Reviewability cap on the SHAPE of the bundle, not its diff (intake
     # cannot see code): area-cluster groups per batch. A batch spanning more
     # clusters than this splits first. The lane enforces the DIFF cap at MR
@@ -241,6 +246,28 @@ def _area_cluster(issue: Dict[str, Any]) -> str:
     return ""
 
 
+def _recency_key(candidate: Tuple[str, Dict[str, Any], int]):
+    """Sort key putting the NEWEST issue first (owner ruling 2026-09-15).
+
+    Returns ``(has_no_date, -created_epoch, issue_id)``:
+
+    * issues with a parseable ``created_at`` sort before undated ones, newest
+      first (negated epoch);
+    * an UNDATED issue sorts LAST rather than first. Fail-open here means
+      "do not let bad data jump the queue" — the opposite polarity from
+      :func:`parse_gitlab_time`'s fail-open, which is about never STALLING.
+      An undated issue is still bundled, just not ahead of dated work;
+    * ``issue_id`` is the final tiebreak so the order is TOTAL and the
+      packer is deterministic — two issues created in the same second must
+      not reorder between cycles, or a bundle's membership churns.
+    """
+    issue_id, issue, _band = candidate
+    dt = parse_gitlab_time(issue.get("created_at"))
+    if dt is None:
+        return (1, 0.0, issue_id)
+    return (0, -dt.timestamp(), issue_id)
+
+
 def parse_gitlab_time(value: Any) -> Optional[datetime]:
     """GitLab payload timestamp (UTC ISO, ``...Z`` or offset, sometimes
     naive) as an aware UTC datetime; None when missing/unparseable.
@@ -342,11 +369,23 @@ def pack_repo_candidates(
     top_band = min(b for _, _, b in candidates)
     band_members = [c for c in candidates if c[2] == top_band]
 
+    # NEWEST FIRST within the band (owner ruling 2026-09-15: "priority goes
+    # to the most recent issues first then working towards the older ones").
+    # This is the decisive place for that ruling: it chooses WHICH issues a
+    # ≤max_bundle_size sitting gets, not merely which task runs next. A
+    # recent issue is filed against the CURRENT system; an old one may rest
+    # on a premise the estate has moved past — measured 2026-09-15: a ballot
+    # built on an in-cluster MongoDB that does not exist, a SAMA finding
+    # about a credits system scrapped four days after the analysis.
+    # Previously this relied on "created order preserved by the caller",
+    # i.e. whatever order the GitLab page happened to arrive in.
+    band_members = sorted(band_members, key=_recency_key)
+
     clusters: Dict[str, List] = {}
     for c in band_members:
         clusters.setdefault(_area_cluster(c[1]), []).append(c)
     # Big clusters first, named clusters before the unlabeled singleton;
-    # stable within each group (created order preserved by the caller).
+    # newest-first order is preserved INSIDE each cluster by the sort above.
     order = sorted(clusters.items(), key=lambda kv: (-len(kv[1]), kv[0] == "", kv[0]))
 
     batch: List = []

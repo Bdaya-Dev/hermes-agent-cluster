@@ -866,14 +866,20 @@ class ClusterState:
                         active_counts.get(t.assigned_to, 0) + 1
                     )
 
-            # Sort ready tasks by priority (1=highest first), then creation time.
+            # Priority band ASC (0 = top), then NEWEST FIRST within the band
+            # (owner ruling 2026-09-15: "priority goes to the most recent
+            # issues first then working towards the older ones"). A recent
+            # task is filed against the CURRENT system; an old one may rest
+            # on a premise the estate has already moved past, so serving it
+            # first spends the most effort on the least-current premise.
+            # Band still dominates — recency is only the tiebreak.
             ready_tasks = sorted(
                 [
                     t for t in self._tasks.values()
                     if t.status == TaskStatus.ready and t.id not in leased_task_ids
                     and t.id not in lane_blocked
                 ],
-                key=lambda t: (t.priority, t.created_at),
+                key=lambda t: (t.priority, -t.created_at.timestamp()),
             )
 
             for task in ready_tasks:
