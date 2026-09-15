@@ -28,6 +28,7 @@ from ..core.ballot import (
     record_answer,
     validate_answer,
 )
+from ..core.ballot_wiring import attach_formal
 from ..state import ClusterState
 
 router = APIRouter(prefix="/api/v1/tasks", tags=["tasks"])
@@ -617,7 +618,9 @@ async def block_task(task_id: str, req: BlockTaskRequest):
         )
     try:
         ballot = build_ballot(req.question, req.options, cls=req.cls,
-                              lane_key=req.lane_key or task.lane_key)
+                              lane_key=req.lane_key or task.lane_key,
+                              decision_ref=req.decision_ref,
+                              decision_id=req.decision_id)
     except BallotError as e:
         raise HTTPException(status_code=422, detail=str(e))
 
@@ -670,16 +673,24 @@ async def answer_task(task_id: str, req: AnswerTaskRequest):
     except BallotError as e:
         raise HTTPException(status_code=409, detail=str(e))
 
+    # #912: the answered carrier ALWAYS carries an explicit formal-actuation
+    # directive — silent drop was the defect (owner answers landed on the task
+    # row and never reached the decision_create tier; 4 of 16 lost, 2 mislinked,
+    # measured 2026-09-15). The directive names the formal target when the
+    # lane supplied decision_ref, else demands actuation from the relay/lead.
+    attach_formal(ballot, task_id=task_id)
     _state.set_task_ballot(task_id, ballot)
     if not _state.unblock_to_ready(task_id):
         # Lost a race (e.g. cancel between the read and the flip). Keep the
         # recorded answer — it is the owner's decision and the audit trail
         # wins — but tell the caller the task did not return to ready.
         return {"status": "answered_but_not_resumed",
-                "reason": f"task status is {task.status.value}; answer recorded"}
+                "reason": f"task status is {task.status.value}; answer recorded",
+                "formal_actuation": ballot.get("formal")}
     logger.info("task %s answered by %s: %s", task_id,
                 ballot.get("answered_by") or "?", answer[:80])
-    return {"status": "answered", "task_status": "ready", "ballot": ballot}
+    return {"status": "answered", "task_status": "ready", "ballot": ballot,
+            "formal_actuation": ballot.get("formal")}
 
 
 @router.post("/{task_id}/advance")

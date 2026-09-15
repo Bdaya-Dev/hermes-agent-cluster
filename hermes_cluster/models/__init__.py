@@ -897,6 +897,12 @@ class BlockTaskRequest(BaseModel):
     # ballot MUST carry its class so the relay never guesses.
     cls: Optional[str] = Field(default=None, alias="class")
     lane_key: str = ""
+    # #912: where the FORMAL (decision_create-tier) ballot for this same
+    # question lives: "group[/sub]/project#<iid>" + optional decision id.
+    # Absent = no formal side yet (the answer response then carries a loud
+    # needs-actuation directive); malformed = 422 at block time.
+    decision_ref: Optional[str] = None
+    decision_id: Optional[str] = None
 
     model_config = {"populate_by_name": True}
 
