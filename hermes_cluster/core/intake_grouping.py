@@ -554,6 +554,37 @@ def reviewer_handoff_brief(bundle: BundlePlan, mr_url: str, head_sha: str,
         f"Post your verdict: an MR note pinned to the head sha, via\n"
         f"`bdaya-glab mr note` (npx -y -p @shared/bdaya-gitlab@latest ...).\n"
         f"The note is the durable oracle the landing gate reads.\n"
+        + (
+            # #918 STAGE 1 (GitHub only): the note stays the audit trail, and
+            # the forge ALSO gets a recorded review — by the second principal,
+            # the `bdaya-lane-agent` App (author `ahmednfwela` cannot approve
+            # his own lanes' PRs; GITHUB_TOKEN is hard-barred from APPROVE).
+            # The review is the machine gate; losing the note would make past
+            # audits unreproducible, and submitting a review is NOT merging
+            # (#882 stays: the reviewer never gets a merge verb here).
+            f"\n"
+            f"RECORD THE REVIEW AS bdaya-lane-agent (#918 — GitHub PR only;\n"
+            f"the note above is unchanged, this is ADDED):\n"
+            f"  python -m hermes_cluster.core.gh_review --mr-url {mr_url} \\\n"
+            f"    --sha {head_sha} --verdict <PASS|NEEDS-CHANGES> \\\n"
+            f"    --body '<one-line verdict summary>'\n"
+            f"  * PASS at head -> the tool submits APPROVE; NEEDS-CHANGES ->\n"
+            f"    REQUEST_CHANGES; INCOMPLETE-ROSTER or a verdict-less\n"
+            f"    completion -> NO review is submitted (the tool refuses and\n"
+            f"    says so — 'completed' is never a verdict, #914's rule).\n"
+            f"  * The tool mints the App installation token through the estate\n"
+            f"    resolver (#867), submits the sha-pinned review, and reports\n"
+            f"    success ONLY after read-back proves a recorded bot review at\n"
+            f"    this sha in GET /pulls/<n>/reviews. If it exits non-zero —\n"
+            f"    token un-mintable, submission 4xx, or read-back empty — SAY\n"
+            f"    SO verbatim in your result ('App review FAILED: <reason>');\n"
+            f"    never report a successful review the forge cannot show.\n"
+            f"  * Never print a token value; the tool reports byte lengths.\n"
+            f"  * Approving is not merging (#882): this gives you NO merge\n"
+            f"    verb — you never merge, never land it yourself; the landing\n"
+            f"    task below still closes the loop.\n"
+            if gh else ""
+        ) +
         f"\n"
         f"CLOSE THE LOOP (#893) — after posting the note:\n"
         + (
