@@ -279,7 +279,14 @@ def _drive_one_connector_cycle(wc, monkeypatch, sent, responses=None):
     def _post(endpoint, path, data, token, node_id, **kw):
         sent.append((path, dict(data)))
         if responses:
-            return responses[min(calls["i"], len(responses) - 1)]
+            # The increment MUST happen on this branch too. It used to sit
+            # only in the default branch below, so a scripted `responses`
+            # sequence was pinned to element 0 forever and every element
+            # after the first was dead -- test_join_409_is_loud_and_retried
+            # never reached its own "and now the join succeeds" response.
+            nxt = responses[min(calls["i"], len(responses) - 1)]
+            calls["i"] += 1
+            return nxt
         calls["i"] += 1
         if path.endswith("/join"):
             return {"node_id": "node_w"}
