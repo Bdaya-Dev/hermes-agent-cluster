@@ -810,7 +810,10 @@ class AgentExecutor:
                 "### Author hand-off (shared/claude-plugins#893 — no lead in the loop)",
                 "- When your work is done and the Draft MR/PR is open, DO NOT stop and wait for a "
                 "lead to notice. Submit your own reviewer task with `kanban_cluster_submit`: "
-                "`role='reviewer'`, `requires=['review']`, `lane_key='<repo>!<mr_iid>'` (the reviewer "
+                "`role='reviewer'`, `requires=['review']` — and for a GitHub-PR artifact "
+                "`requires=['review','github-write']` (#913: a reviewer whose node cannot "
+                "post the verdict comment produces nothing a merge gate can read; the main "
+                "refuses a GitHub-PR reviewer without github-write), `lane_key='<repo>!<mr_iid>'` (the reviewer "
                 "lane key), and a title that carries the MR/PR URL and the exact head sha.",
                 "- SUBMIT EXACTLY ONE reviewer task, then FINISH your turn (#898). Never cancel "
                 "or resubmit it: a reviewer that has not started is QUEUED, not lost — capacity, "
@@ -837,7 +840,10 @@ class AgentExecutor:
             # #893 close of the loop, same shared template (not per-brief).
             lines += [
                 "### Reviewer landing hand-off (shared/claude-plugins#893)",
-                "- Post your sha-pinned verdict as an MR note first (the durable oracle).",
+                "- Post your sha-pinned verdict as an MR note first (the durable oracle). "
+                "On a GitHub PR the oracle is a PR comment (`gh pr comment <n> --repo <owner/repo> "
+                "--body-file …`) — if the posting call fails, your task FAILED: exit nonzero, never "
+                "record a PASS no gate can see (#913).",
                 "- On PASS at head: you MUST NOT merge (#882 denies it). Submit the LANDING task "
                 "yourself with `kanban_cluster_submit`: `role='author'`, "
                 "`lane_key='<repo>#land-<mr_iid>'`, title naming the MR URL, the verified head "
@@ -2222,6 +2228,7 @@ class AgentExecutor:
                     contents,
                     self._brief_text_for(task_id),
                     is_error_response=("API failed after" in stderr_text),
+                    role=spawn.role,
                 )
                 if reason:
                     no_turn = has_no_turn_stderr(stderr_text)

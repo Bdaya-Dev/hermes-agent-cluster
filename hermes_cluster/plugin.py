@@ -573,6 +573,8 @@ SCHEMAS = {
         "description": (
             "Submit a task to the cluster for distributed execution. Used by an "
             "author lane for its hand-off: pass role='reviewer', requires=['review'] "
+            "(plus 'github-write' for a GitHub PR — #913 refuses a GitHub-PR reviewer "
+            "without the capability its verdict posts with) "
             "and lane_key='<repo>!<mr_iid>' to dispatch the independent reviewer "
             "yourself (RV-1: a fresh context on a different lane — never approve or "
             "merge your own work). SUBMIT EXACTLY ONE reviewer task per hand-off and "

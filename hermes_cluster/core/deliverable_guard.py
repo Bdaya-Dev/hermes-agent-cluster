@@ -133,10 +133,59 @@ def _is_provider_shape(content: str, is_error_response: bool = False) -> bool:
     return False
 
 
+def _is_stranded_verdict(content: str) -> bool:
+    """True when a REVIEWER's own result body confesses the verdict was never
+    posted (shared/claude-plugins#913).
+
+    Production specimen (task_9b8910e693ff8c1a, PR #70): a full correct PASS
+    plus the sentence "Could not post verdict as PR comment — gh CLI not
+    authenticated on this node... Verdict delivered via this result file
+    only." The task reached `completed`; a merge gate reading PR comments saw
+    nothing — indistinguishable from a review that never ran. Honesty is what
+    makes this detectable: the confession is the body's OWN statement about
+    THIS posting, so the rule requires a confession SHAPE, in either order,
+    anchored to the verdict/comment noun — and it fires only for reviewer-role
+    reaps (the caller's scope, #913's fix-2 scoping decision: an author lane
+    legitimately reporting a failed post elsewhere is a real deliverable).
+
+    False-positive safety (the #870 lesson): discussing a posting hazard, or
+    reporting posting SUCCESS, must pass. Rejection therefore requires the
+    self-referential pairing — a not-post verb immediately adjacent to a
+    VERDICT noun (the reviewer's deliverable: "could not post verdict",
+    "verdict ... delivered via this result file", "couldn't post the verdict
+    comment"), or a not-post verb plus an explicit posting-noun phrase
+    ("could not post it as PR comment", "failed to post the verdict note").
+    A bare mention of a posting problem anywhere else — "a reviewer could not
+    post verdicts if ..." as a generalization inside a PASS body whose own
+    verdict evidently posted — pairs a modal/hypothetical, not a confession;
+    the anchored possessive/self-reference shape cannot match it.
+    """
+    c = content
+    _NOTPOST = (r"(?:couldn'?t|could\s*not|can'?t|cannot|was\s+not\s+able\s+to|"
+                r"were\s+not\s+able\s+to|am\s+not\s+able\s+to|failed\s+to|"
+                r"unable\s+to)\s+post\b")
+    confession = (
+        # "could not post (the|your|this|my|a|its|any) verdict ...":
+        re.search(_NOTPOST + r"\s+(?:the|your|this|my|a|an|its|any)?\s*verdict\b",
+                  c, re.IGNORECASE)
+        # the production tail, verbatim shape:
+        or re.search(r"verdict\s+(?:was\s+)?delivered\s+via\s+this\s+result\s+file",
+                     c, re.IGNORECASE)
+        # "could not post it as (a|this|the) PR comment":
+        or re.search(_NOTPOST + r"\s+it\s+as\s+(?:a|this|the)?\s*(?:PR|MR)?\s*"
+                     r"(?:comment|note)\b", c, re.IGNORECASE)
+        # "posting failure: verdict never posted":
+        or re.search(r"posting\s+(?:failure|failed)[^.]{0,80}\bverdict\s+never\s+posted\b",
+                     c, re.IGNORECASE)
+    )
+    return bool(confession)
+
+
 def classify_non_deliverable(
     content: str,
     brief_text: str,
     is_error_response: bool = False,
+    role: str = "",
 ) -> Optional[str]:
     """Return a short failure reason when `content` is NOT a deliverable.
 
@@ -154,6 +203,12 @@ def classify_non_deliverable(
         return "provider_error"
     if _is_echo_of_brief(content, brief_text):
         return "brief_echo"
+    # #913: reviewer-role only — a verdict the lane itself says it could not
+    # post is not a deliverable to a merge gate (its whole value was the
+    # posted comment). Author-role bodies are NOT judged here: an author
+    # reporting a failed post elsewhere is a legitimate deliverable.
+    if role.strip().lower() == "reviewer" and _is_stranded_verdict(content):
+        return "stranded_verdict"
     return None
 
 
